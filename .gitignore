@@ -13,3 +13,6 @@ out/
 # IDE files
 .vs/
 .idea/
+
+# Local scratch (not committed)
+Temp/
