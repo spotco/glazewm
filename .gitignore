@@ -16,3 +16,7 @@ out/
 
 # Local scratch (not committed)
 Temp/
+
+# local build.bat log
+build.log
+
