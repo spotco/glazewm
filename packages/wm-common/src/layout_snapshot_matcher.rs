@@ -108,10 +108,12 @@ fn title_score(candidate: Option<&str>, target: Option<&str>) -> u32 {
 
   // Simple fuzzy: compare without whitespace / punctuation collapses already
   // handled by normalize; treat near-equal prefixes as weak fuzzy.
-  let min_len = c_norm.len().min(t_norm.len());
-  if min_len >= 4 {
-    let c_pref = &c_norm[..min_len.min(12)];
-    let t_pref = &t_norm[..min_len.min(12)];
+  // Use char counts / .chars().take so we never byte-slice mid code point.
+  let min_chars = c_norm.chars().count().min(t_norm.chars().count());
+  if min_chars >= 4 {
+    let prefix_len = min_chars.min(12);
+    let c_pref: String = c_norm.chars().take(prefix_len).collect();
+    let t_pref: String = t_norm.chars().take(prefix_len).collect();
     if c_pref == t_pref {
       return SCORE_TITLE_FUZZY;
     }
@@ -314,4 +316,27 @@ mod tests {
       SCORE_PROCESS_NAME + SCORE_TITLE_CONTAINS
     );
   }
+
+  #[test]
+  fn fuzzy_title_prefix_handles_multibyte_utf8() {
+    // 11 ASCII + 2-byte `é` would put a byte index of 12 mid-codepoint;
+    // char-based prefix extraction must not panic and should still fuzzy-match.
+    let snap = ident(None, "app", None, Some("aaaaaaaaaaaé rest"));
+    let live = ident(None, "app", None, Some("aaaaaaaaaaaé other"));
+    let score = score_window(&live, &snap);
+    assert_eq!(score, SCORE_PROCESS_NAME + SCORE_TITLE_FUZZY);
+
+    // Mixed Japanese + ASCII titles (regression for non-ASCII normalize path).
+    let snap_jp = ident(None, "code", None, Some("メイン.rs - 編集"));
+    let live_jp = ident(None, "code", None, Some("メイン.rs - 編集"));
+    let score_jp = score_window(&live_jp, &snap_jp);
+    assert!(score_jp >= SCORE_PROCESS_NAME + SCORE_TITLE_EXACT);
+
+    // Emoji + ASCII: must not panic even when titles only weakly overlap.
+    let snap_emoji = ident(None, "chat", None, Some("🎉hello world"));
+    let live_emoji = ident(None, "chat", None, Some("🎉hello there"));
+    let score_emoji = score_window(&live_emoji, &snap_emoji);
+    assert!(score_emoji >= SCORE_PROCESS_NAME);
+  }
+
 }

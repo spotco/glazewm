@@ -15,11 +15,12 @@ use crate::{
       move_container_within_tree, resize_tiling_container,
       set_focused_descendant,
     },
+    monitor::move_workspace_to_monitor,
     window::{
       move_window_to_workspace, set_window_position, update_window_state,
       WindowPositionTarget,
     },
-    workspace::focus_workspace,
+    workspace::{activate_workspace, focus_workspace},
   },
   models::{
     Monitor, TilingContainer, WindowContainer, WorkspaceTarget,
@@ -45,6 +46,12 @@ struct SnapshotLeaf {
   key: String,
   window: SnapshotWindow,
   workspace_name: String,
+  /// Live monitor matched to the snapshot monitor this leaf came from.
+  ///
+  /// Workspace names are globally unique in GlazeWM, so restore reassigns
+  /// the named workspace onto this monitor (via `move_workspace_to_monitor`
+  /// / `activate_workspace`) before placing windows.
+  target_monitor: Option<Monitor>,
   /// DFS order among window leaves in the workspace.
   order_index: usize,
   tiling_size: Option<f32>,
@@ -109,6 +116,16 @@ pub fn load_layout_snapshot(
       .count(),
     ..Default::default()
   };
+
+  // Workspace names are global/unique: move (or activate) each named
+  // workspace onto its matched live monitor before placing windows.
+  if let Err(err) =
+    ensure_workspaces_on_matched_monitors(&leaves, state, config)
+  {
+    tracing::warn!(
+      "Failed to reassign workspaces to matched monitors: {err:#}"
+    );
+  }
 
   // Sort matched pairs by workspace + order so tiling inserts are stabler.
   let mut ordered_pairs = pairs;
@@ -213,24 +230,46 @@ fn restore_window(
     .context("Window disappeared during restore.")?;
 
   let target_state = leaf.window.state.clone();
-  if !window.state().is_same_state(&target_state) {
+
+  // For Minimized restore, apply snapshot prev_state first (so the later
+  // minimize event records it), then minimize; also set_prev_state so
+  // unminimize returns to Floating/Tiling/etc. from the snapshot.
+  let window = if matches!(target_state, WindowState::Minimized) {
+    let mut window = window;
+    if let Some(prev) = &leaf.window.prev_state {
+      if !window.state().is_same_state(prev)
+        && !matches!(window.state(), WindowState::Minimized)
+      {
+        window =
+          update_window_state(window, prev.clone(), state, config)?;
+        summary.state_updates += 1;
+      }
+    }
+
+    if !matches!(window.state(), WindowState::Minimized) {
+      window = update_window_state(
+        window,
+        WindowState::Minimized,
+        state,
+        config,
+      )?;
+      summary.state_updates += 1;
+    }
+
+    if let Some(prev) = &leaf.window.prev_state {
+      window.set_prev_state(prev.clone());
+    }
+    window
+  } else if !window.state().is_same_state(&target_state) {
     let window =
       update_window_state(window, target_state.clone(), state, config)?;
     summary.state_updates += 1;
+    window
+  } else {
+    window
+  };
 
-    if matches!(target_state, WindowState::Floating(_)) {
-      if let Some(placement) = &leaf.window.floating_placement {
-        set_window_position(
-          window,
-          &WindowPositionTarget::Coordinates(
-            Some(placement.x()),
-            Some(placement.y()),
-          ),
-          state,
-        )?;
-      }
-    }
-  } else if matches!(target_state, WindowState::Floating(_)) {
+  if matches!(target_state, WindowState::Floating(_)) {
     if let Some(placement) = &leaf.window.floating_placement {
       set_window_position(
         window,
@@ -343,11 +382,14 @@ fn live_identity(window: &WindowContainer) -> MatchableIdentity {
   MatchableIdentity {
     process_path: props.process_path,
     process_name: props.process_name,
+    #[cfg(target_os = "windows")]
     class_name: if props.class_name.is_empty() {
       None
     } else {
       Some(props.class_name)
     },
+    #[cfg(not(target_os = "windows"))]
+    class_name: None,
     title: if props.title.is_empty() {
       None
     } else {
@@ -445,7 +487,7 @@ fn collect_snapshot_leaves(
   let mut leaves = Vec::new();
   let mut seen_workspace_keys: HashSet<String> = HashSet::new();
 
-  for (snap_mon, _live_mon) in monitor_map {
+  for (snap_mon, live_mon) in monitor_map {
     for workspace in &snap_mon.workspaces {
       let ws_key = format!("{}::{}", snap_mon.device_name, workspace.name);
       if !seen_workspace_keys.insert(ws_key) {
@@ -455,6 +497,7 @@ fn collect_snapshot_leaves(
       collect_node_windows(
         &workspace.root,
         &workspace.name,
+        Some(live_mon.clone()),
         &mut order,
         &mut leaves,
       );
@@ -473,6 +516,7 @@ fn collect_snapshot_leaves(
       collect_node_windows(
         &workspace.root,
         &workspace.name,
+        None,
         &mut order,
         &mut leaves,
       );
@@ -482,9 +526,65 @@ fn collect_snapshot_leaves(
   leaves
 }
 
+/// Ensure each snapshot workspace lands on its matched live monitor.
+///
+/// GlazeWM workspace names are globally unique (`workspace_by_name`), so
+/// `WorkspaceTarget::Name` alone cannot express "workspace X on monitor A".
+/// We therefore reassign (or activate) the named workspace onto the matched
+/// monitor before `move_window_to_workspace` places windows.
+fn ensure_workspaces_on_matched_monitors(
+  leaves: &[SnapshotLeaf],
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let mut planned: HashMap<String, Monitor> = HashMap::new();
+  for leaf in leaves {
+    if let Some(mon) = &leaf.target_monitor {
+      planned
+        .entry(leaf.workspace_name.clone())
+        .or_insert_with(|| mon.clone());
+    }
+  }
+
+  for (ws_name, target_mon) in planned {
+    if let Some(workspace) = state.workspace_by_name(&ws_name) {
+      let current_mon =
+        workspace.monitor().context("Workspace has no monitor.")?;
+      if current_mon.id() != target_mon.id() {
+        info!(
+          "Moving workspace '{}' to matched monitor '{}'.",
+          ws_name,
+          target_mon.native_properties().device_name
+        );
+        move_workspace_to_monitor(
+          &workspace,
+          &target_mon,
+          state,
+          config,
+        )?;
+      }
+    } else {
+      info!(
+        "Activating workspace '{}' on matched monitor '{}'.",
+        ws_name,
+        target_mon.native_properties().device_name
+      );
+      activate_workspace(
+        Some(&ws_name),
+        Some(target_mon),
+        state,
+        config,
+      )?;
+    }
+  }
+
+  Ok(())
+}
+
 fn collect_node_windows(
   node: &SnapshotNode,
   workspace_name: &str,
+  target_monitor: Option<Monitor>,
   order: &mut usize,
   out: &mut Vec<SnapshotLeaf>,
 ) {
@@ -497,6 +597,7 @@ fn collect_node_windows(
           key,
           window: window.clone(),
           workspace_name: workspace_name.to_string(),
+          target_monitor: target_monitor.clone(),
           order_index: *order,
           tiling_size: node.tiling_size,
         });
@@ -506,7 +607,13 @@ fn collect_node_windows(
     SnapshotNodeKind::Split => {
       if let Some(children) = &node.children {
         for child in children {
-          collect_node_windows(child, workspace_name, order, out);
+          collect_node_windows(
+            child,
+            workspace_name,
+            target_monitor.clone(),
+            order,
+            out,
+          );
         }
       }
     }
