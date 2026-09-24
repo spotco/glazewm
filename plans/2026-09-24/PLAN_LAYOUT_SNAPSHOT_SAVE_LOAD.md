@@ -15,6 +15,7 @@ Scope: tray context-menu save/load + best-effort restore (no app launch)
 - [x] Step 6 - Wire main loop handlers; deps (`arboard`, `rfd`)
 - [x] Step 7 - `cargo test -p wm-common --lib` + compile `wm`
 - [x] Step 8 - Commit, push, open PR against `glazewm-spotcobuild`
+- [x] Step 9 - Address PR review: macOS class_name, monitor match, Minimized prev_state, UTF-8 fuzzy (b17c3bd9)
 
 ## Objective
 
