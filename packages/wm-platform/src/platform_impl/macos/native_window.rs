@@ -63,6 +63,13 @@ impl NativeWindow {
       ))
   }
 
+  /// Implements [`NativeWindow::process_path`].
+  pub(crate) fn process_path(&self) -> crate::Result<String> {
+    Err(crate::Error::Platform(
+      "process_path is not available on macOS.".to_string(),
+    ))
+  }
+
   /// Implements [`NativeWindow::frame`].
   pub(crate) fn frame(&self) -> crate::Result<Rect> {
     // TODO: Consider refactoring this to use a single dispatch.

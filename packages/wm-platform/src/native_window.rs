@@ -457,6 +457,16 @@ impl NativeWindow {
     self.inner.process_name()
   }
 
+  /// Full process image path when the platform can resolve it.
+  ///
+  /// # Platform-specific
+  ///
+  /// - **Windows**: Path from `QueryFullProcessImageNameW`.
+  /// - **macOS**: Not available; returns an error.
+  pub fn process_path(&self) -> crate::Result<String> {
+    self.inner.process_path()
+  }
+
   /// Gets a rectangle of the window's size and position.
   ///
   /// # Platform-specific
