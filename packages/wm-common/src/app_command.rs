@@ -130,6 +130,16 @@ pub enum QueryCommand {
   Workspaces,
   /// Outputs whether the window manager is paused.
   Paused,
+  /// Outputs a persistence-oriented layout snapshot (monitors tree,
+  /// ignored windows, paused, binding modes, version).
+  Layout {
+    /// Optional path to write durable (ephemeral-stripped) snapshot JSON.
+    /// Handled by `glazewm-cli`; the IPC server ignores this flag.
+    #[clap(short = 'o', long = "output", value_hint = clap::ValueHint::FilePath)]
+    output: Option<PathBuf>,
+  },
+  /// Outputs windows currently ignored by the WM.
+  Ignored,
 }
 
 #[derive(Clone, Debug, PartialEq, ValueEnum)]

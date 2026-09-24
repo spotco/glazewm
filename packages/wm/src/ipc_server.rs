@@ -14,9 +14,11 @@ use uuid::Uuid;
 use wm_common::{
   AppCommand, AppMetadataData, BindingModesData, ClientResponseData,
   ClientResponseMessage, CommandData, EventSubscribeData,
-  EventSubscriptionMessage, FocusedData, MonitorsData, QueryCommand,
-  ServerMessage, SubscribableEvent, TilingDirectionData, WindowsData,
-  WmEvent, WorkspacesData, DEFAULT_IPC_PORT,
+  EventSubscriptionMessage, FocusedData, IgnoredWindowsData,
+  LayoutSnapshot, MonitorsData, QueryCommand, ServerMessage,
+  SnapshotWindow, SnapshotWindowIdentity, SubscribableEvent,
+  TilingDirectionData, WindowsData, WmEvent, WorkspacesData,
+  DEFAULT_IPC_PORT, format_system_time_rfc3339,
 };
 
 use crate::{
@@ -242,6 +244,49 @@ impl IpcServer {
         QueryCommand::Paused => {
           ClientResponseData::Paused(wm.state.is_paused)
         }
+        QueryCommand::Layout { .. } => {
+          let monitors: Vec<_> = wm
+            .state
+            .monitors()
+            .into_iter()
+            .map(|monitor| monitor.to_dto())
+            .try_collect()?;
+
+          let ignored_windows = wm
+            .state
+            .ignored_windows
+            .iter()
+            .map(snapshot_from_native_window)
+            .collect();
+
+          let binding_modes = wm
+            .state
+            .binding_modes
+            .iter()
+            .map(|mode| mode.name.clone())
+            .collect();
+
+          let snapshot = LayoutSnapshot::from_monitor_dtos(
+            &monitors,
+            ignored_windows,
+            wm.state.is_paused,
+            binding_modes,
+            Some(env!("VERSION_NUMBER").to_string()),
+            format_system_time_rfc3339(std::time::SystemTime::now()),
+          );
+
+          ClientResponseData::Layout(snapshot)
+        }
+        QueryCommand::Ignored => {
+          ClientResponseData::Ignored(IgnoredWindowsData {
+            windows: wm
+              .state
+              .ignored_windows
+              .iter()
+              .map(snapshot_from_native_window)
+              .collect(),
+          })
+        }
       },
       AppCommand::Command {
         subject_container_id,
@@ -400,6 +445,37 @@ impl IpcServer {
   pub fn stop(&self) {
     info!("Shutting down IPC server.");
     self.abort_handle.abort();
+  }
+}
+
+fn snapshot_from_native_window(
+  native: &wm_platform::NativeWindow,
+) -> SnapshotWindow {
+  #[allow(clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+  let handle = native.id().0 as isize;
+
+  SnapshotWindow {
+    identity: SnapshotWindowIdentity {
+      process_path: native.process_path().ok(),
+      process_name: native
+        .process_name()
+        .unwrap_or_else(|_| "unknown".to_string()),
+      #[cfg(target_os = "windows")]
+      class_name: {
+        use wm_platform::NativeWindowWindowsExt;
+        native.class_name().ok()
+      },
+      #[cfg(not(target_os = "windows"))]
+      class_name: None,
+      title_hint: native.title().ok(),
+    },
+    // Ignored windows are unmanaged; treat as floating for export.
+    state: wm_common::WindowState::Floating(
+      wm_common::FloatingStateConfig::default(),
+    ),
+    floating_placement: native.frame().ok(),
+    id: None,
+    handle: Some(handle),
   }
 }
 

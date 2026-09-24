@@ -1,14 +1,33 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::missing_errors_doc)]
 
+use std::path::PathBuf;
+
 use anyhow::Context;
-use wm_common::ClientResponseData;
+use clap::Parser;
+use wm_common::{AppCommand, ClientResponseData, QueryCommand};
 use wm_ipc_client::IpcClient;
 
 pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
+  let app_command = AppCommand::parse_from(&args);
+
+  let output_path: Option<PathBuf> = match &app_command {
+    AppCommand::Query {
+      command: QueryCommand::Layout { output },
+    } => output.clone(),
+    _ => None,
+  };
+
+  // Layout --output is CLI-local; IPC server only receives `query layout`.
+  let message = match &app_command {
+    AppCommand::Query {
+      command: QueryCommand::Layout { .. },
+    } => "query layout".to_string(),
+    _ => args[1..].join(" "),
+  };
+
   let mut client = IpcClient::connect().await?;
 
-  let message = args[1..].join(" ");
   client
     .send(&message)
     .await
@@ -18,6 +37,16 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
     .client_response(&message)
     .await
     .context("Failed to receive response from IPC server.")?;
+
+  if let (Some(path), Some(ClientResponseData::Layout(snapshot))) =
+    (&output_path, &client_response.data)
+  {
+    let durable = snapshot.clone().into_durable();
+    let json = serde_json::to_string_pretty(&durable)
+      .context("Failed to serialize durable layout snapshot.")?;
+    std::fs::write(path, json)
+      .with_context(|| format!("Failed to write layout snapshot to {}.", path.display()))?;
+  }
 
   match client_response.data {
     // For event subscriptions, omit the initial response message and

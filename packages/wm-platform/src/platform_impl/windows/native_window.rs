@@ -81,8 +81,8 @@ impl NativeWindow {
     Ok(String::from_utf16_lossy(&text[..length as usize]))
   }
 
-  /// Implements [`NativeWindow::process_name`].
-  pub(crate) fn process_name(&self) -> crate::Result<String> {
+  /// Implements [`NativeWindow::process_path`].
+  pub(crate) fn process_path(&self) -> crate::Result<String> {
     let mut process_id = 0u32;
     unsafe {
       GetWindowThreadProcessId(self.hwnd(), Some(&raw mut process_id));
@@ -109,7 +109,12 @@ impl NativeWindow {
       query_res
     }?;
 
-    let exe_path = String::from_utf16_lossy(&buffer[..length as usize]);
+    Ok(String::from_utf16_lossy(&buffer[..length as usize]))
+  }
+
+  /// Implements [`NativeWindow::process_name`].
+  pub(crate) fn process_name(&self) -> crate::Result<String> {
+    let exe_path = self.process_path()?;
 
     exe_path
       .split('\\')

@@ -130,6 +130,7 @@ impl TilingWindow {
       #[cfg(target_os = "windows")]
       class_name: self.native_properties().class_name,
       process_name: self.native_properties().process_name,
+      process_path: self.native_properties().process_path,
       active_drag: self.active_drag(),
     }))
   }
