@@ -8,6 +8,15 @@ use crate::{
 
 pub const DEFAULT_IPC_PORT: u32 = 6123;
 
+/// Resolve IPC port: `GLAZEWM_IPC_PORT` env if set and valid, else [`DEFAULT_IPC_PORT`].
+#[must_use]
+pub fn ipc_port() -> u32 {
+  std::env::var("GLAZEWM_IPC_PORT")
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(DEFAULT_IPC_PORT)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "messageType", rename_all = "snake_case")]
 pub enum ServerMessage {

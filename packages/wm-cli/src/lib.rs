@@ -19,14 +19,44 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
     _ => None,
   };
 
+  let copy_to_clipboard = matches!(app_command, AppCommand::CopyLayout);
+
+  // Materialize clipboard JSON to a temp file for load-layout --clipboard
+  // (IPC server reads from a filesystem path).
+  let clipboard_temp_path: Option<PathBuf> =
+    if let AppCommand::LoadLayout {
+      clipboard: true, ..
+    } = &app_command
+    {
+      Some(write_clipboard_snapshot_temp()?)
+    } else {
+      None
+    };
+
   // Reconstruct IPC message carefully for path-bearing commands.
-  // Layout --output / save-layout write is CLI-local; IPC only gets `query layout`.
+  // Layout --output / save-layout / copy-layout write is CLI-local;
+  // IPC only gets `query layout`.
   let message = match &app_command {
     AppCommand::Query {
       command: QueryCommand::Layout { .. },
     }
-    | AppCommand::SaveLayout { .. } => "query layout".to_string(),
-    AppCommand::LoadLayout { path } => {
+    | AppCommand::SaveLayout { .. }
+    | AppCommand::CopyLayout => "query layout".to_string(),
+    AppCommand::LoadLayout {
+      path,
+      clipboard: false,
+    } => {
+      let path = path
+        .as_ref()
+        .context("load-layout requires a path or --clipboard")?;
+      format!("load-layout {}", quote_path(path))
+    }
+    AppCommand::LoadLayout {
+      clipboard: true, ..
+    } => {
+      let path = clipboard_temp_path
+        .as_ref()
+        .context("internal: missing clipboard temp path")?;
       format!("load-layout {}", quote_path(path))
     }
     AppCommand::Query {
@@ -63,6 +93,30 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
     })?;
   }
 
+  if copy_to_clipboard {
+    if let Some(ClientResponseData::Layout(snapshot)) =
+      &client_response.data
+    {
+      let durable = snapshot.clone().into_durable();
+      let json = serde_json::to_string_pretty(&durable)
+        .context("Failed to serialize durable layout snapshot.")?;
+      set_clipboard_text(&json)?;
+      eprintln!(
+        "Copied layout snapshot to clipboard ({} bytes).",
+        json.len()
+      );
+    } else if !client_response.success {
+      // Fall through to normal response printing / exit.
+    } else {
+      anyhow::bail!("copy-layout expected layout data in IPC response.");
+    }
+  }
+
+  // Best-effort cleanup of clipboard temp file.
+  if let Some(path) = &clipboard_temp_path {
+    let _ = std::fs::remove_file(path);
+  }
+
   match client_response.data {
     // For event subscriptions, omit the initial response message and
     // continuously output subsequent event messages.
@@ -82,6 +136,41 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
   }
 
   Ok(())
+}
+
+fn set_clipboard_text(text: &str) -> anyhow::Result<()> {
+  let mut clipboard = arboard::Clipboard::new()
+    .context("Failed to open system clipboard.")?;
+  clipboard
+    .set_text(text.to_string())
+    .context("Failed to set clipboard text.")?;
+  Ok(())
+}
+
+fn write_clipboard_snapshot_temp() -> anyhow::Result<PathBuf> {
+  let mut clipboard = arboard::Clipboard::new()
+    .context("Failed to open system clipboard.")?;
+  let text = clipboard
+    .get_text()
+    .context("Failed to read clipboard text.")?;
+  let trimmed = text.trim();
+  if !trimmed.starts_with('{') {
+    anyhow::bail!(
+      "Clipboard does not look like layout snapshot JSON (expected '{{')."
+    );
+  }
+  // Validate parse early for clearer errors.
+  let _: wm_common::LayoutSnapshot = serde_json::from_str(trimmed)
+    .context("Clipboard JSON is not a valid layout snapshot.")?;
+
+  let path = std::env::temp_dir().join(format!(
+    "glazewm-clipboard-layout-{}.json",
+    std::process::id()
+  ));
+  std::fs::write(&path, trimmed).with_context(|| {
+    format!("Failed to write clipboard snapshot to {}.", path.display())
+  })?;
+  Ok(path)
 }
 
 /// Format path for IPC. Paths with whitespace are not supported over IPC

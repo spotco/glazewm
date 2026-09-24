@@ -18,7 +18,7 @@ use wm_common::{
   LayoutSnapshot, LoadLayoutData, MonitorsData, QueryCommand,
   ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
   SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
-  WorkspacesData, DEFAULT_IPC_PORT, format_system_time_rfc3339,
+  WorkspacesData, format_system_time_rfc3339, ipc_port,
 };
 
 use crate::{
@@ -50,7 +50,7 @@ impl IpcServer {
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (unsubscribe_tx, _unsubscribe_rx) = broadcast::channel(16);
 
-    let server_addr = format!("127.0.0.1:{DEFAULT_IPC_PORT}");
+    let server_addr = format!("127.0.0.1:{}", ipc_port());
     let server = TcpListener::bind(server_addr.clone()).await?;
     info!("IPC server started on: '{}'.", server_addr);
 
@@ -297,8 +297,26 @@ impl IpcServer {
           ClientResponseData::LayoutMatch(report)
         }
       },
-      AppCommand::LoadLayout { path }
-      | AppCommand::Command {
+      AppCommand::LoadLayout { path, clipboard } => {
+        if clipboard || path.is_none() {
+          bail!("load-layout --clipboard is handled by glazewm-cli locally.");
+        }
+        let path = path.expect("path required without --clipboard");
+        let snapshot = read_layout_snapshot_file(&path)?;
+        let summary =
+          load_layout_snapshot(&snapshot, &mut wm.state, config)?;
+        if wm.state.pending_sync.has_changes() {
+          crate::commands::general::platform_sync(&mut wm.state, config)?;
+        }
+        ClientResponseData::LoadLayout(LoadLayoutData {
+          matched: summary.matched,
+          unmatched_snapshot: summary.unmatched_snapshot,
+          unmatched_live: summary.unmatched_live,
+          workspace_moves: summary.workspace_moves,
+          state_updates: summary.state_updates,
+        })
+      }
+      AppCommand::Command {
         command: wm_common::InvokeCommand::LoadLayout { path },
         ..
       } => {
@@ -321,9 +339,9 @@ impl IpcServer {
         let report = inspect_layout_snapshot(&snapshot, &wm.state)?;
         ClientResponseData::LayoutMatch(report)
       }
-      AppCommand::SaveLayout { .. } => {
-        // CLI handles durable write after `query layout`; not an IPC op.
-        bail!("save-layout is handled by glazewm-cli locally.")
+      AppCommand::SaveLayout { .. } | AppCommand::CopyLayout => {
+        // CLI handles durable write / clipboard after `query layout`.
+        bail!("save-layout/copy-layout are handled by glazewm-cli locally.")
       }
       AppCommand::Command {
         subject_container_id,

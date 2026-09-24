@@ -79,11 +79,16 @@ pub enum AppCommand {
   /// Load a layout snapshot JSON into the running WM (best-effort restore).
   ///
   /// Requires an already running instance of the window manager.
+  /// Use `--clipboard` to load JSON previously copied via `copy-layout` / tray.
   #[clap(name = "load-layout")]
   LoadLayout {
     /// Path to a durable layout snapshot JSON file.
-    #[clap(value_hint = clap::ValueHint::FilePath)]
-    path: PathBuf,
+    #[clap(value_hint = clap::ValueHint::FilePath, required_unless_present = "clipboard")]
+    path: Option<PathBuf>,
+
+    /// Load durable snapshot JSON from the system clipboard instead of a file.
+    #[clap(long = "clipboard", conflicts_with = "path")]
+    clipboard: bool,
   },
 
   /// Dry-run match a layout snapshot against live windows (no mutation).
@@ -95,6 +100,13 @@ pub enum AppCommand {
     #[clap(value_hint = clap::ValueHint::FilePath)]
     path: PathBuf,
   },
+
+  /// Copy a durable layout snapshot JSON to the system clipboard (CLI-local).
+  ///
+  /// Requires an already running instance of the window manager.
+  /// Same JSON as tray "Copy layout snapshot" / `save-layout`.
+  #[clap(name = "copy-layout")]
+  CopyLayout,
 }
 
 impl AppCommand {

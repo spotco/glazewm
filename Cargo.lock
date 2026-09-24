@@ -4110,6 +4110,7 @@ name = "wm-cli"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "clap",
  "futures-util",
  "serde_json",
