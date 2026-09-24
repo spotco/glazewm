@@ -80,6 +80,9 @@ pub struct SnapshotNode {
   pub tiling_direction: Option<TilingDirection>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub children: Option<Vec<SnapshotNode>>,
+  /// Local-id focus history for split nodes (from `SplitContainerDto.child_focus_order`).
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub child_focus_order: Option<Vec<String>>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub window: Option<SnapshotWindow>,
   /// Ephemeral source container id.
@@ -100,6 +103,9 @@ pub enum SnapshotNodeKind {
 pub struct SnapshotWindow {
   pub identity: SnapshotWindowIdentity,
   pub state: WindowState,
+  /// Prior state before minimize/fullscreen; needed so restore can leave Minimized.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub prev_state: Option<WindowState>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub floating_placement: Option<Rect>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +255,8 @@ impl SnapshotWorkspace {
       tiling_size: None,
       tiling_direction: Some(workspace.tiling_direction.clone()),
       children: Some(children),
+      // Workspace focus order lives on SnapshotWorkspace; virtual root has none.
+      child_focus_order: None,
       window: None,
       id: Some(workspace.id),
     };
@@ -279,12 +287,23 @@ fn convert_node(
         .filter_map(|child| convert_node(child, id_map, next_id))
         .collect();
 
+      let child_focus_order: Vec<String> = split
+        .child_focus_order
+        .iter()
+        .filter_map(|uuid| id_map.get(uuid).cloned())
+        .collect();
+
       Some(SnapshotNode {
         local_id,
         kind: SnapshotNodeKind::Split,
         tiling_size: Some(split.tiling_size),
         tiling_direction: Some(split.tiling_direction.clone()),
         children: Some(children),
+        child_focus_order: if child_focus_order.is_empty() {
+          None
+        } else {
+          Some(child_focus_order)
+        },
         window: None,
         id: Some(split.id),
       })
@@ -299,6 +318,7 @@ fn convert_node(
         tiling_size: window.tiling_size,
         tiling_direction: None,
         children: None,
+        child_focus_order: None,
         window: Some(SnapshotWindow::from_window_dto(window)),
         id: Some(window.id),
       })
@@ -340,6 +360,7 @@ impl SnapshotWindow {
         title_hint: Some(window.title.clone()),
       },
       state: window.state.clone(),
+      prev_state: window.prev_state.clone(),
       floating_placement: Some(window.floating_placement.clone()),
       id: Some(window.id),
       handle: Some(window.handle),
@@ -513,6 +534,10 @@ mod tests {
     assert_eq!(windows[0].local_id, "n1");
     assert_eq!(windows[1].local_id, "n2");
     assert_eq!(
+      children[0].child_focus_order.as_ref().unwrap(),
+      &vec!["n2".to_string(), "n1".to_string()]
+    );
+    assert_eq!(
       windows[0].window.as_ref().unwrap().identity.process_name,
       "alpha"
     );
@@ -590,6 +615,36 @@ mod tests {
     // Durable identity kept.
     assert_eq!(win.identity.process_name, "alpha");
     assert!(win.identity.process_path.is_some());
+  }
+
+  #[test]
+  fn persists_prev_state_for_minimized_windows() {
+    use crate::FloatingStateConfig;
+
+    let mut win = sample_window(Uuid::from_u128(7), "minapp", None);
+    win.state = WindowState::Minimized;
+    win.prev_state = Some(WindowState::Floating(FloatingStateConfig {
+      centered: false,
+      shown_on_top: false,
+    }));
+
+    let snap = SnapshotWindow::from_window_dto(&win);
+    assert_eq!(snap.state, WindowState::Minimized);
+    assert_eq!(
+      snap.prev_state,
+      Some(WindowState::Floating(FloatingStateConfig {
+        centered: false,
+        shown_on_top: false,
+      }))
+    );
+
+    // Ignored / fresh windows may omit prev_state.
+    let plain = SnapshotWindow::from_window_dto(&sample_window(
+      Uuid::from_u128(8),
+      "plain",
+      Some(1.0),
+    ));
+    assert!(plain.prev_state.is_none());
   }
 
   #[test]
