@@ -30,6 +30,11 @@ use wm_platform::{
 };
 
 use crate::{
+  commands::general::{
+    copy_layout_snapshot_to_clipboard, load_layout_snapshot,
+    pick_layout_snapshot_path, platform_sync,
+    read_layout_snapshot_file, save_layout_snapshot_with_dialog,
+  },
   ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
   wm::WindowManager,
 };
@@ -278,6 +283,32 @@ async fn start_wm(
           None,
           &mut config,
         ).map(|_| ())
+      },
+      Some(()) = tray.copy_layout_snapshot_rx.recv() => {
+        copy_layout_snapshot_to_clipboard(&wm.state)
+      },
+      Some(()) = tray.save_layout_snapshot_rx.recv() => {
+        save_layout_snapshot_with_dialog(&wm.state, dispatcher)
+      },
+      Some(()) = tray.load_layout_snapshot_rx.recv() => {
+        (|| -> anyhow::Result<()> {
+          let Some(path) = pick_layout_snapshot_path(dispatcher)? else {
+            tracing::info!("Load layout snapshot cancelled.");
+            return Ok(());
+          };
+          let snapshot = read_layout_snapshot_file(&path)?;
+          let summary =
+            load_layout_snapshot(&snapshot, &mut wm.state, &config)?;
+          if wm.state.pending_sync.has_changes() {
+            platform_sync(&mut wm.state, &config)?;
+          }
+          tracing::info!(
+            "Loaded layout snapshot from {}: matched={}",
+            path.display(),
+            summary.matched
+          );
+          Ok(())
+        })()
       },
     };
 

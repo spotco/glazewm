@@ -473,6 +473,7 @@ fn snapshot_from_native_window(
     state: wm_common::WindowState::Floating(
       wm_common::FloatingStateConfig::default(),
     ),
+    prev_state: None,
     floating_placement: native.frame().ok(),
     id: None,
     handle: Some(handle),

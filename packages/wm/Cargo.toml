@@ -19,6 +19,7 @@ tauri-winres = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
+arboard = "3.6"
 auto-launch = "0.5"
 ambassador = "0.4"
 clap = { workspace = true }
@@ -26,6 +27,7 @@ enum-as-inner = "0.6"
 futures-util = { workspace = true }
 home = { workspace = true }
 image = "0.25"
+rfd = "0.15"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"

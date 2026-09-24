@@ -1,7 +1,7 @@
 # Layout Snapshot Export Plan
 
 Date: 2026-09-23
-Status: Implemented; PR open
+Status: Merged into glazewm-spotcobuild; save/load follow-up in progress
 Branch: `feature/layout-snapshot`
 Scope: export-focused first slice (save/load restore orchestration deferred)
 
@@ -191,7 +191,7 @@ cargo test -p wm-common --lib
 
 ## Step 9 - Follow-up: restore orchestration (NOT blocking)
 
-- [ ] Match monitors by hardwareId/devicePath/deviceName/bounds.
+- [ ] Match monitors by hardwareId/devicePath/deviceName/bounds. (see `feature/layout-snapshot-save-load`)
 - [ ] Ensure target apps running (launch via processPath when missing).
 - [ ] Rebuild split tree / move windows / set tiling|floating|fullscreen|
       minimized to match snapshot (dock = tiling).
