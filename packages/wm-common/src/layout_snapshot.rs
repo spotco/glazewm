@@ -456,6 +456,7 @@ pub fn snapshot_workspace_monitor_indices(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::collections::HashMap;
   use crate::{DisplayState, SplitContainerDto};
   use wm_platform::{Rect, RectDelta};
 
@@ -803,5 +804,343 @@ mod tests {
     let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
     let s = format_system_time_rfc3339(t);
     assert_eq!(s, "2023-11-14T22:13:20Z");
+  }
+
+
+  /// Fields a successful restore is expected to bring back. Intentionally
+  /// excludes ephemeral ids/handles and `captured_at` (changes every save).
+  #[derive(Clone, Debug, PartialEq)]
+  struct RestoredLeafView {
+    process_name: String,
+    workspace_name: String,
+    order_index: usize,
+    state: WindowState,
+    prev_state: Option<WindowState>,
+    floating_xywh: Option<(i32, i32, i32, i32)>,
+    tiling_size: Option<f32>,
+  }
+
+  fn collect_restored_leaf_views(snapshot: &LayoutSnapshot) -> Vec<RestoredLeafView> {
+    let mut leaves = Vec::new();
+    for monitor in &snapshot.monitors {
+      for workspace in &monitor.workspaces {
+        let mut order = 0usize;
+        walk_node(&workspace.root, &workspace.name, &mut order, &mut leaves);
+      }
+    }
+    leaves.sort_by(|a, b| a.process_name.cmp(&b.process_name));
+    leaves
+  }
+
+  fn walk_node(
+    node: &SnapshotNode,
+    workspace_name: &str,
+    order: &mut usize,
+    out: &mut Vec<RestoredLeafView>,
+  ) {
+    match node.kind {
+      SnapshotNodeKind::Window => {
+        if let Some(window) = &node.window {
+          let floating_xywh = window
+            .floating_placement
+            .as_ref()
+            .map(|r| (r.x(), r.y(), r.width(), r.height()));
+          out.push(RestoredLeafView {
+            process_name: window.identity.process_name.clone(),
+            workspace_name: workspace_name.to_string(),
+            order_index: *order,
+            state: window.state.clone(),
+            prev_state: window.prev_state.clone(),
+            floating_xywh,
+            tiling_size: node.tiling_size,
+          });
+          *order += 1;
+        }
+      }
+      SnapshotNodeKind::Split => {
+        if let Some(children) = &node.children {
+          for child in children {
+            walk_node(child, workspace_name, order, out);
+          }
+        }
+      }
+    }
+  }
+
+  /// Pure data-level restore: copy restored fields from target onto scrambled
+  /// live leaves matched by process_name. Covers the field set
+  /// `load_layout_snapshot` must preserve without needing a live WM session.
+  fn virtual_restore_leaves(
+    target: &LayoutSnapshot,
+    scrambled: &LayoutSnapshot,
+  ) -> Vec<RestoredLeafView> {
+    let mut by_name: HashMap<String, RestoredLeafView> =
+      collect_restored_leaf_views(target)
+        .into_iter()
+        .map(|l| (l.process_name.clone(), l))
+        .collect();
+    let mut restored = Vec::new();
+    for live in collect_restored_leaf_views(scrambled) {
+      if let Some(wanted) = by_name.remove(&live.process_name) {
+        restored.push(wanted);
+      }
+    }
+    restored.sort_by(|a, b| a.process_name.cmp(&b.process_name));
+    restored
+  }
+
+  fn make_window(
+    id: u128,
+    name: &str,
+    state: WindowState,
+    prev_state: Option<WindowState>,
+    tiling_size: Option<f32>,
+    float_xywh: Option<(i32, i32, i32, i32)>,
+  ) -> WindowDto {
+    let mut w = sample_window(Uuid::from_u128(id), name, tiling_size);
+    w.state = state;
+    w.prev_state = prev_state;
+    if let Some((x, y, width, height)) = float_xywh {
+      w.floating_placement = Rect::from_xy(x, y, width, height);
+    }
+    w
+  }
+
+  fn snapshot_from_workspaces(
+    workspaces: Vec<(Uuid, &str, Uuid, Vec<ContainerDto>)>,
+    monitors: Vec<(Uuid, &str, Vec<Uuid>)>,
+    captured_at: &str,
+  ) -> LayoutSnapshot {
+    use crate::MonitorDto;
+
+    let monitor_dtos: Vec<ContainerDto> = monitors
+      .into_iter()
+      .map(|(mon_id, device, ws_ids)| {
+        let children: Vec<ContainerDto> = ws_ids
+          .iter()
+          .filter_map(|ws_id| {
+            workspaces.iter().find(|(id, _, parent, _)| id == ws_id && parent == &mon_id)
+              .map(|(id, name, parent, children)| {
+                ContainerDto::Workspace(WorkspaceDto {
+                  id: *id,
+                  name: (*name).into(),
+                  display_name: None,
+                  parent_id: Some(*parent),
+                  children: children.clone(),
+                  child_focus_order: vec![],
+                  has_focus: true,
+                  is_displayed: true,
+                  width: 800,
+                  height: 600,
+                  x: 0,
+                  y: 0,
+                  tiling_direction: TilingDirection::Horizontal,
+                })
+              })
+          })
+          .collect();
+        ContainerDto::Monitor(MonitorDto {
+          id: mon_id,
+          parent_id: None,
+          children,
+          child_focus_order: ws_ids,
+          has_focus: true,
+          width: 1920,
+          height: 1080,
+          x: 0,
+          y: 0,
+          dpi: 96,
+          scale_factor: 1.0,
+          handle: Some(1),
+          device_name: device.into(),
+          device_path: None,
+          hardware_id: None,
+          working_rect: Rect::from_xy(0, 0, 1920, 1040),
+        })
+      })
+      .collect();
+
+    LayoutSnapshot::from_monitor_dtos(
+      &monitor_dtos,
+      vec![],
+      false,
+      vec![],
+      Some("test".into()),
+      captured_at.into(),
+    )
+    .into_durable()
+  }
+
+  #[test]
+  fn restore_round_trip_after_scramble_virtual() {
+    use crate::{FloatingStateConfig, FullscreenStateConfig, SplitContainerDto};
+
+    let mon_a = Uuid::from_u128(10);
+    let mon_b = Uuid::from_u128(11);
+    let ws1 = Uuid::from_u128(20);
+    let ws2 = Uuid::from_u128(21);
+    let split_id = Uuid::from_u128(30);
+
+    let tiler = make_window(1, "tiler", WindowState::Tiling, None, Some(0.6), None);
+    let tiler_b = make_window(5, "tiler_b", WindowState::Tiling, None, Some(0.4), None);
+    let floater = make_window(
+      2,
+      "floater",
+      WindowState::Floating(FloatingStateConfig {
+        centered: false,
+        shown_on_top: true,
+      }),
+      None,
+      None,
+      Some((40, 50, 640, 480)),
+    );
+    let fuller = make_window(
+      3,
+      "fuller",
+      WindowState::Fullscreen(FullscreenStateConfig {
+        maximized: true,
+        shown_on_top: false,
+      }),
+      Some(WindowState::Tiling),
+      None,
+      None,
+    );
+    let miner = make_window(
+      4,
+      "miner",
+      WindowState::Minimized,
+      Some(WindowState::Floating(FloatingStateConfig {
+        centered: true,
+        shown_on_top: false,
+      })),
+      None,
+      None,
+    );
+
+    let snapshot_a = snapshot_from_workspaces(
+      vec![
+        (
+          ws1,
+          "1",
+          mon_a,
+          vec![
+            ContainerDto::Split(SplitContainerDto {
+              id: split_id,
+              parent_id: Some(ws1),
+              children: vec![
+                ContainerDto::Window(tiler.clone()),
+                ContainerDto::Window(tiler_b.clone()),
+              ],
+              child_focus_order: vec![tiler.id, tiler_b.id],
+              has_focus: true,
+              tiling_size: 1.0,
+              width: 800,
+              height: 600,
+              x: 0,
+              y: 0,
+              tiling_direction: TilingDirection::Horizontal,
+            }),
+            ContainerDto::Window(miner.clone()),
+          ],
+        ),
+        (
+          ws2,
+          "2",
+          mon_b,
+          vec![
+            ContainerDto::Window(floater.clone()),
+            ContainerDto::Window(fuller.clone()),
+          ],
+        ),
+      ],
+      vec![(mon_a, "DISPLAY1", vec![ws1]), (mon_b, "DISPLAY2", vec![ws2])],
+      "2026-09-24T11:00:00Z",
+    );
+
+    // Scramble: move windows across workspaces/monitors, reverse tiling
+    // order/sizes, flip tiling<->floating, change floating XYWH, clear
+    // fullscreen/minimized (+ prev_state).
+    let tiler_s = make_window(
+      1,
+      "tiler",
+      WindowState::Floating(FloatingStateConfig {
+        centered: true,
+        shown_on_top: false,
+      }),
+      None,
+      None,
+      Some((1, 2, 10, 10)),
+    );
+    let tiler_b_s = make_window(5, "tiler_b", WindowState::Tiling, None, Some(0.75), None);
+    let floater_s = make_window(2, "floater", WindowState::Tiling, None, Some(0.25), None);
+    let fuller_s = make_window(3, "fuller", WindowState::Tiling, None, None, None);
+    let miner_s = make_window(4, "miner", WindowState::Tiling, None, None, None);
+
+    let scrambled = snapshot_from_workspaces(
+      vec![(
+        ws2,
+        "2",
+        mon_a,
+        vec![
+          ContainerDto::Split(SplitContainerDto {
+            id: split_id,
+            parent_id: Some(ws2),
+            children: vec![
+              ContainerDto::Window(tiler_b_s.clone()),
+              ContainerDto::Window(floater_s.clone()),
+            ],
+            child_focus_order: vec![floater_s.id, tiler_b_s.id],
+            has_focus: true,
+            tiling_size: 1.0,
+            width: 800,
+            height: 600,
+            x: 0,
+            y: 0,
+            tiling_direction: TilingDirection::Horizontal,
+          }),
+          ContainerDto::Window(tiler_s.clone()),
+          ContainerDto::Window(fuller_s.clone()),
+          ContainerDto::Window(miner_s.clone()),
+        ],
+      )],
+      vec![(mon_a, "DISPLAY1", vec![ws2]), (mon_b, "DISPLAY2", vec![])],
+      "2026-09-24T12:00:00Z",
+    );
+
+    let leaves_a = collect_restored_leaf_views(&snapshot_a);
+    assert!(
+      leaves_a.len() >= 5,
+      "fixture should include tiling/floating/fullscreen/minimized/sibling"
+    );
+    let leaves_scrambled = collect_restored_leaf_views(&scrambled);
+    assert_ne!(leaves_a, leaves_scrambled);
+
+    let restored = virtual_restore_leaves(&snapshot_a, &scrambled);
+    assert_eq!(
+      restored, leaves_a,
+      "virtual restore must recover workspace, order, state, prev_state, \
+       floating WxH, and tiling sizes from snapshot A"
+    );
+
+    assert!(leaves_a.iter().any(|l| {
+      l.workspace_name == "1"
+        && matches!(l.state, WindowState::Minimized)
+        && l.prev_state.is_some()
+    }));
+    assert!(leaves_a.iter().any(|l| {
+      matches!(l.state, WindowState::Floating(_))
+        && l.floating_xywh == Some((40, 50, 640, 480))
+    }));
+    assert!(leaves_a.iter().any(|l| {
+      matches!(l.state, WindowState::Fullscreen(_))
+        && l
+          .prev_state
+          .as_ref()
+          .is_some_and(|s| matches!(s, WindowState::Tiling))
+    }));
+    assert!(leaves_a.iter().any(|l| l.tiling_size == Some(0.6)));
+    assert!(leaves_a
+      .iter()
+      .any(|l| l.process_name == "tiler" && l.order_index == 0));
   }
 }

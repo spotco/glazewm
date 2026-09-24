@@ -629,7 +629,8 @@ impl WindowManager {
       InvokeCommand::ShellExec {
         hide_window,
         command,
-      } => shell_exec(&command.join(" "), *hide_window, state),
+      } => // Re-quote after split_ipc_args so paths with spaces stay one arg for ShellExec.
+        shell_exec(&wm_common::join_ipc_args(command), *hide_window, state),
       InvokeCommand::Size(args) => {
         match subject_container.as_window_container() {
           Ok(window) => set_window_size(

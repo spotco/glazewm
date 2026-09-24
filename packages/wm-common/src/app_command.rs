@@ -507,3 +507,67 @@ pub struct InvokeUpdateWorkspaceConfig {
   #[clap(long)]
   pub keep_alive: Option<bool>,
 }
+
+#[cfg(test)]
+mod shell_exec_ipc_tests {
+  use super::*;
+  use crate::{ipc_argv_from_message, join_ipc_args};
+
+  fn parse_shell_exec(message: &str) -> Vec<String> {
+    let argv = ipc_argv_from_message(message).expect("tokenize");
+    match InvokeCommand::try_parse_from(argv).expect("parse") {
+      InvokeCommand::ShellExec { command, .. } => command,
+      other => panic!("expected ShellExec, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn invoke_shell_exec_preserves_powershell_file_path_with_spaces() {
+    let msg = r#"shell-exec powershell -File "C:\My Scripts\foo.ps1""#;
+    let command = parse_shell_exec(msg);
+    assert_eq!(
+      command,
+      vec![
+        "powershell".to_string(),
+        "-File".to_string(),
+        r"C:\My Scripts\foo.ps1".to_string(),
+      ]
+    );
+    assert_eq!(
+      join_ipc_args(&command),
+      r#"powershell -File "C:\My Scripts\foo.ps1""#
+    );
+  }
+
+  #[test]
+  fn invoke_shell_exec_preserves_code_project_path() {
+    let command = parse_shell_exec(r#"shell-exec code "C:\My Project""#);
+    assert_eq!(join_ipc_args(&command), r#"code "C:\My Project""#);
+  }
+
+  #[test]
+  fn invoke_shell_exec_multiple_quoted_args_and_empty() {
+    let command = parse_shell_exec(r#"shell-exec tool "arg one" "" --flag"#);
+    assert_eq!(
+      command,
+      vec![
+        "tool".to_string(),
+        "arg one".to_string(),
+        String::new(),
+        "--flag".to_string(),
+      ]
+    );
+    assert_eq!(join_ipc_args(&command), r#"tool "arg one" "" --flag"#);
+  }
+
+  #[test]
+  fn invoke_shell_exec_unc_path_round_trip() {
+    let unc = r"\\server\share\My Folder\file.ps1";
+    let msg = format!("shell-exec powershell -File {}", crate::quote_ipc_arg(unc));
+    let command = parse_shell_exec(&msg);
+    assert_eq!(command.last().map(String::as_str), Some(unc));
+    let joined = join_ipc_args(&command);
+    let again = parse_shell_exec(&format!("shell-exec {joined}"));
+    assert_eq!(again, command);
+  }
+}
