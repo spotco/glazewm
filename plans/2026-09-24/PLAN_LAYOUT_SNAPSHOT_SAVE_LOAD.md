@@ -17,6 +17,8 @@ Scope: tray context-menu save/load + CLI save/load/inspect + best-effort restore
 - [x] Step 8 - Commit, push, open PR against `glazewm-spotcobuild`
 - [x] Step 9 - Address PR review: macOS class_name, monitor match, Minimized prev_state, UTF-8 fuzzy (b17c3bd9)
 - [x] Step 10 - CLI save-layout / load-layout / query layout-match (+ inspect-layout alias)
+- [x] Step 11 - PR review round 2: full WindowState equality + prev_state, floating W+H,
+      empty workspace→monitor, IPC path-with-spaces quoting
 
 ## Objective
 
@@ -87,8 +89,10 @@ match_windows(snapshot_windows, live_windows) -> Vec<(snapshot_key, live_id)>
 3. Collect all `SnapshotWindow` leaves (ignored: skip / leave alone).
 4. Enumerate live managed windows from `wm.state`; run matcher.
 5. For each matched pair: move to target workspace (by snapshot workspace
-   name on matched monitor); apply `WindowState` (and `prev_state` awareness
-   for Minimized).
+   name on matched monitor); apply full `WindowState` equality (Floating/
+   Fullscreen config fields) and `prev_state` for minimized **and**
+   non-minimized; restore floating Rect X/Y/W/H; place empty workspaces
+   from snapshot monitor structure.
 6. Optionally reorder tiling toward snapshot sibling order; set
    `tiling_size` ratios when possible.
 7. Activate focused workspace from snapshot if present.

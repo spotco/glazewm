@@ -417,6 +417,42 @@ fn civil_from_days(unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
   )
 }
 
+
+/// Validate snapshot schema version before any restore mutation.
+///
+/// Returns `Ok(())` when `version == LAYOUT_SNAPSHOT_VERSION`. Callers must
+/// invoke this (or equivalent) before mutating WM state so unsupported
+/// versions fail cleanly with no partial apply.
+pub fn validate_layout_snapshot_version(
+  snapshot: &LayoutSnapshot,
+) -> Result<(), String> {
+  if snapshot.version != LAYOUT_SNAPSHOT_VERSION {
+    Err(format!(
+      "Unsupported layout snapshot version {} (expected {}).",
+      snapshot.version, LAYOUT_SNAPSHOT_VERSION
+    ))
+  } else {
+    Ok(())
+  }
+}
+
+/// Plan workspace-name → snapshot-monitor index (first occurrence wins).
+///
+/// Includes **empty** workspaces — restore must not rely solely on window
+/// leaves to discover workspace→monitor placement.
+#[must_use]
+pub fn snapshot_workspace_monitor_indices(
+  monitors: &[SnapshotMonitor],
+) -> std::collections::HashMap<String, usize> {
+  let mut planned = std::collections::HashMap::new();
+  for (index, mon) in monitors.iter().enumerate() {
+    for workspace in &mon.workspaces {
+      planned.entry(workspace.name.clone()).or_insert(index);
+    }
+  }
+  planned
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -646,6 +682,121 @@ mod tests {
     ));
     assert!(plain.prev_state.is_none());
   }
+
+  #[test]
+  fn unsupported_version_fails_validation() {
+    let mut snap = LayoutSnapshot {
+      version: LAYOUT_SNAPSHOT_VERSION + 99,
+      captured_at: "t".into(),
+      glazewm_version: None,
+      paused: false,
+      binding_modes: vec![],
+      monitors: vec![],
+      ignored_windows: vec![],
+    };
+    assert!(validate_layout_snapshot_version(&snap).is_err());
+    snap.version = LAYOUT_SNAPSHOT_VERSION;
+    assert!(validate_layout_snapshot_version(&snap).is_ok());
+  }
+
+  #[test]
+  fn unsupported_version_is_rejected_before_any_restore() {
+    // Mirrors load_layout_snapshot's first gate: bad versions error with
+    // no WM mutation. Invalid JSON is rejected earlier by
+    // `read_layout_snapshot_file` in the wm package (serde_json parse).
+    let snap = LayoutSnapshot {
+      version: 0,
+      captured_at: "t".into(),
+      glazewm_version: None,
+      paused: false,
+      binding_modes: vec![],
+      monitors: vec![],
+      ignored_windows: vec![],
+    };
+    let err = validate_layout_snapshot_version(&snap).unwrap_err();
+    assert!(err.contains("Unsupported layout snapshot version"));
+  }
+
+  #[test]
+  fn empty_workspace_included_in_monitor_plan() {
+    let empty_root = SnapshotNode {
+      local_id: "root".into(),
+      kind: SnapshotNodeKind::Split,
+      tiling_size: None,
+      tiling_direction: Some(TilingDirection::Horizontal),
+      children: Some(vec![]),
+      child_focus_order: Some(vec![]),
+      window: None,
+      id: None,
+    };
+    let monitors = vec![
+      SnapshotMonitor {
+        hardware_id: Some("HW1".into()),
+        device_path: None,
+        device_name: "DISPLAY1".into(),
+        bounds: SnapshotBounds { x: 0, y: 0, width: 1920, height: 1080 },
+        focused_workspace_name: Some("empty-focus".into()),
+        workspaces: vec![
+          SnapshotWorkspace {
+            name: "with-win".into(),
+            tiling_direction: TilingDirection::Horizontal,
+            child_focus_order: vec![],
+            root: empty_root.clone(),
+            id: None,
+          },
+        ],
+        id: None,
+      },
+      SnapshotMonitor {
+        hardware_id: Some("HW2".into()),
+        device_path: None,
+        device_name: "DISPLAY2".into(),
+        bounds: SnapshotBounds { x: 1920, y: 0, width: 1920, height: 1080 },
+        focused_workspace_name: Some("empty-focus".into()),
+        workspaces: vec![
+          SnapshotWorkspace {
+            name: "empty-focus".into(),
+            tiling_direction: TilingDirection::Horizontal,
+            child_focus_order: vec![],
+            root: empty_root,
+            id: None,
+          },
+        ],
+        id: None,
+      },
+    ];
+    // Put a window only on monitor 0 so leaf-driven planning would miss monitor 1.
+    let plan = snapshot_workspace_monitor_indices(&monitors);
+    assert_eq!(plan.get("with-win").copied(), Some(0));
+    assert_eq!(
+      plan.get("empty-focus").copied(),
+      Some(1),
+      "empty workspace must map to its snapshot monitor"
+    );
+  }
+
+  #[test]
+  fn floating_placement_rect_round_trips_xywh() {
+    let rect = Rect::from_xy(100, 200, 640, 480);
+    let mut win = sample_window(Uuid::from_u128(42), "floaty", None);
+    win.state = WindowState::Floating(crate::FloatingStateConfig {
+      centered: false,
+      shown_on_top: true,
+    });
+    win.prev_state = Some(WindowState::Tiling);
+    win.floating_placement = rect.clone();
+    let snap = SnapshotWindow::from_window_dto(&win);
+    assert_eq!(snap.floating_placement.as_ref().map(|r| (r.x(), r.y(), r.width(), r.height())), Some((100, 200, 640, 480)));
+    assert_eq!(snap.prev_state, Some(WindowState::Tiling));
+    assert_eq!(
+      snap.state,
+      WindowState::Floating(crate::FloatingStateConfig {
+        centered: false,
+        shown_on_top: true,
+      })
+    );
+  }
+
 
   #[test]
   fn format_rfc3339_known_instant() {

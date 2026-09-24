@@ -1,4 +1,4 @@
-use std::{iter, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{error::KindFormatter, Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -342,7 +342,11 @@ impl<'de> Deserialize<'de> for InvokeCommand {
     // the binary name/path. When deserializing commands from the user
     // config, we therefore have to prepend an additional empty argument.
     let unparsed = String::deserialize(deserializer)?;
-    let unparsed_split = iter::once("").chain(unparsed.split_whitespace());
+    // Quote-aware split so `load-layout "C:\path with spaces\a.json"` works
+    // in config bindings and IPC `command load-layout ...`.
+    let unparsed_split = crate::ipc_argv_from_message(&unparsed).map_err(|err| {
+      serde::de::Error::custom(err.to_string())
+    })?;
 
     InvokeCommand::try_parse_from(unparsed_split).map_err(|err| {
       // Format the error message and remove the "error: " prefix.

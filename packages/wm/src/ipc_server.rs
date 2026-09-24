@@ -1,4 +1,4 @@
-use std::{iter, net::SocketAddr};
+use std::net::SocketAddr;
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -145,9 +145,10 @@ impl IpcServer {
     wm: &mut WindowManager,
     config: &mut UserConfig,
   ) -> anyhow::Result<()> {
-    let app_command = AppCommand::try_parse_from(
-      iter::once("").chain(message.split_whitespace()),
-    );
+    // Quote-aware argv split so path-bearing commands survive spaces
+    // (e.g. load-layout / inspect-layout / query layout-match).
+    let argv = wm_common::ipc_argv_from_message(&message)?;
+    let app_command = AppCommand::try_parse_from(argv);
 
     let response_data =
       app_command

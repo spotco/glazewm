@@ -651,4 +651,75 @@ mod tests {
     assert!(report.unmatched_snapshot.is_empty());
     assert!(report.unmatched_live.is_empty());
   }
+
+  /// Greedy matching: identical exe + similar titles prefers exact title when
+  /// available; leftover live windows stay unmatched. Missing snapshot apps
+  /// simply leave that snap unmatched (no launch).
+  #[test]
+  fn ambiguity_same_exe_similar_titles_and_extra_live() {
+    let snaps = vec![
+      win(
+        "snap-notes",
+        ident(None, "notepad", None, Some("notes.txt - Notepad")),
+      ),
+      win(
+        "snap-missing",
+        ident(
+          Some(r"C:\Apps\gone.exe"),
+          "gone",
+          None,
+          Some("Gone Window"),
+        ),
+      ),
+    ];
+    let lives = vec![
+      win(
+        "live-notes",
+        ident(None, "notepad", None, Some("notes.txt - Notepad")),
+      ),
+      win(
+        "live-notes-copy",
+        ident(None, "notepad", None, Some("notes - Notepad")),
+      ),
+      win(
+        "live-extra",
+        ident(None, "calc", None, Some("Calculator")),
+      ),
+    ];
+
+    let matched = match_windows(&snaps, &lives);
+    // Exact title wins for snap-notes; snap-missing has no live candidate.
+    assert!(matched.contains(&(
+      "snap-notes".to_string(),
+      "live-notes".to_string()
+    )));
+    assert!(!matched.iter().any(|(s, _)| s == "snap-missing"));
+    // Extra live windows (similar-title notepad + calc) remain unmatched.
+    let matched_lives: Vec<_> = matched.iter().map(|(_, l)| l.clone()).collect();
+    assert!(!matched_lives.contains(&"live-extra".to_string()));
+    assert_eq!(matched.len(), 1);
+  }
+
+  #[test]
+  fn greedy_does_not_double_assign_identical_identities() {
+    // Two identical snapshot windows, two identical live windows: greedy
+    // 1:1 assign both pairs (order by score then discovery).
+    let snaps = vec![
+      win("s1", ident(None, "app", None, Some("Title"))),
+      win("s2", ident(None, "app", None, Some("Title"))),
+    ];
+    let lives = vec![
+      win("l1", ident(None, "app", None, Some("Title"))),
+      win("l2", ident(None, "app", None, Some("Title"))),
+    ];
+    let matched = match_windows(&snaps, &lives);
+    assert_eq!(matched.len(), 2);
+    let snap_keys: std::collections::HashSet<_> =
+      matched.iter().map(|(s, _)| s.clone()).collect();
+    let live_keys: std::collections::HashSet<_> =
+      matched.iter().map(|(_, l)| l.clone()).collect();
+    assert_eq!(snap_keys.len(), 2);
+    assert_eq!(live_keys.len(), 2);
+  }
+
 }

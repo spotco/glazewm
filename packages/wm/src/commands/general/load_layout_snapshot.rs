@@ -6,7 +6,7 @@ use uuid::Uuid;
 use wm_common::{
   match_windows, LayoutSnapshot, MatchableIdentity, MatchableWindow,
   SnapshotBounds, SnapshotMonitor, SnapshotNode, SnapshotNodeKind,
-  SnapshotWindow, WindowState, LAYOUT_SNAPSHOT_VERSION,
+  SnapshotWindow, WindowState,
 };
 
 use crate::{
@@ -16,10 +16,7 @@ use crate::{
       set_focused_descendant,
     },
     monitor::move_workspace_to_monitor,
-    window::{
-      move_window_to_workspace, set_window_position, update_window_state,
-      WindowPositionTarget,
-    },
+    window::{move_window_to_workspace, update_window_state},
     workspace::{activate_workspace, focus_workspace},
   },
   models::{
@@ -46,12 +43,6 @@ struct SnapshotLeaf {
   key: String,
   window: SnapshotWindow,
   workspace_name: String,
-  /// Live monitor matched to the snapshot monitor this leaf came from.
-  ///
-  /// Workspace names are globally unique in GlazeWM, so restore reassigns
-  /// the named workspace onto this monitor (via `move_workspace_to_monitor`
-  /// / `activate_workspace`) before placing windows.
-  target_monitor: Option<Monitor>,
   /// DFS order among window leaves in the workspace.
   order_index: usize,
   tiling_size: Option<f32>,
@@ -67,12 +58,8 @@ pub fn load_layout_snapshot(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<LoadLayoutSummary> {
-  if snapshot.version != LAYOUT_SNAPSHOT_VERSION {
-    anyhow::bail!(
-      "Unsupported layout snapshot version {} (expected {}).",
-      snapshot.version,
-      LAYOUT_SNAPSHOT_VERSION
-    );
+  if let Err(msg) = wm_common::validate_layout_snapshot_version(snapshot) {
+    anyhow::bail!("{msg}");
   }
 
   let monitor_map = match_monitors(&snapshot.monitors, &state.monitors());
@@ -120,7 +107,7 @@ pub fn load_layout_snapshot(
   // Workspace names are global/unique: move (or activate) each named
   // workspace onto its matched live monitor before placing windows.
   if let Err(err) =
-    ensure_workspaces_on_matched_monitors(&leaves, state, config)
+    ensure_workspaces_on_matched_monitors(&monitor_map, state, config)
   {
     tracing::warn!(
       "Failed to reassign workspaces to matched monitors: {err:#}"
@@ -234,6 +221,12 @@ fn restore_window(
   // For Minimized restore, apply snapshot prev_state first (so the later
   // minimize event records it), then minimize; also set_prev_state so
   // unminimize returns to Floating/Tiling/etc. from the snapshot.
+  //
+  // For non-minimized targets, compare full WindowState (not just the
+  // discriminant) so Floating.centered/shown_on_top and
+  // Fullscreen.maximized/shown_on_top round-trip. Always re-apply snapshot
+  // prev_state so exiting fullscreen/unminimize uses the saved previous
+  // state rather than the live pre-load state.
   let window = if matches!(target_state, WindowState::Minimized) {
     let mut window = window;
     if let Some(prev) = &leaf.window.prev_state {
@@ -260,25 +253,29 @@ fn restore_window(
       window.set_prev_state(prev.clone());
     }
     window
-  } else if !window.state().is_same_state(&target_state) {
-    let window =
-      update_window_state(window, target_state.clone(), state, config)?;
-    summary.state_updates += 1;
-    window
   } else {
+    let window = if window.state() != target_state {
+      let window =
+        update_window_state(window, target_state.clone(), state, config)?;
+      summary.state_updates += 1;
+      window
+    } else {
+      window
+    };
+
+    if let Some(prev) = &leaf.window.prev_state {
+      window.set_prev_state(prev.clone());
+    }
     window
   };
 
   if matches!(target_state, WindowState::Floating(_)) {
     if let Some(placement) = &leaf.window.floating_placement {
-      set_window_position(
-        window,
-        &WindowPositionTarget::Coordinates(
-          Some(placement.x()),
-          Some(placement.y()),
-        ),
-        state,
-      )?;
+      // Full Rect restore (X/Y/W/H). set_window_position alone preserves
+      // live width/height and cannot round-trip a resized float.
+      window.set_floating_placement(placement.clone());
+      window.set_has_custom_floating_placement(true);
+      state.pending_sync.queue_container_to_redraw(window);
     }
   }
 
@@ -487,7 +484,7 @@ fn collect_snapshot_leaves(
   let mut leaves = Vec::new();
   let mut seen_workspace_keys: HashSet<String> = HashSet::new();
 
-  for (snap_mon, live_mon) in monitor_map {
+  for (snap_mon, _live_mon) in monitor_map {
     for workspace in &snap_mon.workspaces {
       let ws_key = format!("{}::{}", snap_mon.device_name, workspace.name);
       if !seen_workspace_keys.insert(ws_key) {
@@ -497,7 +494,6 @@ fn collect_snapshot_leaves(
       collect_node_windows(
         &workspace.root,
         &workspace.name,
-        Some(live_mon.clone()),
         &mut order,
         &mut leaves,
       );
@@ -516,7 +512,6 @@ fn collect_snapshot_leaves(
       collect_node_windows(
         &workspace.root,
         &workspace.name,
-        None,
         &mut order,
         &mut leaves,
       );
@@ -532,17 +527,21 @@ fn collect_snapshot_leaves(
 /// `WorkspaceTarget::Name` alone cannot express "workspace X on monitor A".
 /// We therefore reassign (or activate) the named workspace onto the matched
 /// monitor before `move_window_to_workspace` places windows.
+///
+/// Placement is derived from the snapshot monitor→workspace structure (via
+/// `monitor_map`), **including empty workspaces** that produce no window
+/// leaves. Leaf-driven planning alone would skip those.
 fn ensure_workspaces_on_matched_monitors(
-  leaves: &[SnapshotLeaf],
+  monitor_map: &[(SnapshotMonitor, Monitor)],
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
   let mut planned: HashMap<String, Monitor> = HashMap::new();
-  for leaf in leaves {
-    if let Some(mon) = &leaf.target_monitor {
+  for (snap_mon, live_mon) in monitor_map {
+    for workspace in &snap_mon.workspaces {
       planned
-        .entry(leaf.workspace_name.clone())
-        .or_insert_with(|| mon.clone());
+        .entry(workspace.name.clone())
+        .or_insert_with(|| live_mon.clone());
     }
   }
 
@@ -584,7 +583,6 @@ fn ensure_workspaces_on_matched_monitors(
 fn collect_node_windows(
   node: &SnapshotNode,
   workspace_name: &str,
-  target_monitor: Option<Monitor>,
   order: &mut usize,
   out: &mut Vec<SnapshotLeaf>,
 ) {
@@ -597,7 +595,6 @@ fn collect_node_windows(
           key,
           window: window.clone(),
           workspace_name: workspace_name.to_string(),
-          target_monitor: target_monitor.clone(),
           order_index: *order,
           tiling_size: node.tiling_size,
         });
@@ -607,13 +604,7 @@ fn collect_node_windows(
     SnapshotNodeKind::Split => {
       if let Some(children) = &node.children {
         for child in children {
-          collect_node_windows(
-            child,
-            workspace_name,
-            target_monitor.clone(),
-            order,
-            out,
-          );
+          collect_node_windows(child, workspace_name, order, out);
         }
       }
     }

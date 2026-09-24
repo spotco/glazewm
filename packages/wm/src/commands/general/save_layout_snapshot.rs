@@ -181,3 +181,40 @@ fn snapshot_from_native_window(
     handle: Some(handle),
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::read_layout_snapshot_file;
+
+  #[test]
+  fn rejects_invalid_json_without_returning_snapshot() {
+    let dir = tempfile_dir();
+    let path = dir.join("bad.json");
+    std::fs::write(&path, "{not json").unwrap();
+    assert!(read_layout_snapshot_file(&path).is_err());
+  }
+
+  #[test]
+  fn rejects_unsupported_version_at_load_gate() {
+    use wm_common::{validate_layout_snapshot_version, LayoutSnapshot, LAYOUT_SNAPSHOT_VERSION};
+    let snap = LayoutSnapshot {
+      version: LAYOUT_SNAPSHOT_VERSION + 1,
+      captured_at: "t".into(),
+      glazewm_version: None,
+      paused: false,
+      binding_modes: vec![],
+      monitors: vec![],
+      ignored_windows: vec![],
+    };
+    assert!(validate_layout_snapshot_version(&snap).is_err());
+  }
+
+  fn tempfile_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+      "glazewm-layout-test-{}",
+      std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+  }
+}
