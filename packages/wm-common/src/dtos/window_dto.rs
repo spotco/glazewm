@@ -28,5 +28,8 @@ pub struct WindowDto {
   #[cfg(target_os = "windows")]
   pub class_name: String,
   pub process_name: String,
+  /// Full process image path when available (Windows).
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub process_path: Option<String>,
   pub active_drag: Option<ActiveDrag>,
 }

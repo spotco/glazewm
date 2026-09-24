@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{BindingModeConfig, ContainerDto, TilingDirection, WmEvent};
+use crate::{BindingModeConfig, ContainerDto, LayoutSnapshot, TilingDirection, WmEvent};
 
 pub const DEFAULT_IPC_PORT: u32 = 6123;
 
@@ -35,6 +35,8 @@ pub enum ClientResponseData {
   Windows(WindowsData),
   Workspaces(WorkspacesData),
   Paused(bool),
+  Layout(LayoutSnapshot),
+  Ignored(crate::IgnoredWindowsData),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
