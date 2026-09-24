@@ -15,13 +15,17 @@ use wm_common::{
   AppCommand, AppMetadataData, BindingModesData, ClientResponseData,
   ClientResponseMessage, CommandData, EventSubscribeData,
   EventSubscriptionMessage, FocusedData, IgnoredWindowsData,
-  LayoutSnapshot, MonitorsData, QueryCommand, ServerMessage,
-  SnapshotWindow, SnapshotWindowIdentity, SubscribableEvent,
-  TilingDirectionData, WindowsData, WmEvent, WorkspacesData,
-  DEFAULT_IPC_PORT, format_system_time_rfc3339,
+  LayoutSnapshot, LoadLayoutData, MonitorsData, QueryCommand,
+  ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
+  SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
+  WorkspacesData, DEFAULT_IPC_PORT, format_system_time_rfc3339,
 };
 
 use crate::{
+  commands::general::{
+    inspect_layout_snapshot, load_layout_snapshot,
+    read_layout_snapshot_file,
+  },
   traits::{CommonGetters, TilingDirectionGetters},
   user_config::UserConfig,
   wm::WindowManager,
@@ -287,7 +291,40 @@ impl IpcServer {
               .collect(),
           })
         }
+        QueryCommand::LayoutMatch { path } => {
+          let snapshot = read_layout_snapshot_file(&path)?;
+          let report = inspect_layout_snapshot(&snapshot, &wm.state)?;
+          ClientResponseData::LayoutMatch(report)
+        }
       },
+      AppCommand::LoadLayout { path }
+      | AppCommand::Command {
+        command: wm_common::InvokeCommand::LoadLayout { path },
+        ..
+      } => {
+        let snapshot = read_layout_snapshot_file(&path)?;
+        let summary =
+          load_layout_snapshot(&snapshot, &mut wm.state, config)?;
+        if wm.state.pending_sync.has_changes() {
+          crate::commands::general::platform_sync(&mut wm.state, config)?;
+        }
+        ClientResponseData::LoadLayout(LoadLayoutData {
+          matched: summary.matched,
+          unmatched_snapshot: summary.unmatched_snapshot,
+          unmatched_live: summary.unmatched_live,
+          workspace_moves: summary.workspace_moves,
+          state_updates: summary.state_updates,
+        })
+      }
+      AppCommand::InspectLayout { path } => {
+        let snapshot = read_layout_snapshot_file(&path)?;
+        let report = inspect_layout_snapshot(&snapshot, &wm.state)?;
+        ClientResponseData::LayoutMatch(report)
+      }
+      AppCommand::SaveLayout { .. } => {
+        // CLI handles durable write after `query layout`; not an IPC op.
+        bail!("save-layout is handled by glazewm-cli locally.")
+      }
       AppCommand::Command {
         subject_container_id,
         command,

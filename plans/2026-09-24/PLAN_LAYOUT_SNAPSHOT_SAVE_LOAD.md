@@ -1,9 +1,9 @@
 # Layout Snapshot Save/Load Plan
 
 Date: 2026-09-24
-Status: Implemented; PR open
+Status: Implemented (tray + CLI); PR open
 Branch: `feature/layout-snapshot-save-load`
-Scope: tray context-menu save/load + best-effort restore (no app launch)
+Scope: tray context-menu save/load + CLI save/load/inspect + best-effort restore (no app launch)
 
 ## Progress
 
@@ -16,6 +16,7 @@ Scope: tray context-menu save/load + best-effort restore (no app launch)
 - [x] Step 7 - `cargo test -p wm-common --lib` + compile `wm`
 - [x] Step 8 - Commit, push, open PR against `glazewm-spotcobuild`
 - [x] Step 9 - Address PR review: macOS class_name, monitor match, Minimized prev_state, UTF-8 fuzzy (b17c3bd9)
+- [x] Step 10 - CLI save-layout / load-layout / query layout-match (+ inspect-layout alias)
 
 ## Objective
 
@@ -147,6 +148,43 @@ cargo check -p wm
 
 - [ ] Commit(s), push, `gh pr create` base `glazewm-spotcobuild`
 
+## CLI surface (save / load / inspect)
+
+Added for reproducible scripting (no tray dialogs):
+
+| Command | Effect |
+|---------|--------|
+| `glazewm-cli save-layout <path.json>` | Durable snapshot write (same as `query layout -o`) |
+| `glazewm-cli query layout -o <path.json>` | Unchanged |
+| `glazewm-cli load-layout <path.json>` | IPC → running WM best-effort restore (`read_layout_snapshot_file` + `load_layout_snapshot`) |
+| `glazewm-cli command load-layout <path.json>` | Same restore via `InvokeCommand::LoadLayout` |
+| `glazewm-cli query layout-match <path.json>` | Dry-run match report JSON (no mutation) |
+| `glazewm-cli inspect-layout <path.json>` | Alias of layout-match |
+
+Match report fields: `matched[]` (snapshot/live identity, `score`, optional `plannedWorkspaceMove`), `unmatchedSnapshot[]`, `unmatchedLive[]`. Pure report builder + scoring live in `wm-common` (`build_layout_match_report`, `match_windows_with_scores`).
+
+### Step 10 - CLI save / load / inspect
+
+- [x] `save-layout` / `load-layout` / `inspect-layout` + `query layout-match`
+- [x] `InvokeCommand::LoadLayout` + IPC `LoadLayout` / `LayoutMatch` responses
+- [x] Unit tests for report builder in `layout_snapshot_matcher`
+- [x] Smoke on Asus (see verification)
+
+## Verification commands (CLI)
+
+```
+cargo test -p wm-common --lib
+# build (Asus): build.bat   OR   cargo build -p wm -p wm-cli --release
+# Live (WM running from this build):
+glazewm-cli save-layout %TEMP%\glazewm-smoke.json
+glazewm-cli query layout-match %TEMP%\glazewm-smoke.json
+# optional (mutates desktop):
+glazewm-cli load-layout %TEMP%\glazewm-smoke.json
+glazewm-cli query layout -o %TEMP%\glazewm-smoke-after.json
+```
+
+Not CLI-testable: tray file dialogs / clipboard copy (manual).
+
 ## Follow-up (explicitly out of scope)
 
 - Launch missing apps via `processPath`
@@ -162,3 +200,4 @@ cargo check -p wm
 # Live (requires running GlazeWM from this branch):
 # Tray → Copy / Save… / Load…
 ```
+

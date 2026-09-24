@@ -11,18 +11,32 @@ use wm_ipc_client::IpcClient;
 pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
   let app_command = AppCommand::parse_from(&args);
 
-  let output_path: Option<PathBuf> = match &app_command {
+  let layout_output_path: Option<PathBuf> = match &app_command {
     AppCommand::Query {
       command: QueryCommand::Layout { output },
     } => output.clone(),
+    AppCommand::SaveLayout { path } => Some(path.clone()),
     _ => None,
   };
 
-  // Layout --output is CLI-local; IPC server only receives `query layout`.
+  // Reconstruct IPC message carefully for path-bearing commands.
+  // Layout --output / save-layout write is CLI-local; IPC only gets `query layout`.
   let message = match &app_command {
     AppCommand::Query {
       command: QueryCommand::Layout { .. },
-    } => "query layout".to_string(),
+    }
+    | AppCommand::SaveLayout { .. } => "query layout".to_string(),
+    AppCommand::LoadLayout { path } => {
+      format!("load-layout {}", quote_path(path))
+    }
+    AppCommand::Query {
+      command: QueryCommand::LayoutMatch { path },
+    } => {
+      format!("query layout-match {}", quote_path(path))
+    }
+    AppCommand::InspectLayout { path } => {
+      format!("inspect-layout {}", quote_path(path))
+    }
     _ => args[1..].join(" "),
   };
 
@@ -39,13 +53,14 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
     .context("Failed to receive response from IPC server.")?;
 
   if let (Some(path), Some(ClientResponseData::Layout(snapshot))) =
-    (&output_path, &client_response.data)
+    (&layout_output_path, &client_response.data)
   {
     let durable = snapshot.clone().into_durable();
     let json = serde_json::to_string_pretty(&durable)
       .context("Failed to serialize durable layout snapshot.")?;
-    std::fs::write(path, json)
-      .with_context(|| format!("Failed to write layout snapshot to {}.", path.display()))?;
+    std::fs::write(path, json).with_context(|| {
+      format!("Failed to write layout snapshot to {}.", path.display())
+    })?;
   }
 
   match client_response.data {
@@ -67,4 +82,10 @@ pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
   }
 
   Ok(())
+}
+
+/// Format path for IPC. Paths with whitespace are not supported over IPC
+/// (server re-parses with `split_whitespace`).
+fn quote_path(path: &std::path::Path) -> String {
+  path.display().to_string()
 }

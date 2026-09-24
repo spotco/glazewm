@@ -64,6 +64,37 @@ pub enum AppCommand {
     #[clap(long = "id")]
     subscription_id: Uuid,
   },
+
+  /// Save a durable layout snapshot JSON to `path` (CLI-local write).
+  ///
+  /// Requires an already running instance of the window manager.
+  /// Equivalent to `query layout -o <path>`.
+  #[clap(name = "save-layout")]
+  SaveLayout {
+    /// Destination path for durable snapshot JSON.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
+
+  /// Load a layout snapshot JSON into the running WM (best-effort restore).
+  ///
+  /// Requires an already running instance of the window manager.
+  #[clap(name = "load-layout")]
+  LoadLayout {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
+
+  /// Dry-run match a layout snapshot against live windows (no mutation).
+  ///
+  /// Alias of `query layout-match`. Requires a running WM.
+  #[clap(name = "inspect-layout")]
+  InspectLayout {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
 }
 
 impl AppCommand {
@@ -140,6 +171,17 @@ pub enum QueryCommand {
   },
   /// Outputs windows currently ignored by the WM.
   Ignored,
+
+  /// Dry-run match a layout snapshot file against live managed windows.
+  ///
+  /// Returns matched pairs (with scores), unmatched snapshot/live windows,
+  /// and optional planned workspace moves. Does not mutate WM state.
+  #[clap(name = "layout-match")]
+  LayoutMatch {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
 }
 
 #[derive(Clone, Debug, PartialEq, ValueEnum)]
@@ -270,6 +312,13 @@ pub enum InvokeCommand {
   WmRedraw,
   WmReloadConfig,
   WmTogglePause,
+
+  /// Load a layout snapshot JSON (best-effort restore; no app launch).
+  LoadLayout {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
 }
 
 impl<'de> Deserialize<'de> for InvokeCommand {

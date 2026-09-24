@@ -776,6 +776,15 @@ impl WindowManager {
         toggle_pause(state);
         Ok(())
       }
+      InvokeCommand::LoadLayout { path } => {
+        let snapshot = crate::commands::general::read_layout_snapshot_file(path)?;
+        let _summary = crate::commands::general::load_layout_snapshot(
+          &snapshot,
+          state,
+          config,
+        )?;
+        Ok(())
+      }
     }
   }
 
