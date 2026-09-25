@@ -1,7 +1,7 @@
 # Layout Snapshot Save/Load Plan
 
 Date: 2026-09-24
-Status: Implemented (tray + CLI); PR open
+Status: Implemented (tray + CLI + auto layout.json persistence); PR open
 Branch: `feature/layout-snapshot-save-load`
 Scope: tray context-menu save/load + CLI save/load/inspect + best-effort restore (no app launch)
 
@@ -205,3 +205,26 @@ cargo check -p wm
 # Tray → Copy / Save… / Load…
 ```
 
+## Auto layout persistence (`layout.json`) — 2026-09-24 evening
+
+Status: Implemented on this branch (same PR #2)
+
+### Behaviour
+
+- **Path:** `layout.json` beside the active `config.yaml` via `config.path.with_file_name("layout.json")` (same dir resolution as `UserConfig` / `%USERPROFILE%\.glzr\glazewm`, not a hardcoded username).
+- **Startup load:** After `WmState::populate` (via `WindowManager::new`) and user `startup_commands`, call `try_load_persisted_layout_snapshot`. Missing / empty / invalid JSON / restore failure -> `tracing` warn/info and continue with default layout (never fatal, no error dialog).
+- **Auto-save:** On layout-affecting `WmEvent`s (move/manage/unmanage/workspace/tiling direction/monitor; **not** pure `FocusChanged` / pause / config), debounce **5s** (`LAYOUT_AUTO_SAVE_DEBOUNCE`), then write durable snapshot JSON (same schema as tray/CLI) via `save_layout_snapshot_to_path`.
+- **No thrash on restore:** Drain `event_rx` after startup load (IPC still gets events) **before** enabling `LayoutAutoSave`, so restore does not immediately rewrite `layout.json`.
+- **Module:** `packages/wm/src/commands/general/layout_persistence.rs`
+
+### Tests
+
+- Path join (Windows + Unix style)
+- Debounce enable/disable arming
+- Non-layout event gate
+- Empty/missing file gates (no live GUI)
+
+```
+cargo test -p wm layout_persistence
+cargo test -p wm-common --lib
+```

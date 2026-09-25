@@ -119,7 +119,7 @@ pub fn read_layout_snapshot_file(
   Ok(snapshot)
 }
 
-fn write_snapshot_file(path: &Path, json: &str) -> anyhow::Result<()> {
+pub fn write_snapshot_file(path: &Path, json: &str) -> anyhow::Result<()> {
   fs::write(path, json)
     .with_context(|| format!("Failed to write {}", path.display()))?;
   info!("Saved layout snapshot to {}.", path.display());

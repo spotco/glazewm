@@ -31,9 +31,11 @@ use wm_platform::{
 
 use crate::{
   commands::general::{
-    copy_layout_snapshot_to_clipboard, load_layout_snapshot,
-    pick_layout_snapshot_path, platform_sync,
+    copy_layout_snapshot_to_clipboard, layout_snapshot_path,
+    load_layout_snapshot, pick_layout_snapshot_path, platform_sync,
     read_layout_snapshot_file, save_layout_snapshot_with_dialog,
+    try_load_persisted_layout_snapshot, wm_event_affects_layout_snapshot,
+    LayoutAutoSave,
   },
   ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
   wm::WindowManager,
@@ -181,6 +183,50 @@ async fn start_wm(
     dispatcher.show_error_dialog("Non-fatal error", &err.to_string());
   }
 
+  // Best-effort restore of persisted layout.json (beside config.yaml).
+  // Runs after initial populate + startup commands so windows/workspaces exist.
+  let layout_path = layout_snapshot_path(&config);
+  let _ = try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
+
+  // Drain events emitted by startup restore so IPC clients see them, but do
+  // not arm auto-save yet (avoids thrashing a rewrite of the file we just loaded).
+  while let Ok(wm_event) = wm.event_rx.try_recv() {
+    if let WmEvent::PauseChanged { is_paused } = wm_event {
+      let _ = mouse_listener.enable(!is_paused);
+    }
+    if matches!(
+      wm_event,
+      WmEvent::UserConfigChanged { .. }
+        | WmEvent::BindingModesChanged { .. }
+        | WmEvent::PauseChanged { .. }
+    ) {
+      keybinding_listener.update(
+        &config
+          .active_keybinding_configs(&wm.state.binding_modes, false)
+          .flat_map(|kb| kb.bindings)
+          .collect::<Vec<_>>(),
+      );
+      let _ = mouse_listener.set_enabled_events(
+        if config.value.general.focus_follows_cursor {
+          &[MouseEventKind::Move, MouseEventKind::LeftButtonUp]
+        } else {
+          &[MouseEventKind::LeftButtonUp]
+        },
+      );
+    }
+    if let Err(err) = ipc_server.process_event(wm_event) {
+      tracing::error!("{:?}", err);
+    }
+  }
+
+  let mut layout_auto_save = LayoutAutoSave::new(layout_path);
+  layout_auto_save.enable();
+  tracing::info!(
+    "Layout auto-save enabled (debounce {}s) -> {}",
+    crate::commands::general::LAYOUT_AUTO_SAVE_DEBOUNCE.as_secs(),
+    layout_auto_save.path().display()
+  );
+
   // Create an interval for periodically cleaning up invalid windows.
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
 
@@ -271,11 +317,18 @@ async fn start_wm(
           )?;
         }
 
+        if wm_event_affects_layout_snapshot(&wm_event) {
+          layout_auto_save.schedule();
+        }
+
         if let Err(err) = ipc_server.process_event(wm_event) {
           tracing::error!("{:?}", err);
         }
 
         Ok(())
+      },
+      () = layout_auto_save.sleep_mut(), if layout_auto_save.is_armed() => {
+        layout_auto_save.flush(&wm.state)
       },
       Some(()) = tray.config_reload_rx.recv() => {
         wm.process_commands(
