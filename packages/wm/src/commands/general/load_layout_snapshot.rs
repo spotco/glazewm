@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Context;
 use tracing::info;
+
+use super::layout_debug_log;
 use uuid::Uuid;
 use wm_common::{
   match_windows, plan_workspace_tiling_layout, LayoutPlanNode,
@@ -65,6 +67,12 @@ pub fn load_layout_snapshot(
   if let Err(msg) = wm_common::validate_layout_snapshot_version(snapshot) {
     anyhow::bail!("{msg}");
   }
+
+  layout_debug_log(format!(
+    "restore begin: snapshot monitors={}, version={}",
+    snapshot.monitors.len(),
+    snapshot.version
+  ));
 
   let monitor_map = match_monitors(&snapshot.monitors, &state.monitors());
   let leaves = collect_snapshot_leaves(snapshot, &monitor_map);
@@ -149,11 +157,13 @@ pub fn load_layout_snapshot(
     if let Err(err) =
       restore_window(leaf, window, state, config, &mut summary)
     {
-      tracing::warn!(
+      let msg = format!(
         "Failed to restore window '{}' -> {}: {err:#}",
         snap_key,
         live_key
       );
+      tracing::warn!("{msg}");
+      layout_debug_log(&msg);
     }
   }
 
@@ -187,7 +197,7 @@ pub fn load_layout_snapshot(
     }
   }
 
-  info!(
+  let msg = format!(
     "Layout snapshot load summary: matched={}, unmatched_snapshot={}, unmatched_live={}, workspace_moves={}, state_updates={}, tiling_trees_restored={}, tiling_windows_placed={}",
     summary.matched,
     summary.unmatched_snapshot,
@@ -197,6 +207,8 @@ pub fn load_layout_snapshot(
     summary.tiling_trees_restored,
     summary.tiling_windows_placed
   );
+  info!("{msg}");
+  layout_debug_log(&msg);
 
   Ok(summary)
 }
@@ -346,12 +358,14 @@ fn restore_tiling_layouts(
       let plan = plan_workspace_tiling_layout(ws, &matched_ids);
       for skip in &plan.skipped {
         if skip.reason == SkipReason::MissingLiveMatch {
-          tracing::info!(
+          let msg = format!(
             "Layout restore: skipping missing tiling window '{}' ({}) on workspace '{}'",
             skip.process_name,
             skip.local_id,
             ws.name
           );
+          tracing::info!("{msg}");
+          layout_debug_log(&msg);
         }
       }
       if !plan.is_empty() {
@@ -384,19 +398,23 @@ fn restore_tiling_layouts(
       Ok(placed) => {
         summary.tiling_trees_restored += 1;
         summary.tiling_windows_placed += placed;
-        info!(
+        let msg = format!(
           "Restored tiling tree on workspace '{}': {} windows, {} root children, direction={:?}",
           plan.workspace_name,
           placed,
           plan.children.len(),
           plan.tiling_direction
         );
+        info!("{msg}");
+        layout_debug_log(&msg);
       }
       Err(err) => {
-        tracing::warn!(
+        let msg = format!(
           "Failed to restore tiling tree on workspace '{}': {err:#}",
           plan.workspace_name
         );
+        tracing::warn!("{msg}");
+        layout_debug_log(&msg);
       }
     }
   }
@@ -478,11 +496,13 @@ fn apply_workspace_tiling_plan(
   )?;
 
   if !detached.is_empty() {
-    tracing::warn!(
+    let msg = format!(
       "Tiling restore on '{}': {} planned windows were not re-attached",
       plan.workspace_name,
       detached.len()
     );
+    tracing::warn!("{msg}");
+    layout_debug_log(&msg);
   }
 
   apply_plan_sizes(&plan.children, &local_to_container, state)?;
@@ -887,11 +907,13 @@ fn ensure_workspaces_on_matched_monitors(
       let current_mon =
         workspace.monitor().context("Workspace has no monitor.")?;
       if current_mon.id() != target_mon.id() {
-        info!(
+        let msg = format!(
           "Moving workspace '{}' to matched monitor '{}'.",
           ws_name,
           target_mon.native_properties().device_name
         );
+        info!("{msg}");
+        layout_debug_log(&msg);
         move_workspace_to_monitor(
           &workspace,
           &target_mon,
@@ -900,11 +922,13 @@ fn ensure_workspaces_on_matched_monitors(
         )?;
       }
     } else {
-      info!(
+      let msg = format!(
         "Activating workspace '{}' on matched monitor '{}'.",
         ws_name,
         target_mon.native_properties().device_name
       );
+      info!("{msg}");
+      layout_debug_log(&msg);
       activate_workspace(
         Some(&ws_name),
         Some(target_mon),

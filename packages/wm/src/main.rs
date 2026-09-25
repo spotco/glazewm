@@ -31,11 +31,11 @@ use wm_platform::{
 
 use crate::{
   commands::general::{
-    copy_layout_snapshot_to_clipboard, layout_snapshot_path,
-    load_layout_snapshot, pick_layout_snapshot_path, platform_sync,
-    read_layout_snapshot_file, save_layout_snapshot_with_dialog,
-    try_load_persisted_layout_snapshot, wm_event_affects_layout_snapshot,
-    LayoutAutoSave,
+    copy_layout_snapshot_to_clipboard, layout_debug_log_path,
+    layout_snapshot_path, load_layout_snapshot, pick_layout_snapshot_path,
+    platform_sync, read_layout_snapshot_file, save_layout_snapshot_with_dialog,
+    set_layout_debug_log_path, try_load_persisted_layout_snapshot,
+    wm_event_affects_layout_snapshot, LayoutAutoSave,
   },
   ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
   wm::WindowManager,
@@ -185,7 +185,18 @@ async fn start_wm(
 
   // Best-effort restore of persisted layout.json (beside config.yaml).
   // Runs after initial populate + startup commands so windows/workspaces exist.
+  // Debug trail: layout.log beside config.yaml / layout.json.
   let layout_path = layout_snapshot_path(&config);
+  let layout_log_path = layout_debug_log_path(&config);
+  set_layout_debug_log_path(layout_log_path.clone());
+  tracing::info!(
+    "Layout persistence debug log -> {}",
+    layout_log_path.display()
+  );
+  crate::commands::general::layout_debug_log(format!(
+    "layout persistence debug log ready -> {}",
+    layout_log_path.display()
+  ));
   let _ = try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
 
   // Drain events emitted by startup restore so IPC clients see them, but do
@@ -219,13 +230,12 @@ async fn start_wm(
     }
   }
 
+  // Startup event drain finished; allow layout auto-save scheduling.
+  crate::commands::general::layout_debug_log(
+    "startup event drain complete; enabling layout auto-save",
+  );
   let mut layout_auto_save = LayoutAutoSave::new(layout_path);
   layout_auto_save.enable();
-  tracing::info!(
-    "Layout auto-save enabled (debounce {}s) -> {}",
-    crate::commands::general::LAYOUT_AUTO_SAVE_DEBOUNCE.as_secs(),
-    layout_auto_save.path().display()
-  );
 
   // Create an interval for periodically cleaning up invalid windows.
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
@@ -318,7 +328,7 @@ async fn start_wm(
         }
 
         if wm_event_affects_layout_snapshot(&wm_event) {
-          layout_auto_save.schedule();
+          layout_auto_save.schedule(&wm_event);
         }
 
         if let Err(err) = ipc_server.process_event(wm_event) {

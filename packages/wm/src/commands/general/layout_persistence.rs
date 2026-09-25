@@ -2,18 +2,23 @@
 //!
 //! Auto-saves the current durable layout on a ~5s debounce after layout-
 //! affecting WM events, and best-effort loads that file once at startup.
+//!
+//! Debug trail for this feature is appended to `layout.log` in the same
+//! directory (resolved from the active config path).
 
 use std::{
-  fs,
+  fs::{self, OpenOptions},
+  io::Write,
   path::{Path, PathBuf},
   pin::Pin,
-  time::Duration,
+  sync::Mutex,
+  time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
 use tokio::time::{sleep_until, Instant, Sleep};
-use tracing::{info, warn};
-use wm_common::{LayoutSnapshot, WmEvent};
+use tracing::{debug, info, warn};
+use wm_common::{format_system_time_rfc3339, LayoutSnapshot, WmEvent};
 
 use crate::{
   commands::general::{
@@ -30,6 +35,15 @@ pub const LAYOUT_AUTO_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 /// File name written beside the user config (`config.yaml` → `layout.json`).
 pub const LAYOUT_SNAPSHOT_FILE_NAME: &str = "layout.json";
 
+/// Debug log beside the snapshot (`config.yaml` → `layout.log`).
+pub const LAYOUT_DEBUG_LOG_FILE_NAME: &str = "layout.log";
+
+/// Soft size cap before rotating `layout.log` (keep a `.1` backup).
+const LAYOUT_DEBUG_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Process-wide path for layout persistence debug logging (set at startup).
+static LAYOUT_DEBUG_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// Resolve `layout.json` next to the active config file (same directory
 /// resolution as `UserConfig` / `%USERPROFILE%\.glzr\glazewm`).
 pub fn layout_snapshot_path(config: &UserConfig) -> PathBuf {
@@ -39,6 +53,94 @@ pub fn layout_snapshot_path(config: &UserConfig) -> PathBuf {
 /// Pure path join used by [`layout_snapshot_path`] (unit-tested).
 pub fn layout_snapshot_path_from_config_path(config_path: &Path) -> PathBuf {
   config_path.with_file_name(LAYOUT_SNAPSHOT_FILE_NAME)
+}
+
+/// Resolve `layout.log` beside the active config / `layout.json`.
+pub fn layout_debug_log_path(config: &UserConfig) -> PathBuf {
+  layout_debug_log_path_from_config_path(&config.path)
+}
+
+/// Pure path join for the layout debug log (unit-tested).
+pub fn layout_debug_log_path_from_config_path(config_path: &Path) -> PathBuf {
+  config_path.with_file_name(LAYOUT_DEBUG_LOG_FILE_NAME)
+}
+
+/// Remember where layout persistence should append debug lines.
+pub fn set_layout_debug_log_path(path: PathBuf) {
+  if let Ok(mut guard) = LAYOUT_DEBUG_LOG_PATH.lock() {
+    *guard = Some(path);
+  }
+}
+
+/// Short discriminant name for debounce / schedule logging.
+pub fn wm_event_kind_name(event: &WmEvent) -> &'static str {
+  match event {
+    WmEvent::ApplicationExiting => "ApplicationExiting",
+    WmEvent::BindingModesChanged { .. } => "BindingModesChanged",
+    WmEvent::FocusChanged { .. } => "FocusChanged",
+    WmEvent::FocusedContainerMoved { .. } => "FocusedContainerMoved",
+    WmEvent::MonitorAdded { .. } => "MonitorAdded",
+    WmEvent::MonitorRemoved { .. } => "MonitorRemoved",
+    WmEvent::MonitorUpdated { .. } => "MonitorUpdated",
+    WmEvent::TilingDirectionChanged { .. } => "TilingDirectionChanged",
+    WmEvent::UserConfigChanged { .. } => "UserConfigChanged",
+    WmEvent::WindowManaged { .. } => "WindowManaged",
+    WmEvent::WindowUnmanaged { .. } => "WindowUnmanaged",
+    WmEvent::WorkspaceActivated { .. } => "WorkspaceActivated",
+    WmEvent::WorkspaceDeactivated { .. } => "WorkspaceDeactivated",
+    WmEvent::WorkspaceUpdated { .. } => "WorkspaceUpdated",
+    WmEvent::PauseChanged { .. } => "PauseChanged",
+  }
+}
+
+/// Append a high-signal line to `layout.log` (and optionally mirror via tracing).
+///
+/// Never fatal: I/O failures are swallowed after a single `warn!`.
+pub fn layout_debug_log(message: impl AsRef<str>) {
+  let message = message.as_ref();
+  let path = match LAYOUT_DEBUG_LOG_PATH.lock() {
+    Ok(guard) => guard.clone(),
+    Err(_) => None,
+  };
+
+  let Some(path) = path else {
+    debug!("layout.log unset; skipped: {message}");
+    return;
+  };
+
+  if let Err(err) = append_layout_debug_line(&path, message) {
+    warn!(
+      "Failed to append layout debug log {}: {err:#}",
+      path.display()
+    );
+  }
+}
+
+fn append_layout_debug_line(path: &Path, message: &str) -> anyhow::Result<()> {
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent).with_context(|| {
+      format!("Unable to create directory {}.", parent.display())
+    })?;
+  }
+
+  // Soft rotate: keep previous contents as layout.log.1 once over the cap.
+  if let Ok(meta) = fs::metadata(path) {
+    if meta.len() >= LAYOUT_DEBUG_LOG_MAX_BYTES {
+      let backup = path.with_extension("log.1");
+      let _ = fs::remove_file(&backup);
+      let _ = fs::rename(path, &backup);
+    }
+  }
+
+  let ts = format_system_time_rfc3339(SystemTime::now());
+  let mut file = OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(path)
+    .with_context(|| format!("Unable to open {}.", path.display()))?;
+  writeln!(file, "[{ts}] {message}")
+    .with_context(|| format!("Unable to write {}.", path.display()))?;
+  Ok(())
 }
 
 /// Whether a WM event should schedule an auto-save of the layout snapshot.
@@ -94,15 +196,47 @@ impl LayoutAutoSave {
   pub fn enable(&mut self) {
     self.enabled = true;
     self.armed = false;
+    let msg = format!(
+      "auto-save enabled (debounce {}s) -> {}",
+      LAYOUT_AUTO_SAVE_DEBOUNCE.as_secs(),
+      self.path.display()
+    );
+    info!("{msg}");
+    layout_debug_log(&msg);
   }
 
-  pub fn schedule(&mut self) {
+  /// Schedule (or coalesce) a debounced save for a layout-affecting event.
+  pub fn schedule(&mut self, event: &WmEvent) {
+    let kind = wm_event_kind_name(event);
     if !self.enabled {
+      let msg = format!(
+        "auto-save suppressed (startup drain / disabled); event={kind}"
+      );
+      debug!("{msg}");
+      layout_debug_log(&msg);
       return;
     }
+
+    let was_armed = self.armed;
     let deadline = Instant::now() + LAYOUT_AUTO_SAVE_DEBOUNCE;
     self.sleep.as_mut().reset(deadline);
     self.armed = true;
+
+    if was_armed {
+      let msg = format!(
+        "auto-save debounce coalesced; event={kind}; quiet={}s",
+        LAYOUT_AUTO_SAVE_DEBOUNCE.as_secs()
+      );
+      debug!("{msg}");
+      layout_debug_log(&msg);
+    } else {
+      let msg = format!(
+        "auto-save scheduled; event={kind}; quiet={}s",
+        LAYOUT_AUTO_SAVE_DEBOUNCE.as_secs()
+      );
+      info!("{msg}");
+      layout_debug_log(&msg);
+    }
   }
 
   /// `true` while a debounced save is pending (for `tokio::select!` guards).
@@ -119,9 +253,41 @@ impl LayoutAutoSave {
   pub fn flush(&mut self, state: &WmState) -> anyhow::Result<()> {
     self.armed = false;
     if !self.enabled {
+      let msg = "auto-save flush skipped (disabled)";
+      debug!("{msg}");
+      layout_debug_log(msg);
       return Ok(());
     }
-    save_layout_snapshot_to_path(state, &self.path)
+
+    let workspace_count = state.workspaces().len();
+    let window_count = state.windows().len();
+    let msg = format!(
+      "auto-save debounce fired; writing {} (workspaces={workspace_count}, windows={window_count})",
+      self.path.display()
+    );
+    info!("{msg}");
+    layout_debug_log(&msg);
+
+    match save_layout_snapshot_to_path(state, &self.path) {
+      Ok(()) => {
+        let msg = format!(
+          "auto-save success -> {} (workspaces={workspace_count}, windows={window_count})",
+          self.path.display()
+        );
+        info!("{msg}");
+        layout_debug_log(&msg);
+        Ok(())
+      }
+      Err(err) => {
+        let msg = format!(
+          "auto-save failed -> {}: {err:#}",
+          self.path.display()
+        );
+        warn!("{msg}");
+        layout_debug_log(&msg);
+        Err(err)
+      }
+    }
   }
 }
 
@@ -149,40 +315,52 @@ pub fn try_load_persisted_layout_snapshot(
   state: &mut WmState,
   config: &UserConfig,
 ) -> Option<LoadLayoutSummary> {
+  let attempt = format!("startup load attempting from {}", path.display());
+  info!("{attempt}");
+  layout_debug_log(&attempt);
+
   if !path.exists() {
-    info!(
-      "No persisted layout at {}; using default layout behaviour.",
+    let msg = format!(
+      "startup load: no file at {}; using default layout behaviour",
       path.display()
     );
+    info!("{msg}");
+    layout_debug_log(&msg);
     return None;
   }
 
   let text = match fs::read_to_string(path) {
     Ok(t) => t,
     Err(err) => {
-      warn!(
-        "Failed to read persisted layout {}: {err:#}; using default.",
+      let msg = format!(
+        "startup load: failed to read {}: {err:#}; using default",
         path.display()
       );
+      warn!("{msg}");
+      layout_debug_log(&msg);
       return None;
     }
   };
 
   if text.trim().is_empty() {
-    warn!(
-      "Persisted layout {} is empty; using default layout behaviour.",
+    let msg = format!(
+      "startup load: {} is empty; using default layout behaviour",
       path.display()
     );
+    warn!("{msg}");
+    layout_debug_log(&msg);
     return None;
   }
 
   let snapshot: LayoutSnapshot = match serde_json::from_str(&text) {
     Ok(s) => s,
     Err(err) => {
-      warn!(
-        "Failed to parse persisted layout {}: {err:#}; using default.",
+      let msg = format!(
+        "startup load: parse failed for {}: {err:#}; using default",
         path.display()
       );
+      warn!("{msg}");
+      layout_debug_log(&msg);
       return None;
     }
   };
@@ -191,25 +369,35 @@ pub fn try_load_persisted_layout_snapshot(
     Ok(summary) => {
       if state.pending_sync.has_changes() {
         if let Err(err) = platform_sync(state, config) {
-          warn!(
+          let msg = format!(
             "platform_sync after persisted layout load failed: {err:#}"
           );
+          warn!("{msg}");
+          layout_debug_log(&msg);
         }
       }
-      info!(
-        "Loaded persisted layout from {}: matched={}, unmatched_snapshot={}, unmatched_live={}",
+      let msg = format!(
+        "startup load success from {}: matched={}, unmatched_snapshot={}, unmatched_live={}, workspace_moves={}, state_updates={}, tiling_trees_restored={}, tiling_windows_placed={}",
         path.display(),
         summary.matched,
         summary.unmatched_snapshot,
-        summary.unmatched_live
+        summary.unmatched_live,
+        summary.workspace_moves,
+        summary.state_updates,
+        summary.tiling_trees_restored,
+        summary.tiling_windows_placed
       );
+      info!("{msg}");
+      layout_debug_log(&msg);
       Some(summary)
     }
     Err(err) => {
-      warn!(
-        "Failed to restore persisted layout {}: {err:#}; using default.",
+      let msg = format!(
+        "startup load: restore failed for {}: {err:#}; using default",
         path.display()
       );
+      warn!("{msg}");
+      layout_debug_log(&msg);
       None
     }
   }
@@ -239,6 +427,15 @@ mod tests {
   }
 
   #[test]
+  fn layout_debug_log_path_joins_beside_config() {
+    let config = PathBuf::from(r"C:\Users\example\.glzr\glazewm\config.yaml");
+    assert_eq!(
+      layout_debug_log_path_from_config_path(&config),
+      PathBuf::from(r"C:\Users\example\.glzr\glazewm\layout.log")
+    );
+  }
+
+  #[test]
   fn debounce_constant_is_five_seconds() {
     assert_eq!(LAYOUT_AUTO_SAVE_DEBOUNCE, Duration::from_secs(5));
   }
@@ -253,12 +450,14 @@ mod tests {
     rt.block_on(async {
       let mut auto = LayoutAutoSave::new(PathBuf::from("layout.json"));
       assert!(!auto.enabled());
-      auto.schedule();
+      auto.schedule(&WmEvent::ApplicationExiting);
       assert!(!auto.is_armed());
       auto.enable();
       assert!(auto.enabled());
       assert!(!auto.is_armed());
-      auto.schedule();
+      // schedule() arms whenever called while enabled; event filtering is
+      // the caller's responsibility (wm_event_affects_layout_snapshot).
+      auto.schedule(&WmEvent::ApplicationExiting);
       assert!(auto.is_armed());
     });
   }
@@ -295,6 +494,23 @@ mod tests {
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.trim().is_empty());
     let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir(&dir);
+  }
+
+  #[test]
+  fn layout_debug_log_appends_when_path_set() {
+    let dir = std::env::temp_dir().join(format!(
+      "glazewm-layout-debug-{}",
+      std::process::id()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    let log_path = dir.join("layout.log");
+    let _ = fs::remove_file(&log_path);
+    set_layout_debug_log_path(log_path.clone());
+    layout_debug_log("unit-test line");
+    let text = fs::read_to_string(&log_path).unwrap();
+    assert!(text.contains("unit-test line"));
+    let _ = fs::remove_file(&log_path);
     let _ = fs::remove_dir(&dir);
   }
 }
