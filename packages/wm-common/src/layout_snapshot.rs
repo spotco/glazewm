@@ -1143,4 +1143,252 @@ mod tests {
       .iter()
       .any(|l| l.process_name == "tiler" && l.order_index == 0));
   }
+
+  #[test]
+  fn json_round_trip_preserves_nested_split_tiling_directions() {
+    let nested = SnapshotNode {
+      local_id: "root".into(),
+      kind: SnapshotNodeKind::Split,
+      tiling_size: None,
+      tiling_direction: Some(TilingDirection::Vertical),
+      children: Some(vec![
+        SnapshotNode {
+          local_id: "n0".into(),
+          kind: SnapshotNodeKind::Window,
+          tiling_size: Some(0.4),
+          tiling_direction: None,
+          children: None,
+          child_focus_order: None,
+          window: Some(SnapshotWindow {
+            identity: SnapshotWindowIdentity {
+              process_path: Some("C:\\Apps\\top.exe".into()),
+              process_name: "top".into(),
+              class_name: Some("TopClass".into()),
+              title_hint: Some("top".into()),
+            },
+            state: WindowState::Tiling,
+            prev_state: None,
+            floating_placement: None,
+            id: None,
+            handle: None,
+          }),
+          id: None,
+        },
+        SnapshotNode {
+          local_id: "n1".into(),
+          kind: SnapshotNodeKind::Split,
+          tiling_size: Some(0.6),
+          tiling_direction: Some(TilingDirection::Horizontal),
+          children: Some(vec![
+            SnapshotNode {
+              local_id: "n2".into(),
+              kind: SnapshotNodeKind::Window,
+              tiling_size: Some(0.5),
+              tiling_direction: None,
+              children: None,
+              child_focus_order: None,
+              window: Some(SnapshotWindow {
+                identity: SnapshotWindowIdentity {
+                  process_path: Some("C:\\Apps\\left.exe".into()),
+                  process_name: "left".into(),
+                  class_name: Some("LeftClass".into()),
+                  title_hint: Some("left".into()),
+                },
+                state: WindowState::Tiling,
+                prev_state: None,
+                floating_placement: None,
+                id: None,
+                handle: None,
+              }),
+              id: None,
+            },
+            SnapshotNode {
+              local_id: "n3".into(),
+              kind: SnapshotNodeKind::Window,
+              tiling_size: Some(0.5),
+              tiling_direction: None,
+              children: None,
+              child_focus_order: None,
+              window: Some(SnapshotWindow {
+                identity: SnapshotWindowIdentity {
+                  process_path: Some("C:\\Apps\\right.exe".into()),
+                  process_name: "right".into(),
+                  class_name: Some("RightClass".into()),
+                  title_hint: Some("right".into()),
+                },
+                state: WindowState::Tiling,
+                prev_state: None,
+                floating_placement: None,
+                id: None,
+                handle: None,
+              }),
+              id: None,
+            },
+          ]),
+          child_focus_order: Some(vec!["n2".into(), "n3".into()]),
+          window: None,
+          id: None,
+        },
+      ]),
+      child_focus_order: None,
+      window: None,
+      id: None,
+    };
+
+    let snapshot = LayoutSnapshot {
+      version: LAYOUT_SNAPSHOT_VERSION,
+      captured_at: "2026-09-24T00:00:00Z".into(),
+      glazewm_version: Some("test".into()),
+      paused: false,
+      binding_modes: vec![],
+      monitors: vec![SnapshotMonitor {
+        hardware_id: None,
+        device_path: None,
+        device_name: "DISPLAY1".into(),
+        bounds: SnapshotBounds {
+          x: 0,
+          y: 0,
+          width: 1920,
+          height: 1080,
+        },
+        focused_workspace_name: Some("1".into()),
+        workspaces: vec![SnapshotWorkspace {
+          name: "1".into(),
+          tiling_direction: TilingDirection::Vertical,
+          child_focus_order: vec!["n0".into(), "n1".into()],
+          root: nested,
+          id: None,
+        }],
+        id: None,
+      }],
+      ignored_windows: vec![],
+    };
+
+    let json = serde_json::to_string_pretty(&snapshot).expect("serialize");
+    assert!(
+      json.contains("\"tilingDirection\": \"vertical\""),
+      "workspace/root vertical must be persisted: {json}"
+    );
+    assert!(
+      json.contains("\"tilingDirection\": \"horizontal\""),
+      "nested horizontal must be persisted: {json}"
+    );
+
+    let loaded: LayoutSnapshot =
+      serde_json::from_str(&json).expect("deserialize");
+    let ws = &loaded.monitors[0].workspaces[0];
+    assert_eq!(ws.tiling_direction, TilingDirection::Vertical);
+    let children = ws.root.children.as_ref().expect("root children");
+    assert_eq!(children[1].tiling_direction, Some(TilingDirection::Horizontal));
+
+    // Plan after JSON load must still carry directions for attach.
+    let matched: std::collections::HashSet<String> =
+      ["n0", "n2", "n3"].into_iter().map(str::to_string).collect();
+    let plan = crate::plan_workspace_tiling_layout(ws, &matched);
+    assert_eq!(plan.tiling_direction, TilingDirection::Vertical);
+    match &plan.children[1] {
+      crate::LayoutPlanNode::Split { tiling_direction, .. } => {
+        assert_eq!(*tiling_direction, TilingDirection::Horizontal);
+      }
+      other => panic!("expected split after JSON round-trip, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn snapshot_leaves_retain_workspace_names_across_monitors() {
+    // Windows under different workspace names must keep that membership in
+    // the durable JSON tree (load keys off workspace_name on each leaf).
+    let win = |local_id: &str, name: &str| SnapshotNode {
+      local_id: local_id.into(),
+      kind: SnapshotNodeKind::Window,
+      tiling_size: Some(1.0),
+      tiling_direction: None,
+      children: None,
+      child_focus_order: None,
+      window: Some(SnapshotWindow {
+        identity: SnapshotWindowIdentity {
+          process_path: Some(format!("C:\\\\Apps\\\\{name}.exe")),
+          process_name: name.into(),
+          class_name: Some(format!("{name}Class")),
+          title_hint: Some(name.into()),
+        },
+        state: WindowState::Tiling,
+        prev_state: None,
+        floating_placement: None,
+        id: None,
+        handle: None,
+      }),
+      id: None,
+    };
+
+    let ws = |name: &str, child: SnapshotNode, dir: TilingDirection| SnapshotWorkspace {
+      name: name.into(),
+      tiling_direction: dir.clone(),
+      child_focus_order: vec![child.local_id.clone()],
+      root: SnapshotNode {
+        local_id: "root".into(),
+        kind: SnapshotNodeKind::Split,
+        tiling_size: None,
+        tiling_direction: Some(dir),
+        children: Some(vec![child]),
+        child_focus_order: None,
+        window: None,
+        id: None,
+      },
+      id: None,
+    };
+
+    let snapshot = LayoutSnapshot {
+      version: LAYOUT_SNAPSHOT_VERSION,
+      captured_at: "t".into(),
+      glazewm_version: None,
+      paused: false,
+      binding_modes: vec![],
+      monitors: vec![
+        SnapshotMonitor {
+          hardware_id: Some("HW1".into()),
+          device_path: None,
+          device_name: "DISPLAY1".into(),
+          bounds: SnapshotBounds { x: 0, y: 0, width: 1920, height: 1080 },
+          focused_workspace_name: Some("1".into()),
+          workspaces: vec![ws("1", win("n0", "editor"), TilingDirection::Horizontal)],
+          id: None,
+        },
+        SnapshotMonitor {
+          hardware_id: Some("HW2".into()),
+          device_path: None,
+          device_name: "DISPLAY2".into(),
+          bounds: SnapshotBounds { x: 1920, y: 0, width: 1920, height: 1080 },
+          focused_workspace_name: Some("2".into()),
+          workspaces: vec![ws("2", win("n0", "browser"), TilingDirection::Vertical)],
+          id: None,
+        },
+      ],
+      ignored_windows: vec![],
+    };
+
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let loaded: LayoutSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(loaded.monitors[0].workspaces[0].name, "1");
+    assert_eq!(loaded.monitors[1].workspaces[0].name, "2");
+    let p0 = loaded.monitors[0].workspaces[0].root.children.as_ref().unwrap()[0]
+      .window.as_ref().unwrap().identity.process_name.clone();
+    let p1 = loaded.monitors[1].workspaces[0].root.children.as_ref().unwrap()[0]
+      .window.as_ref().unwrap().identity.process_name.clone();
+    assert_eq!(p0, "editor");
+    assert_eq!(p1, "browser");
+
+    let plan1 = crate::plan_workspace_tiling_layout(
+      &loaded.monitors[0].workspaces[0],
+      &["n0".to_string()].into_iter().collect(),
+    );
+    let plan2 = crate::plan_workspace_tiling_layout(
+      &loaded.monitors[1].workspaces[0],
+      &["n0".to_string()].into_iter().collect(),
+    );
+    assert_eq!(plan1.workspace_name, "1");
+    assert_eq!(plan2.workspace_name, "2");
+    assert_eq!(plan1.tiling_direction, TilingDirection::Horizontal);
+    assert_eq!(plan2.tiling_direction, TilingDirection::Vertical);
+  }
 }

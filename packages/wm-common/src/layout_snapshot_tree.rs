@@ -494,6 +494,8 @@ mod tests {
       plan.child_focus_order,
       vec!["n2".to_string(), "n1".to_string()]
     );
+    assert_eq!(plan.tiling_direction, TilingDirection::Horizontal);
+    assert_eq!(plan.workspace_name, "1");
     assert!(plan.skipped.is_empty());
   }
 
@@ -629,5 +631,154 @@ mod tests {
     assert!((plan.children[0].tiling_size() - 0.3).abs() < 1e-5);
     assert_eq!(plan.children[1].local_id(), "n3");
     assert!((plan.children[1].tiling_size() - 0.7).abs() < 1e-5);
+  }
+
+  /// Collect split directions in DFS attach order (workspace children first,
+  /// then nested). Mirrors what `attach_plan_nodes` walks when creating
+  /// `SplitContainer`s during load.
+  fn collect_split_directions(nodes: &[LayoutPlanNode]) -> Vec<TilingDirection> {
+    let mut out = Vec::new();
+    for node in nodes {
+      if let LayoutPlanNode::Split {
+        tiling_direction,
+        children,
+        ..
+      } = node
+      {
+        out.push(tiling_direction.clone());
+        out.extend(collect_split_directions(children));
+      }
+    }
+    out
+  }
+
+  #[test]
+  fn plan_preserves_nested_vertical_then_horizontal_directions() {
+    // V[ a(0.4) H[ b(0.5) c(0.5) ](0.6) ]
+    let ws = workspace_with_root(
+      "code",
+      TilingDirection::Vertical,
+      vec![
+        tiling_window("n1", "top", 0.4),
+        split(
+          "n2",
+          TilingDirection::Horizontal,
+          0.6,
+          vec![
+            tiling_window("n3", "left", 0.5),
+            tiling_window("n4", "right", 0.5),
+          ],
+          vec!["n3", "n4"],
+        ),
+      ],
+      vec!["n1", "n2"],
+    );
+
+    let matched: HashSet<String> =
+      ["n1", "n3", "n4"].into_iter().map(str::to_string).collect();
+    let plan = plan_workspace_tiling_layout(&ws, &matched);
+
+    assert_eq!(plan.workspace_name, "code");
+    assert_eq!(plan.tiling_direction, TilingDirection::Vertical);
+    assert_eq!(plan.children.len(), 2);
+    assert_eq!(
+      collect_split_directions(&plan.children),
+      vec![TilingDirection::Horizontal],
+      "load attach must see nested Horizontal under Vertical workspace"
+    );
+    match &plan.children[1] {
+      LayoutPlanNode::Split {
+        tiling_direction,
+        children,
+        ..
+      } => {
+        assert_eq!(*tiling_direction, TilingDirection::Horizontal);
+        assert_eq!(children[0].local_id(), "n3");
+        assert_eq!(children[1].local_id(), "n4");
+      }
+      other => panic!("expected horizontal split, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn plan_preserves_nested_horizontal_then_vertical_directions_for_attach() {
+    // Explicit H-then-V direction list that load's SplitContainer::new walks.
+    let ws = workspace_with_root(
+      "1",
+      TilingDirection::Horizontal,
+      vec![
+        tiling_window("n1", "alpha", 0.3),
+        split(
+          "n2",
+          TilingDirection::Vertical,
+          0.7,
+          vec![
+            tiling_window("n3", "beta", 0.4),
+            tiling_window("n4", "gamma", 0.6),
+          ],
+          vec!["n3", "n4"],
+        ),
+      ],
+      vec!["n1", "n2"],
+    );
+    let matched: HashSet<String> =
+      ["n1", "n3", "n4"].into_iter().map(str::to_string).collect();
+    let plan = plan_workspace_tiling_layout(&ws, &matched);
+    assert_eq!(plan.tiling_direction, TilingDirection::Horizontal);
+    assert_eq!(
+      collect_split_directions(&plan.children),
+      vec![TilingDirection::Vertical]
+    );
+  }
+
+  #[test]
+  fn plans_keep_windows_on_their_snapshot_workspaces() {
+    // Two workspaces; matched tiling ids per workspace must not cross-contaminate.
+    let ws1 = workspace_with_root(
+      "1",
+      TilingDirection::Horizontal,
+      vec![
+        tiling_window("a1", "editor", 0.5),
+        tiling_window("a2", "term", 0.5),
+      ],
+      vec!["a1", "a2"],
+    );
+    let ws2 = workspace_with_root(
+      "2",
+      TilingDirection::Vertical,
+      vec![
+        tiling_window("b1", "browser", 0.6),
+        floating_window("b2", "chat"),
+      ],
+      vec!["b1", "b2"],
+    );
+
+    // Best-effort across workspaces: ws1 keeps both tiling leaves; ws2 keeps browser,
+    // drops floating chat from the tiling plan.
+    let plan1 = plan_workspace_tiling_layout(
+      &ws1,
+      &["a1", "a2"].into_iter().map(str::to_string).collect(),
+    );
+    let plan2 = plan_workspace_tiling_layout(
+      &ws2,
+      &["b1"].into_iter().map(str::to_string).collect(),
+    );
+
+    assert_eq!(plan1.workspace_name, "1");
+    assert_eq!(plan1.window_local_ids(), vec!["a1".to_string(), "a2".to_string()]);
+    assert_eq!(plan1.tiling_direction, TilingDirection::Horizontal);
+
+    assert_eq!(plan2.workspace_name, "2");
+    assert_eq!(plan2.window_local_ids(), vec!["b1".to_string()]);
+    assert_eq!(plan2.tiling_direction, TilingDirection::Vertical);
+    assert!(
+      plan2.skipped.iter().any(|s| {
+        s.local_id == "b2" && s.reason == SkipReason::NonTiling
+      }),
+      "floating leaf stays out of tiling plan but ws membership is via leaf path"
+    );
+    // No cross-workspace leakage of local ids.
+    assert!(!plan1.window_local_ids().iter().any(|id| id.starts_with('b')));
+    assert!(!plan2.window_local_ids().iter().any(|id| id.starts_with('a')));
   }
 }
