@@ -1,18 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Context;
 use tracing::info;
 use uuid::Uuid;
 use wm_common::{
-  match_windows, LayoutSnapshot, MatchableIdentity, MatchableWindow,
+  match_windows, plan_workspace_tiling_layout, LayoutPlanNode,
+  LayoutSnapshot, MatchableIdentity, MatchableWindow, SkipReason,
   SnapshotBounds, SnapshotMonitor, SnapshotNode, SnapshotNodeKind,
-  SnapshotWindow, WindowState,
+  SnapshotWindow, WindowState, WorkspaceLayoutPlan,
 };
 
 use crate::{
   commands::{
     container::{
-      move_container_within_tree, resize_tiling_container,
+      attach_container, detach_container, flatten_split_container,
       set_focused_descendant,
     },
     monitor::move_workspace_to_monitor,
@@ -20,9 +21,10 @@ use crate::{
     workspace::{activate_workspace, focus_workspace},
   },
   models::{
-    Monitor, TilingContainer, WindowContainer, WorkspaceTarget,
+    Container, Monitor, SplitContainer, TilingContainer, WindowContainer,
+    WorkspaceTarget,
   },
-  traits::{CommonGetters, WindowGetters},
+  traits::{CommonGetters, TilingDirectionGetters, TilingSizeGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
 };
@@ -35,24 +37,26 @@ pub struct LoadLayoutSummary {
   pub unmatched_live: usize,
   pub state_updates: usize,
   pub workspace_moves: usize,
+  pub tiling_trees_restored: usize,
+  pub tiling_windows_placed: usize,
 }
 
 /// Placement metadata for a snapshot window leaf.
 #[derive(Clone, Debug)]
 struct SnapshotLeaf {
   key: String,
+  local_id: String,
   window: SnapshotWindow,
   workspace_name: String,
   /// DFS order among window leaves in the workspace.
   order_index: usize,
-  tiling_size: Option<f32>,
 }
 
 /// Best-effort restore of `snapshot` onto the current desktop.
 ///
 /// Does **not** launch missing applications. Ignored snapshot windows are
-/// left alone. Nested-split isomorphism is not required — workspace
-/// assignment and window state are prioritized.
+/// left alone. Matched tiling windows are re-shaped into the snapshot's
+/// nested split tree (order, sizes, directions) with missing leaves pruned.
 pub fn load_layout_snapshot(
   snapshot: &LayoutSnapshot,
   state: &mut WmState,
@@ -153,9 +157,17 @@ pub fn load_layout_snapshot(
     }
   }
 
-  if let Err(err) = apply_tiling_sizes(&ordered_pairs, &leaf_by_key, state)
-  {
-    tracing::warn!("Failed to apply tiling sizes: {err:#}");
+  // Rebuild nested tiling geometry per workspace (order, sizes, splits).
+  if let Err(err) = restore_tiling_layouts(
+    snapshot,
+    &monitor_map,
+    &ordered_pairs,
+    &leaf_by_key,
+    state,
+    config,
+    &mut summary,
+  ) {
+    tracing::warn!("Failed to restore tiling layouts: {err:#}");
   }
 
   // Activate focused workspaces from snapshot where monitors matched.
@@ -176,12 +188,14 @@ pub fn load_layout_snapshot(
   }
 
   info!(
-    "Layout snapshot load summary: matched={}, unmatched_snapshot={}, unmatched_live={}, workspace_moves={}, state_updates={}",
+    "Layout snapshot load summary: matched={}, unmatched_snapshot={}, unmatched_live={}, workspace_moves={}, state_updates={}, tiling_trees_restored={}, tiling_windows_placed={}",
     summary.matched,
     summary.unmatched_snapshot,
     summary.unmatched_live,
     summary.workspace_moves,
-    summary.state_updates
+    summary.state_updates,
+    summary.tiling_trees_restored,
+    summary.tiling_windows_placed
   );
 
   Ok(summary)
@@ -282,96 +296,419 @@ fn restore_window(
   Ok(())
 }
 
-fn apply_tiling_sizes(
+/// Rebuild nested tiling trees for every snapshot workspace that has at
+/// least one matched tiling window.
+fn restore_tiling_layouts(
+  snapshot: &LayoutSnapshot,
+  monitor_map: &[(SnapshotMonitor, Monitor)],
   pairs: &[(String, String)],
   leaf_by_key: &HashMap<String, &SnapshotLeaf>,
   state: &mut WmState,
+  config: &UserConfig,
+  summary: &mut LoadLayoutSummary,
 ) -> anyhow::Result<()> {
-  let mut by_ws: HashMap<String, Vec<(Uuid, f32, usize)>> = HashMap::new();
-
+  // snap leaf key -> live window uuid
+  let mut live_by_snap_key: HashMap<String, Uuid> = HashMap::new();
   for (snap_key, live_key) in pairs {
+    if let Ok(id) = Uuid::parse_str(live_key) {
+      live_by_snap_key.insert(snap_key.clone(), id);
+    }
+  }
+
+  // Per workspace: matched tiling local_id -> live uuid
+  let mut matched_tiling_by_ws: HashMap<String, HashMap<String, Uuid>> =
+    HashMap::new();
+
+  for (snap_key, live_id) in &live_by_snap_key {
     let Some(leaf) = leaf_by_key.get(snap_key) else {
-      continue;
-    };
-    let Some(size) = leaf.tiling_size else {
       continue;
     };
     if !matches!(leaf.window.state, WindowState::Tiling) {
       continue;
     }
-    let Ok(id) = Uuid::parse_str(live_key) else {
-      continue;
-    };
-    by_ws
+    matched_tiling_by_ws
       .entry(leaf.workspace_name.clone())
       .or_default()
-      .push((id, size, leaf.order_index));
+      .insert(leaf.local_id.clone(), *live_id);
   }
 
-  for (ws_name, mut entries) in by_ws {
-    entries.sort_by_key(|e| e.2);
+  let mut seen_workspaces: HashSet<String> = HashSet::new();
+  let mut workspace_plans: Vec<(WorkspaceLayoutPlan, HashMap<String, Uuid>)> =
+    Vec::new();
 
-    let Some(workspace) = state.workspace_by_name(&ws_name) else {
-      continue;
+  let mut consider_workspace =
+    |ws: &wm_common::SnapshotWorkspace,
+     matched: &HashMap<String, Uuid>| {
+      if !seen_workspaces.insert(ws.name.clone()) {
+        return;
+      }
+      let matched_ids: HashSet<String> = matched.keys().cloned().collect();
+      let plan = plan_workspace_tiling_layout(ws, &matched_ids);
+      for skip in &plan.skipped {
+        if skip.reason == SkipReason::MissingLiveMatch {
+          tracing::info!(
+            "Layout restore: skipping missing tiling window '{}' ({}) on workspace '{}'",
+            skip.process_name,
+            skip.local_id,
+            ws.name
+          );
+        }
+      }
+      if !plan.is_empty() {
+        workspace_plans.push((plan, matched.clone()));
+      }
     };
 
-    // Direct tiling window children of the workspace (best-effort; ignores
-    // nested split structure).
-    let tiling_windows: Vec<_> = workspace
-      .tiling_children()
-      .filter_map(|c| match c {
-        TilingContainer::TilingWindow(w) => Some(w),
-        TilingContainer::Split(_) => None,
-      })
-      .collect();
+  for (snap_mon, _) in monitor_map {
+    for workspace in &snap_mon.workspaces {
+      let matched = matched_tiling_by_ws
+        .get(&workspace.name)
+        .cloned()
+        .unwrap_or_default();
+      consider_workspace(workspace, &matched);
+    }
+  }
+  for snap_mon in &snapshot.monitors {
+    for workspace in &snap_mon.workspaces {
+      let matched = matched_tiling_by_ws
+        .get(&workspace.name)
+        .cloned()
+        .unwrap_or_default();
+      consider_workspace(workspace, &matched);
+    }
+  }
 
-    for (target_index, (id, _size, _)) in entries.iter().enumerate() {
-      let Some(window) =
-        tiling_windows.iter().find(|w| w.id() == *id).cloned()
-      else {
-        continue;
-      };
-
-      let parent = window.parent().context("No parent.")?;
-      let desired =
-        target_index.min(parent.child_count().saturating_sub(1));
-      if window.index() != desired {
-        let _ = move_container_within_tree(
-          &window.clone().into(),
-          &parent,
-          desired,
-          state,
+  for (plan, local_to_live) in workspace_plans {
+    match apply_workspace_tiling_plan(&plan, &local_to_live, state, config)
+    {
+      Ok(placed) => {
+        summary.tiling_trees_restored += 1;
+        summary.tiling_windows_placed += placed;
+        info!(
+          "Restored tiling tree on workspace '{}': {} windows, {} root children, direction={:?}",
+          plan.workspace_name,
+          placed,
+          plan.children.len(),
+          plan.tiling_direction
         );
       }
-    }
-
-    for (id, size, _) in &entries {
-      let Some(window) =
-        state.windows().into_iter().find(|w| w.id() == *id)
-      else {
-        continue;
-      };
-      let WindowContainer::TilingWindow(tw) = window else {
-        continue;
-      };
-      let tiling: TilingContainer = tw.into();
-      resize_tiling_container(&tiling, *size);
-      let redraw: Vec<TilingContainer> =
-        tiling.tiling_siblings().chain([tiling.clone()]).collect();
-      state.pending_sync.queue_containers_to_redraw(redraw);
-    }
-
-    if let Some((id, _, _)) = entries.first() {
-      if let Some(window) =
-        state.windows().into_iter().find(|w| w.id() == *id)
-      {
-        set_focused_descendant(&window.into(), None);
-        state.pending_sync.queue_focus_change();
+      Err(err) => {
+        tracing::warn!(
+          "Failed to restore tiling tree on workspace '{}': {err:#}",
+          plan.workspace_name
+        );
       }
     }
   }
 
   Ok(())
+}
+
+fn apply_workspace_tiling_plan(
+  plan: &WorkspaceLayoutPlan,
+  local_to_live: &HashMap<String, Uuid>,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<usize> {
+  let workspace = state
+    .workspace_by_name(&plan.workspace_name)
+    .with_context(|| {
+      format!("Workspace '{}' not found during tiling restore.", plan.workspace_name)
+    })?;
+
+  // Detach planned tiling windows so we can rebuild the tree cleanly.
+  let mut detached: HashMap<String, WindowContainer> = HashMap::new();
+  for local_id in plan.window_local_ids() {
+    let Some(live_id) = local_to_live.get(&local_id).copied() else {
+      tracing::warn!(
+        "Plan window local_id '{}' has no live match on '{}'",
+        local_id,
+        plan.workspace_name
+      );
+      continue;
+    };
+    let Some(mut window) =
+      state.windows().into_iter().find(|w| w.id() == live_id)
+    else {
+      continue;
+    };
+
+    // Should already be tiling after restore_window; force if needed.
+    if !matches!(window, WindowContainer::TilingWindow(_)) {
+      let _ = update_window_state(
+        window,
+        WindowState::Tiling,
+        state,
+        config,
+      )?;
+      window = state
+        .windows()
+        .into_iter()
+        .find(|w| w.id() == live_id)
+        .context("Window missing after forcing tiling.")?;
+    }
+
+    if !matches!(window, WindowContainer::TilingWindow(_)) {
+      tracing::warn!(
+        "Could not convert window {} to tiling for layout restore",
+        live_id
+      );
+      continue;
+    }
+
+    if window.parent().is_some() {
+      detach_container(window.clone().into())?;
+    }
+    detached.insert(local_id, window);
+  }
+
+  // Flatten any split leftovers (e.g. from unmatched live windows).
+  flatten_all_splits(&workspace.clone().into())?;
+
+  workspace.set_tiling_direction(plan.tiling_direction.clone());
+
+  let mut local_to_container: HashMap<String, Uuid> = HashMap::new();
+  attach_plan_nodes(
+    &workspace.clone().into(),
+    &plan.children,
+    &mut detached,
+    &mut local_to_container,
+    config,
+    0,
+  )?;
+
+  if !detached.is_empty() {
+    tracing::warn!(
+      "Tiling restore on '{}': {} planned windows were not re-attached",
+      plan.workspace_name,
+      detached.len()
+    );
+  }
+
+  apply_plan_sizes(&plan.children, &local_to_container, state)?;
+  apply_child_focus_order(
+    &workspace.clone().into(),
+    &plan.child_focus_order,
+    &local_to_container,
+  );
+  apply_focus_orders_recursive(&plan.children, &local_to_container, state)?;
+
+  // Focus the first window in workspace focus order when available.
+  if let Some(first_local) = plan.child_focus_order.first() {
+    if let Some(id) = local_to_container.get(first_local) {
+      if let Some(window) =
+        state.windows().into_iter().find(|w| w.id() == *id)
+      {
+        set_focused_descendant(&window.into(), None);
+        state.pending_sync.queue_focus_change();
+      } else if let Some(split) = find_split_by_id(state, *id) {
+        if let Some(focus_win) = split.descendant_focus_order().next() {
+          set_focused_descendant(&focus_win, None);
+          state.pending_sync.queue_focus_change();
+        }
+      }
+    }
+  }
+
+  state
+    .pending_sync
+    .queue_containers_to_redraw(workspace.tiling_children());
+
+  Ok(plan.window_local_ids().len())
+}
+
+fn attach_plan_nodes(
+  parent: &Container,
+  nodes: &[LayoutPlanNode],
+  detached: &mut HashMap<String, WindowContainer>,
+  local_to_container: &mut HashMap<String, Uuid>,
+  config: &UserConfig,
+  start_index: usize,
+) -> anyhow::Result<()> {
+  let mut index = start_index;
+  for node in nodes {
+    match node {
+      LayoutPlanNode::Window { local_id, .. } => {
+        let window = detached.remove(local_id).with_context(|| {
+          format!("Detached window '{local_id}' missing during attach.")
+        })?;
+        let window_id = window.id();
+        attach_container(
+          &window.clone().into(),
+          parent,
+          Some(index),
+        )?;
+        local_to_container.insert(local_id.clone(), window_id);
+        index += 1;
+      }
+      LayoutPlanNode::Split {
+        local_id,
+        tiling_direction,
+        children,
+        ..
+      } => {
+        let split = SplitContainer::new(
+          tiling_direction.clone(),
+          config.value.gaps.clone(),
+        );
+        let split_id = split.id();
+        attach_container(&split.clone().into(), parent, Some(index))?;
+        local_to_container.insert(local_id.clone(), split_id);
+        attach_plan_nodes(
+          &split.into(),
+          children,
+          detached,
+          local_to_container,
+          config,
+          0,
+        )?;
+        index += 1;
+      }
+    }
+  }
+  Ok(())
+}
+
+fn apply_plan_sizes(
+  nodes: &[LayoutPlanNode],
+  local_to_container: &HashMap<String, Uuid>,
+  state: &WmState,
+) -> anyhow::Result<()> {
+  // Direct set (not resize_tiling_container) so sibling ratios match the
+  // plan exactly without fighting proportional redistribution.
+  for node in nodes {
+    let Some(id) = local_to_container.get(node.local_id()) else {
+      continue;
+    };
+    if let Some(tiling) = find_tiling_by_id(state, *id) {
+      tiling.set_tiling_size(node.tiling_size());
+    }
+  }
+
+  for node in nodes {
+    if let LayoutPlanNode::Split { children, .. } = node {
+      apply_plan_sizes(children, local_to_container, state)?;
+    }
+  }
+  Ok(())
+}
+
+fn apply_focus_orders_recursive(
+  nodes: &[LayoutPlanNode],
+  local_to_container: &HashMap<String, Uuid>,
+  state: &WmState,
+) -> anyhow::Result<()> {
+  for node in nodes {
+    if let LayoutPlanNode::Split {
+      local_id,
+      children,
+      child_focus_order,
+      ..
+    } = node
+    {
+      if let Some(id) = local_to_container.get(local_id) {
+        if let Some(split) = find_split_by_id(state, *id) {
+          apply_child_focus_order(
+            &split.into(),
+            child_focus_order,
+            local_to_container,
+          );
+        }
+      }
+      apply_focus_orders_recursive(
+        children,
+        local_to_container,
+        state,
+      )?;
+    }
+  }
+  Ok(())
+}
+
+fn apply_child_focus_order(
+  parent: &Container,
+  focus_local_ids: &[String],
+  local_to_container: &HashMap<String, Uuid>,
+) {
+  let child_ids: HashSet<Uuid> =
+    parent.children().iter().map(CommonGetters::id).collect();
+
+  let mut new_order: VecDeque<Uuid> = VecDeque::new();
+  for local_id in focus_local_ids {
+    if let Some(id) = local_to_container.get(local_id) {
+      if child_ids.contains(id) && !new_order.contains(id) {
+        new_order.push_back(*id);
+      }
+    }
+  }
+  for child in parent.children() {
+    if !new_order.contains(&child.id()) {
+      new_order.push_back(child.id());
+    }
+  }
+  *parent.borrow_child_focus_order_mut() = new_order;
+}
+
+fn flatten_all_splits(parent: &Container) -> anyhow::Result<()> {
+  loop {
+    let mut splits: Vec<SplitContainer> = parent
+      .descendants()
+      .filter_map(|c| c.as_split().cloned())
+      .collect();
+    if splits.is_empty() {
+      break;
+    }
+    splits.sort_by_key(|s| std::cmp::Reverse(s.ancestors().count()));
+    let before = splits.len();
+    for split in splits {
+      if split.parent().is_some() {
+        flatten_split_container(split)?;
+      }
+    }
+    // Safety: avoid infinite loop if something fails to detach.
+    let remaining = parent
+      .descendants()
+      .filter(|c| c.is_split())
+      .count();
+    if remaining >= before {
+      tracing::warn!(
+        "flatten_all_splits made no progress ({} splits remain)",
+        remaining
+      );
+      break;
+    }
+  }
+  Ok(())
+}
+
+fn find_tiling_by_id(
+  state: &WmState,
+  id: Uuid,
+) -> Option<TilingContainer> {
+  for window in state.windows() {
+    if window.id() == id {
+      return window.as_tiling_container().ok();
+    }
+  }
+  for monitor in state.monitors() {
+    for descendant in monitor.descendants() {
+      if descendant.id() == id {
+        return descendant.as_tiling_container().ok();
+      }
+    }
+  }
+  None
+}
+
+fn find_split_by_id(state: &WmState, id: Uuid) -> Option<SplitContainer> {
+  for monitor in state.monitors() {
+    for descendant in monitor.descendants() {
+      if descendant.id() == id {
+        return descendant.as_split().cloned();
+      }
+    }
+  }
+  None
 }
 
 fn live_identity(window: &WindowContainer) -> MatchableIdentity {
@@ -593,10 +930,10 @@ fn collect_node_windows(
           format!("{}::{}::{}", workspace_name, node.local_id, *order);
         out.push(SnapshotLeaf {
           key,
+          local_id: node.local_id.clone(),
           window: window.clone(),
           workspace_name: workspace_name.to_string(),
           order_index: *order,
-          tiling_size: node.tiling_size,
         });
         *order += 1;
       }
@@ -610,3 +947,4 @@ fn collect_node_windows(
     }
   }
 }
+

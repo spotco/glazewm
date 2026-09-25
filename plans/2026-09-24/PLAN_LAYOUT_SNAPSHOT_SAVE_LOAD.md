@@ -192,7 +192,7 @@ Not CLI-testable: tray file dialogs / clipboard copy (manual).
 ## Follow-up (explicitly out of scope)
 
 - Launch missing apps via `processPath`
-- Perfect nested-split tree isomorphism / full tree rebuild
+- ~~Perfect nested-split tree isomorphism / full tree rebuild~~ (done: best-effort prune + rebuild)
 - Re-apply ignored-window set from snapshot
 - Toast UI for success/failure (tracing is enough for v1)
 
