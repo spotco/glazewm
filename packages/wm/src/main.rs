@@ -43,6 +43,7 @@ use crate::{
 
 mod commands;
 mod events;
+mod ipc_conflict;
 mod ipc_server;
 mod models;
 mod pending_sync;
@@ -127,12 +128,26 @@ async fn start_wm(
   // Parse and validate user config.
   let mut config = UserConfig::new(config_path)?;
 
+  // Debug trail: layout.log beside config.yaml / layout.json.
+  // Set early so IPC AddrInUse recovery can log before the listener binds.
+  let layout_path = layout_snapshot_path(&config);
+  let layout_log_path = layout_debug_log_path(&config);
+  set_layout_debug_log_path(layout_log_path.clone());
+  tracing::info!(
+    "Layout persistence debug log -> {}",
+    layout_log_path.display()
+  );
+  crate::commands::general::layout_debug_log(format!(
+    "layout persistence debug log ready -> {}",
+    layout_log_path.display()
+  ));
+
   // Add application icon to system tray.
   let mut tray = SystemTray::new(&config.path, dispatcher.clone())?;
 
   let mut wm = WindowManager::new(&mut config, dispatcher.clone())?;
 
-  let mut ipc_server = IpcServer::start().await?;
+  let mut ipc_server = IpcServer::start(dispatcher).await?;
 
   // On Windows, start watcher process for restoring hidden windows on
   // crash. macOS' hidden windows are always accessible.
@@ -185,18 +200,6 @@ async fn start_wm(
 
   // Best-effort restore of persisted layout.json (beside config.yaml).
   // Runs after initial populate + startup commands so windows/workspaces exist.
-  // Debug trail: layout.log beside config.yaml / layout.json.
-  let layout_path = layout_snapshot_path(&config);
-  let layout_log_path = layout_debug_log_path(&config);
-  set_layout_debug_log_path(layout_log_path.clone());
-  tracing::info!(
-    "Layout persistence debug log -> {}",
-    layout_log_path.display()
-  );
-  crate::commands::general::layout_debug_log(format!(
-    "layout persistence debug log ready -> {}",
-    layout_log_path.display()
-  ));
   let _ = try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
 
   // Drain events emitted by startup restore so IPC clients see them, but do

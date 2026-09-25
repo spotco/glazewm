@@ -4,7 +4,7 @@ use anyhow::{bail, Context};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
-  net::{TcpListener, TcpStream},
+  net::TcpStream,
   sync::{broadcast, mpsc},
   task,
 };
@@ -18,8 +18,9 @@ use wm_common::{
   LayoutSnapshot, LoadLayoutData, MonitorsData, QueryCommand,
   ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
   SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
-  WorkspacesData, format_system_time_rfc3339, ipc_port,
+  WorkspacesData, format_system_time_rfc3339,
 };
+use wm_platform::Dispatcher;
 
 use crate::{
   commands::general::{
@@ -45,13 +46,13 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-  pub async fn start() -> anyhow::Result<Self> {
+  pub async fn start(dispatcher: &Dispatcher) -> anyhow::Result<Self> {
     let (message_tx, message_rx) = mpsc::unbounded_channel();
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (unsubscribe_tx, _unsubscribe_rx) = broadcast::channel(16);
 
-    let server_addr = format!("127.0.0.1:{}", ipc_port());
-    let server = TcpListener::bind(server_addr.clone()).await?;
+    let (server, server_addr) =
+      crate::ipc_conflict::bind_ipc_listener(dispatcher).await?;
     info!("IPC server started on: '{}'.", server_addr);
 
     let task = task::spawn(async move {
