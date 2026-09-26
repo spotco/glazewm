@@ -65,7 +65,7 @@ pub fn shell_exec(
   Ok(())
 }
 
-/// Reject empty / quote-junk programs that would ShellExecute into UNC
+/// Reject empty / quote-junk programs that would `ShellExecute` into UNC
 /// nonsense like `\\ "\"` (Windows "Network Error" dialog), and refuse
 /// truncated `C:\\Program` paths that produce the classic Windows "cannot
 /// find" popup.
@@ -252,11 +252,14 @@ fn recover_spaced_exe_path(parts: &[&str]) -> Option<(String, String)> {
       cumulative.push(' ');
     }
     cumulative.push_str(part);
-    let lower = cumulative.to_ascii_lowercase();
-    if lower.ends_with(".exe")
-      || lower.ends_with(".bat")
-      || lower.ends_with(".cmd")
-      || lower.ends_with(".com")
+    if std::path::Path::new(&cumulative)
+      .extension()
+      .is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("exe")
+          || ext.eq_ignore_ascii_case("bat")
+          || ext.eq_ignore_ascii_case("cmd")
+          || ext.eq_ignore_ascii_case("com")
+      })
     {
       let args = parts[idx + 1..].join(" ");
       return Some((cumulative, args));

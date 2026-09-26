@@ -873,7 +873,7 @@ impl WindowManager {
   }
 
   /// Best-effort uncloak/show of all managed windows (Windows cloak
-  /// hide_method).
+  /// `hide_method`).
   fn restore_visibility_on_exit(&self, config: &UserConfig) {
     let cloak = config.value.general.hide_method == HideMethod::Cloak;
     let mut restored = 0usize;

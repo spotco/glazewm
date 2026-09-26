@@ -33,7 +33,7 @@ use crate::{
 };
 
 pub struct IpcServer {
-  /// Accept-loop task. Prefer joining on shutdown so TcpListener Drop
+  /// Accept-loop task. Prefer joining on shutdown so `TcpListener` Drop
   /// runs synchronously before process exit (abort races Drop and can
   /// ghost ports).
   join_handle: Option<task::JoinHandle<()>>,
@@ -540,12 +540,12 @@ impl IpcServer {
     }
   }
 
-  /// Stop the accept loop and wait until the TcpListener is dropped.
+  /// Stop the accept loop and wait until the `TcpListener` is dropped.
   ///
-  /// On Windows, process exit / TerminateProcess before the listen socket
-  /// is closed can leave a ghost LISTENING entry (netstat PID with no
-  /// process). Soft wm-exit must always take this path; taskkill /F
-  /// cannot free ghosts.
+  /// On Windows, process exit / `TerminateProcess` before the listen
+  /// socket is closed can leave a ghost LISTENING entry (netstat PID
+  /// with no process). Soft wm-exit must always take this path; taskkill
+  /// /F cannot free ghosts.
   pub async fn stop_and_wait(&mut self) {
     let started = std::time::Instant::now();
     crate::commands::general::layout_debug_log(

@@ -121,6 +121,56 @@ pub fn load_layout_snapshot(
     ..Default::default()
   };
 
+  log_unmatched_layout_identities(
+    &leaves,
+    &live_matchables,
+    &matched_keys,
+    &matched_live,
+  );
+
+  // Workspace names are global/unique: move (or activate) each named
+  // workspace onto its matched live monitor before placing windows.
+  if let Err(err) =
+    ensure_workspaces_on_matched_monitors(&monitor_map, state, config)
+  {
+    tracing::warn!(
+      "Failed to reassign workspaces to matched monitors: {err:#}"
+    );
+  }
+
+  let ordered_pairs =
+    order_matched_pairs_by_workspace(pairs, &leaf_by_key);
+  restore_matched_windows(
+    &ordered_pairs,
+    &leaf_by_key,
+    state,
+    config,
+    &mut summary,
+  );
+
+  // Rebuild nested tiling geometry per workspace (order, sizes, splits).
+  restore_tiling_layouts(
+    snapshot,
+    &monitor_map,
+    &ordered_pairs,
+    &leaf_by_key,
+    state,
+    config,
+    &mut summary,
+  );
+
+  focus_snapshot_workspaces(&monitor_map, state, config);
+  log_load_layout_summary(&summary);
+
+  Ok(summary)
+}
+
+fn log_unmatched_layout_identities(
+  leaves: &[SnapshotLeaf],
+  live_matchables: &[MatchableWindow],
+  matched_keys: &HashSet<String>,
+  matched_live: &HashSet<String>,
+) {
   // Log unmatched identities so layout.log shows *why* leaves were skipped
   // (missing live window vs weak score / greedy collision).
   for leaf in leaves.iter().filter(|l| !matched_keys.contains(&l.key)) {
@@ -152,20 +202,14 @@ pub fn load_layout_snapshot(
     tracing::info!("{msg}");
     layout_debug_log(&msg);
   }
+}
 
-  // Workspace names are global/unique: move (or activate) each named
-  // workspace onto its matched live monitor before placing windows.
-  if let Err(err) =
-    ensure_workspaces_on_matched_monitors(&monitor_map, state, config)
-  {
-    tracing::warn!(
-      "Failed to reassign workspaces to matched monitors: {err:#}"
-    );
-  }
-
+fn order_matched_pairs_by_workspace(
+  mut pairs: Vec<(String, String)>,
+  leaf_by_key: &HashMap<String, &SnapshotLeaf>,
+) -> Vec<(String, String)> {
   // Sort matched pairs by workspace + order so tiling inserts are stabler.
-  let mut ordered_pairs = pairs;
-  ordered_pairs.sort_by(|(a, _), (b, _)| {
+  pairs.sort_by(|(a, _), (b, _)| {
     let la = leaf_by_key.get(a);
     let lb = leaf_by_key.get(b);
     match (la, lb) {
@@ -176,8 +220,17 @@ pub fn load_layout_snapshot(
       _ => std::cmp::Ordering::Equal,
     }
   });
+  pairs
+}
 
-  for (snap_key, live_key) in &ordered_pairs {
+fn restore_matched_windows(
+  ordered_pairs: &[(String, String)],
+  leaf_by_key: &HashMap<String, &SnapshotLeaf>,
+  state: &mut WmState,
+  config: &UserConfig,
+  summary: &mut LoadLayoutSummary,
+) {
+  for (snap_key, live_key) in ordered_pairs {
     let Some(leaf) = leaf_by_key.get(snap_key) else {
       continue;
     };
@@ -191,33 +244,23 @@ pub fn load_layout_snapshot(
       continue;
     };
 
-    if let Err(err) =
-      restore_window(leaf, window, state, config, &mut summary)
+    if let Err(err) = restore_window(leaf, window, state, config, summary)
     {
       let msg = format!(
-        "Failed to restore window '{}' -> {}: {err:#}",
-        snap_key, live_key
+        "Failed to restore window '{snap_key}' -> {live_key}: {err:#}"
       );
       tracing::warn!("{msg}");
       layout_debug_log(&msg);
     }
   }
+}
 
-  // Rebuild nested tiling geometry per workspace (order, sizes, splits).
-  if let Err(err) = restore_tiling_layouts(
-    snapshot,
-    &monitor_map,
-    &ordered_pairs,
-    &leaf_by_key,
-    state,
-    config,
-    &mut summary,
-  ) {
-    tracing::warn!("Failed to restore tiling layouts: {err:#}");
-  }
-
-  // Activate focused workspaces from snapshot where monitors matched.
-  for (snap_mon, live_mon) in &monitor_map {
+fn focus_snapshot_workspaces(
+  monitor_map: &[(SnapshotMonitor, Monitor)],
+  state: &mut WmState,
+  config: &UserConfig,
+) {
+  for (snap_mon, live_mon) in monitor_map {
     if let Some(name) = &snap_mon.focused_workspace_name {
       if let Err(err) =
         focus_workspace(WorkspaceTarget::Name(name.clone()), state, config)
@@ -230,7 +273,9 @@ pub fn load_layout_snapshot(
       }
     }
   }
+}
 
+fn log_load_layout_summary(summary: &LoadLayoutSummary) {
   let msg = format!(
     "Layout snapshot load summary: matched={}, unmatched_snapshot={}, unmatched_live={}, workspace_moves={}, state_updates={}, tiling_trees_restored={}, tiling_windows_placed={}",
     summary.matched,
@@ -243,8 +288,6 @@ pub fn load_layout_snapshot(
   );
   info!("{msg}");
   layout_debug_log(&msg);
-
-  Ok(summary)
 }
 
 fn restore_window(
@@ -313,12 +356,12 @@ fn restore_window(
     }
     window
   } else {
-    let window = if window.state() != target_state {
+    let window = if window.state() == target_state {
+      window
+    } else {
       let window =
         update_window_state(window, target_state.clone(), state, config)?;
       summary.state_updates += 1;
-      window
-    } else {
       window
     };
 
@@ -356,7 +399,7 @@ fn restore_tiling_layouts(
   state: &mut WmState,
   config: &UserConfig,
   summary: &mut LoadLayoutSummary,
-) -> anyhow::Result<()> {
+) {
   // snap leaf key -> live window uuid
   let mut live_by_snap_key: HashMap<String, Uuid> = HashMap::new();
   for (snap_key, live_key) in pairs {
@@ -458,8 +501,6 @@ fn restore_tiling_layouts(
       }
     }
   }
-
-  Ok(())
 }
 
 fn apply_workspace_tiling_plan(
@@ -552,7 +593,7 @@ fn apply_workspace_tiling_plan(
   renormalize_tiling_siblings_with_extras(
     &workspace.clone().into(),
     &local_to_container,
-  )?;
+  );
   apply_child_focus_order(
     &workspace.clone().into(),
     &plan.child_focus_order,
@@ -667,14 +708,14 @@ fn apply_plan_sizes(
 fn renormalize_tiling_siblings_with_extras(
   parent: &Container,
   local_to_container: &HashMap<String, Uuid>,
-) -> anyhow::Result<()> {
+) {
   let planned_ids: HashSet<Uuid> =
     local_to_container.values().copied().collect();
 
   let tiling_children: Vec<TilingContainer> =
     parent.tiling_children().collect();
   if tiling_children.is_empty() {
-    return Ok(());
+    return;
   }
 
   let mut planned: Vec<(TilingContainer, f32)> = Vec::new();
@@ -688,7 +729,7 @@ fn renormalize_tiling_siblings_with_extras(
   }
 
   if extras.is_empty() {
-    return Ok(());
+    return;
   }
 
   let (planned_sizes, extra_sizes) = allocate_tiling_sizes_with_extras(
@@ -711,8 +752,6 @@ fn renormalize_tiling_siblings_with_extras(
   );
   tracing::info!("{msg}");
   layout_debug_log(&msg);
-
-  Ok(())
 }
 
 /// Pure size math for plan survivors + N unplanned live tiling siblings.
@@ -720,6 +759,8 @@ fn renormalize_tiling_siblings_with_extras(
 /// Planned sizes (already summing ~1.0 among themselves) are scaled to
 /// leave an equal per-extra remainder of `1 / (planned + extras)`. Returns
 /// `(scaled_planned, extra_sizes)`.
+#[allow(clippy::cast_precision_loss)] // sibling counts stay well within
+                                      // f32 mantissa
 fn allocate_tiling_sizes_with_extras(
   planned_sizes: &[f32],
   extra_count: usize,
@@ -823,7 +864,8 @@ fn flatten_all_splits(parent: &Container) -> anyhow::Result<()> {
       }
     }
     // Safety: avoid infinite loop if something fails to detach.
-    let remaining = parent.descendants().filter(|c| c.is_split()).count();
+    let remaining =
+      parent.descendants().filter(Container::is_split).count();
     if remaining >= before {
       tracing::warn!(
         "flatten_all_splits made no progress ({} splits remain)",
@@ -986,7 +1028,7 @@ fn collect_snapshot_leaves(
       collect_node_windows(
         &workspace.root,
         &workspace.name,
-        live_bounds.clone(),
+        live_bounds.as_ref(),
         &mut order,
         &mut leaves,
       );
@@ -1081,7 +1123,7 @@ fn ensure_workspaces_on_matched_monitors(
 fn collect_node_windows(
   node: &SnapshotNode,
   workspace_name: &str,
-  live_monitor_bounds: Option<SnapshotBounds>,
+  live_monitor_bounds: Option<&SnapshotBounds>,
   order: &mut usize,
   out: &mut Vec<SnapshotLeaf>,
 ) {
@@ -1096,7 +1138,7 @@ fn collect_node_windows(
           window: window.clone(),
           workspace_name: workspace_name.to_string(),
           order_index: *order,
-          live_monitor_bounds: live_monitor_bounds.clone(),
+          live_monitor_bounds: live_monitor_bounds.cloned(),
         });
         *order += 1;
       }
@@ -1107,7 +1149,7 @@ fn collect_node_windows(
           collect_node_windows(
             child,
             workspace_name,
-            live_monitor_bounds.clone(),
+            live_monitor_bounds,
             order,
             out,
           );
@@ -1154,7 +1196,7 @@ mod tests {
   fn no_extras_leaves_planned_unchanged() {
     let (planned, extras) =
       allocate_tiling_sizes_with_extras(&[0.6, 0.4], 0);
-    assert!(extras.is_empty());
+    assert_eq!(extras, [] as [f32; 0]);
     approx_eq(planned[0], 0.6);
     approx_eq(planned[1], 0.4);
   }
@@ -1162,7 +1204,7 @@ mod tests {
   #[test]
   fn only_extras_share_equally() {
     let (planned, extras) = allocate_tiling_sizes_with_extras(&[], 2);
-    assert!(planned.is_empty());
+    assert_eq!(planned, [] as [f32; 0]);
     approx_eq(extras[0], 0.5);
     approx_eq(extras[1], 0.5);
   }

@@ -26,11 +26,8 @@ pub fn inspect_layout_snapshot(
   }
 
   let snapshot_windows = collect_snapshot_windows_for_match(snapshot);
-  let live_windows: Vec<LayoutMatchWindow> = state
-    .windows()
-    .iter()
-    .map(|window| live_match_window(window))
-    .collect();
+  let live_windows: Vec<LayoutMatchWindow> =
+    state.windows().iter().map(live_match_window).collect();
 
   Ok(build_layout_match_report(&snapshot_windows, &live_windows))
 }

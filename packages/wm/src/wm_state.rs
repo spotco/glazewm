@@ -656,14 +656,6 @@ impl WmState {
       .cloned()
   }
 
-  /// Cleans up windows that are no longer alive.
-  ///
-  /// This addresses the "ghost window" issue where applications may
-  /// terminate without sending window destroy events, leaving invalid
-  /// windows in WM state.
-  ///
-  /// See: <https://github.com/glzr-io/glazewm/issues/1219>
-
   /// Best-effort: manage any currently visible top-level windows that are
   /// not already in the container tree (e.g. after uncloaking orphans).
   pub fn manage_new_visible_windows(
@@ -691,6 +683,13 @@ impl WmState {
     Ok(())
   }
 
+  /// Cleans up windows that are no longer alive.
+  ///
+  /// This addresses the "ghost window" issue where applications may
+  /// terminate without sending window destroy events, leaving invalid
+  /// windows in WM state.
+  ///
+  /// See: <https://github.com/glzr-io/glazewm/issues/1219>
   pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
     let invalid_windows = self
       .windows()

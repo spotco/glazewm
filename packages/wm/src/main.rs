@@ -225,7 +225,7 @@ async fn start_wm(
   if startup_layout_retries_left > 0 {
     crate::commands::general::layout_debug_log(format!(
       "startup load left unmatched_snapshot={}; scheduling up to {startup_layout_retries_left} retries (2s / WindowManaged)",
-      first_load.as_ref().map(|s| s.unmatched_snapshot).unwrap_or(0)
+      first_load.as_ref().map_or(0, |s| s.unmatched_snapshot)
     ));
   }
   let startup_layout_retry_delay =

@@ -9,19 +9,19 @@
 //! Flow:
 //! 1. Try preferred bind port (`GLAZEWM_IPC_PORT` / 6123) - not
 //!    `ipc.port`.
-//! 2. On AddrInUse: prompt Kill vs Quit; kill glazewm + watcher + listener
-//!    PID.
+//! 2. On `AddrInUse`: prompt Kill vs Quit; kill glazewm + watcher +
+//!    listener PID.
 //! 3. Poll bind for ~5s (ghost sockets are not freed by taskkill).
 //! 4. Detect ghost (netstat PID absent from process list) and fall back.
 //! 5. Fallback: try preferred+1.. (skip 6124 = Zebar asset server), then
 //!    ephemeral; write `~/.glzr/glazewm/ipc.port` so CLI/`ipc_port()` find
 //!    the new port.
 //!
-//! **Prevention:** soft `wm-exit` must Drop the TcpListener (SO_LINGER=0)
-//! via `IpcServer::stop_and_wait` before process exit. Prefer
-//! `scripts/deploy/start_glazewm.cmd` / deploy soft-exit. `taskkill /F`
-//! and crashes can still leave ghosts — reboot (or wait) is the only cure
-//! then.
+//! **Prevention:** soft `wm-exit` must Drop the `TcpListener`
+//! (`SO_LINGER=0`) via `IpcServer::stop_and_wait` before process exit.
+//! Prefer `scripts/deploy/start_glazewm.cmd` / deploy soft-exit. `taskkill
+//! /F` and crashes can still leave ghosts — reboot (or wait) is the only
+//! cure then.
 
 use std::{
   io,
@@ -37,7 +37,7 @@ use wm_platform::Dispatcher;
 
 use crate::commands::general::layout_debug_log;
 
-/// Max times we ask the user to kill+retry after an AddrInUse failure.
+/// Max times we ask the user to kill+retry after an `AddrInUse` failure.
 const MAX_KILL_RETRY_ROUNDS: u32 = 2;
 
 /// After each kill round, keep trying to bind for this long before giving
@@ -69,7 +69,7 @@ pub fn is_addr_in_use(err: &io::Error) -> bool {
     || msg.contains("Only one usage of each socket address")
 }
 
-/// Bind the IPC listener, offering Kill-existing vs Quit on AddrInUse,
+/// Bind the IPC listener, offering Kill-existing vs Quit on `AddrInUse`,
 /// then falling back to alternate ports when a ghost socket cannot be
 /// freed.
 pub async fn bind_ipc_listener(
@@ -91,112 +91,34 @@ pub async fn bind_ipc_listener(
           "IPC preferred bind ok on {preferred} in {}ms",
           bind_started.elapsed().as_millis()
         ));
-        return finish_bind(listener, preferred, preferred, kill_rounds)
-          .await;
+        return Ok(finish_bind(
+          listener,
+          preferred,
+          preferred,
+          kill_rounds,
+        ));
       }
       Err(err) if is_addr_in_use(&err) => {
-        let err_text = format!("{err}");
-        let ghost = port_has_ghost_listener(preferred);
-        if ghost {
-          saw_ghost = true;
-        }
-        let log_line = format!(
-          "IPC bind AddrInUse on 127.0.0.1:{preferred} (round {kill_rounds}, ghost={ghost}): {err_text}"
-        );
-        warn!("{log_line}");
-        layout_debug_log(&log_line);
-
-        // Ghost sockets cannot be freed by taskkill — still best-effort
-        // kill watcher/glazewm once, then auto-fallback without
-        // blocking on dialog.
-        if ghost {
-          layout_debug_log(format!(
-            "IPC ghost listener on {preferred}; best-effort kill then auto-fallback (no dialog)"
-          ));
-          let report = kill_existing_glazewm_and_free_port(preferred);
-          layout_debug_log(format!("IPC ghost cleanup: {report}"));
-          // Quick poll in case it was not actually a ghost.
-          if let Some(listener) = poll_bind_port(
-            preferred,
-            Duration::from_millis(250),
-            POST_KILL_POLL_INTERVAL,
-          )
-          .await
-          {
-            return finish_bind(
+        match handle_preferred_addr_in_use(
+          dispatcher,
+          preferred,
+          &err,
+          &mut kill_rounds,
+          &mut last_detail,
+          &mut saw_ghost,
+        )
+        .await?
+        {
+          AddrInUseAction::Bound(listener) => {
+            return Ok(finish_bind(
               listener,
               preferred,
               preferred,
               kill_rounds,
-            )
-            .await;
+            ));
           }
-          break;
-        }
-
-        if kill_rounds >= MAX_KILL_RETRY_ROUNDS {
-          layout_debug_log(format!(
-            "IPC port {preferred} still in use after {MAX_KILL_RETRY_ROUNDS} kill+retry; falling back"
-          ));
-          break;
-        }
-
-        let ghost_hint = if ghost {
-          "\n\nDetected a GHOST listen socket (netstat PID is not a live process). \
-           Kill cannot free it — after this attempt GlazeWM will bind an alternate port."
-            .to_string()
-        } else if last_detail.is_empty() {
-          String::new()
-        } else {
-          format!("\n\nPrevious attempt notes:\n{last_detail}")
-        };
-
-        let prompt = format!(
-          "GlazeWM could not bind the IPC socket on 127.0.0.1:{preferred}.\n\n\
-           {err_text}\n\n\
-           Another GlazeWM instance may still be running, or a ghost socket \
-           may still own this port.{ghost_hint}\n\n\
-           Yes — Kill existing GlazeWM / watcher processes and retry\n\
-           No — Quit (do not start this instance)"
-        );
-
-        let kill = dispatcher
-          .show_yes_no_dialog("GlazeWM — IPC port in use", &prompt);
-        if !kill {
-          let msg = format!(
-            "IPC port {preferred} in use; user chose Quit (abort this instance)"
-          );
-          layout_debug_log(&msg);
-          bail!("{msg}");
-        }
-
-        kill_rounds += 1;
-        let report = kill_existing_glazewm_and_free_port(preferred);
-        last_detail = report.clone();
-        layout_debug_log(format!(
-          "IPC kill+free-port round {kill_rounds}: {report}"
-        ));
-        info!("IPC kill+free-port round {kill_rounds}: {report}");
-
-        // Poll bind for several seconds — OS may release slowly; ghosts
-        // never release.
-        if let Some(listener) = poll_bind_port(
-          preferred,
-          POST_KILL_POLL,
-          POST_KILL_POLL_INTERVAL,
-        )
-        .await
-        {
-          return finish_bind(listener, preferred, preferred, kill_rounds)
-            .await;
-        }
-
-        if port_has_ghost_listener(preferred) {
-          saw_ghost = true;
-          layout_debug_log(format!(
-            "IPC port {preferred} still ghost after kill+poll; will fall back"
-          ));
-          break;
+          AddrInUseAction::Fallback => break,
+          AddrInUseAction::Retry => {}
         }
       }
       Err(err) => {
@@ -215,12 +137,123 @@ pub async fn bind_ipc_listener(
   bind_fallback_ports(preferred, saw_ghost, &last_detail).await
 }
 
-async fn finish_bind(
+/// Result of handling one preferred-port `AddrInUse`.
+enum AddrInUseAction {
+  Bound(TcpListener),
+  /// Give up on preferred; try fallback ports.
+  Fallback,
+  /// Kill/poll did not free the port and it is not a ghost; try again.
+  Retry,
+}
+
+/// Handle one `AddrInUse` on the preferred port.
+///
+/// Returns [`AddrInUseAction::Bound`] if bind succeeded after kill/poll,
+/// [`AddrInUseAction::Fallback`] to try alternate ports,
+/// [`AddrInUseAction::Retry`] to loop again, or `Err` if the user chose
+/// Quit.
+async fn handle_preferred_addr_in_use(
+  dispatcher: &Dispatcher,
+  preferred: u32,
+  err: &io::Error,
+  kill_rounds: &mut u32,
+  last_detail: &mut String,
+  saw_ghost: &mut bool,
+) -> anyhow::Result<AddrInUseAction> {
+  let err_text = format!("{err}");
+  let ghost = port_has_ghost_listener(preferred);
+  if ghost {
+    *saw_ghost = true;
+  }
+  let log_line = format!(
+    "IPC bind AddrInUse on 127.0.0.1:{preferred} (round {kill_rounds}, ghost={ghost}): {err_text}"
+  );
+  warn!("{log_line}");
+  layout_debug_log(&log_line);
+
+  // Ghost sockets cannot be freed by taskkill - still best-effort kill
+  // watcher/glazewm once, then auto-fallback without blocking on dialog.
+  if ghost {
+    layout_debug_log(format!(
+      "IPC ghost listener on {preferred}; best-effort kill then auto-fallback (no dialog)"
+    ));
+    let report = kill_existing_glazewm_and_free_port(preferred);
+    layout_debug_log(format!("IPC ghost cleanup: {report}"));
+    if let Some(listener) = poll_bind_port(
+      preferred,
+      Duration::from_millis(250),
+      POST_KILL_POLL_INTERVAL,
+    )
+    .await
+    {
+      return Ok(AddrInUseAction::Bound(listener));
+    }
+    return Ok(AddrInUseAction::Fallback);
+  }
+
+  if *kill_rounds >= MAX_KILL_RETRY_ROUNDS {
+    layout_debug_log(format!(
+      "IPC port {preferred} still in use after {MAX_KILL_RETRY_ROUNDS} kill+retry; falling back"
+    ));
+    return Ok(AddrInUseAction::Fallback);
+  }
+
+  let ghost_hint = if last_detail.is_empty() {
+    String::new()
+  } else {
+    format!("\n\nPrevious attempt notes:\n{last_detail}")
+  };
+
+  let prompt = format!(
+    "GlazeWM could not bind the IPC socket on 127.0.0.1:{preferred}.\n\n\
+     {err_text}\n\n\
+     Another GlazeWM instance may still be running, or a ghost socket \
+     may still own this port.{ghost_hint}\n\n\
+     Yes - Kill existing GlazeWM / watcher processes and retry\n\
+     No - Quit (do not start this instance)"
+  );
+
+  let kill =
+    dispatcher.show_yes_no_dialog("GlazeWM - IPC port in use", &prompt);
+  if !kill {
+    let msg = format!(
+      "IPC port {preferred} in use; user chose Quit (abort this instance)"
+    );
+    layout_debug_log(&msg);
+    bail!("{msg}");
+  }
+
+  *kill_rounds += 1;
+  let report = kill_existing_glazewm_and_free_port(preferred);
+  last_detail.clone_from(&report);
+  layout_debug_log(format!(
+    "IPC kill+free-port round {kill_rounds}: {report}"
+  ));
+  info!("IPC kill+free-port round {kill_rounds}: {report}");
+
+  if let Some(listener) =
+    poll_bind_port(preferred, POST_KILL_POLL, POST_KILL_POLL_INTERVAL)
+      .await
+  {
+    return Ok(AddrInUseAction::Bound(listener));
+  }
+
+  if port_has_ghost_listener(preferred) {
+    *saw_ghost = true;
+    layout_debug_log(format!(
+      "IPC port {preferred} still ghost after kill+poll; will fall back"
+    ));
+    return Ok(AddrInUseAction::Fallback);
+  }
+  Ok(AddrInUseAction::Retry)
+}
+
+fn finish_bind(
   listener: TcpListener,
   bound_port: u32,
   preferred: u32,
   kill_rounds: u32,
-) -> anyhow::Result<(TcpListener, String)> {
+) -> (TcpListener, String) {
   let addr = format!("127.0.0.1:{bound_port}");
   // Always write ipc.port so Zebar/CLI have a single authoritative port
   // (including when bound to preferred 6123). Do not clear on default.
@@ -240,7 +273,7 @@ async fn finish_bind(
   );
   info!("{msg}");
   layout_debug_log(&msg);
-  Ok((listener, addr))
+  (listener, addr)
 }
 
 /// Ports reserved by sibling glzr.io tools — never steal these for IPC
@@ -275,7 +308,7 @@ async fn bind_fallback_ports(
         layout_debug_log(format!(
           "IPC fallback bound 127.0.0.1:{port} (preferred {preferred} ghost={saw_ghost})"
         ));
-        return finish_bind(listener, port, preferred, 0).await;
+        return Ok(finish_bind(listener, port, preferred, 0));
       }
       Err(err) if is_addr_in_use(&err) => {
         layout_debug_log(format!(
@@ -293,11 +326,11 @@ async fn bind_fallback_ports(
   // Ephemeral port.
   match TcpListener::bind("127.0.0.1:0").await {
     Ok(listener) => {
-      let port = listener.local_addr()?.port() as u32;
+      let port = u32::from(listener.local_addr()?.port());
       layout_debug_log(format!(
         "IPC ephemeral fallback bound 127.0.0.1:{port}"
       ));
-      finish_bind(listener, port, preferred, 0).await
+      Ok(finish_bind(listener, port, preferred, 0))
     }
     Err(err) => {
       let msg = format!(
@@ -311,6 +344,8 @@ async fn bind_fallback_ports(
   }
 }
 
+// Async so non-Windows can `.await` Tokio bind; Windows path is sync.
+#[allow(clippy::unused_async)]
 async fn try_bind_port(port: u32) -> io::Result<TcpListener> {
   // Build the listen socket with SO_LINGER=0 so an abortive close on Drop
   // / process soft-exit releases the port immediately on Windows instead
@@ -337,7 +372,7 @@ async fn try_bind_port(port: u32) -> io::Result<TcpListener> {
     socket.bind(&addr.into())?;
     socket.listen(128)?;
     let std_listener: std::net::TcpListener = socket.into();
-    return TcpListener::from_std(std_listener);
+    TcpListener::from_std(std_listener)
   }
   #[cfg(not(target_os = "windows"))]
   {
@@ -427,8 +462,7 @@ fn process_exists(pid: u32) -> bool {
       || line
         .split(',')
         .nth(1)
-        .map(|s| s.trim_matches('"') == pid.to_string())
-        .unwrap_or(false)
+        .is_some_and(|s| s.trim_matches('"') == pid.to_string())
     {
       return true;
     }
@@ -739,9 +773,8 @@ mod tests {
 
   #[test]
   fn detects_windows_10048_message() {
-    let err = Error::new(
-      ErrorKind::Other,
-      "Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048)",
+    let err = Error::other(
+      "Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048)"
     );
     assert!(is_addr_in_use(&err));
   }
