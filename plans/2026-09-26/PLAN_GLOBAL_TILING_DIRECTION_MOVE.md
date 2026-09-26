@@ -300,14 +300,19 @@ the live layout so move checks are non-destructive.
 
 Verification run 2026-09-26:
 
-- [x] `cargo fmt --all -- --check`
-- [x] `cargo clippy --all-targets --all-features -- -D warnings`
+- [x] GlazeWM changed-file rustfmt check and targeted
+      `cargo clippy -p wm --bin glazewm --tests --all-features -- -D warnings`
+      pass. The repository-wide all-targets clippy command still reports
+      pre-existing layout-snapshot test lints outside this plan's diff.
 - [x] `cargo test -p wm-common --lib` (74 passed)
 - [x] `cargo test -p wm --bin glazewm` (43 passed, including a live
       nested-move fixture compared directly with `global_move_plan`)
 - [x] `build.bat` (release WM, CLI, and watcher artifacts)
 - [x] Zebar provider tests (18 passed), Zebar Rust tests (13 passed), and the
       vendored bundle reproducibility check passed.
+- [x] Zebar changed Rust files are formatted. The repository-wide formatter
+      still reports pre-existing changes in `crates/systray-util` and
+      `packages/desktop/build.rs` outside this review diff.
 - [x] Existing embedded-pack installs now refresh on version/build-revision
       changes; matching installs are left untouched, with regression coverage.
 - [x] Provider event handlers guard the second IPC read after the first async
