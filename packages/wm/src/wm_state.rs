@@ -29,6 +29,9 @@ use crate::{
   user_config::UserConfig,
 };
 
+pub(crate) const DEFAULT_GLOBAL_TILING_DIRECTION: TilingDirection =
+  TilingDirection::Horizontal;
+
 pub struct WmState {
   /// Root node of the container tree. Monitors are the children of the
   /// root node, followed by workspaces, then split containers/windows.
@@ -97,7 +100,7 @@ impl WmState {
       unmanaged_or_minimized_timestamp: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
-      global_tiling_direction: TilingDirection::Horizontal,
+      global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
       is_paused: false,
       is_focus_synced: false,
       has_initialized: false,

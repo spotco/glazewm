@@ -425,6 +425,55 @@ mod tests {
   }
 
   #[test]
+  fn fixture_covers_all_global_directions_and_arrows() {
+    let cases = [
+      (
+        TilingDirection::Horizontal,
+        Direction::Left,
+        Some("H[3 V[1 2]]"),
+      ),
+      (TilingDirection::Horizontal, Direction::Right, None),
+      (TilingDirection::Horizontal, Direction::Up, Some("H[1 2 3]")),
+      (
+        TilingDirection::Horizontal,
+        Direction::Down,
+        Some("H[V[1 2] 3]"),
+      ),
+      (TilingDirection::Vertical, Direction::Left, Some("V[1 2 3]")),
+      (
+        TilingDirection::Vertical,
+        Direction::Right,
+        Some("V[1 2 3]"),
+      ),
+      (TilingDirection::Vertical, Direction::Up, Some("V[3 1 2]")),
+      (TilingDirection::Vertical, Direction::Down, Some("V[1 2 3]")),
+    ];
+
+    for (stack_direction, direction, expected) in cases {
+      let result = plan_global_move(
+        &fixture_13_23(),
+        "3",
+        &direction,
+        &stack_direction,
+      );
+
+      match expected {
+        Some(expected) => assert_eq!(
+          result
+            .expect("fixture move should succeed")
+            .format_compact(),
+          expected,
+          "stack={stack_direction:?}, direction={direction:?}"
+        ),
+        None => assert!(
+          result.is_none(),
+          "stack={stack_direction:?}, direction={direction:?}"
+        ),
+      }
+    }
+  }
+
+  #[test]
   fn move_left_global_horizontal_gives_31_32() {
     let tree = fixture_13_23();
     let out = plan_global_move(

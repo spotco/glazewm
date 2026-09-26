@@ -1,7 +1,7 @@
 # Global tiling direction + consistent Super+Shift(+Ctrl) move Plan
 
 Date: 2026-09-26
-Status: Step 9 automated/runtime verification complete; visual hotkey smoke remains
+Status: implementation and automated/runtime verification complete; visual hotkey smoke remains desktop-only
 Branch: `glazewm-spotcobuild` (GlazeWM) + `zebar-spotcobuild` (Zebar pack / provider as needed)
 Scope: multi-day feature work (WM move semantics + global direction state + Zebar indicator + default config)
 
@@ -16,7 +16,8 @@ Scope: multi-day feature work (WM move semantics + global direction state + Zeba
 - [x] Step 6 - Unit tests for move matrices (H/V global × arrow × layouts)
 - [x] Step 7 - Zebar: show + toggle global tiling direction
 - [x] Step 8 - Make live `config.yaml` the spotcobuild sample default
-- [ ] Step 9 - Manual smoke on Asus + build/deploy readiness (interactive checks pending)
+- [x] Step 9 - Automated/runtime verification and build/deploy readiness
+- [ ] Desktop-only physical hotkey and tray-hover follow-up (UI surface unavailable)
 
 ## Objective
 
@@ -166,8 +167,10 @@ Horizontal, or from config — see open questions).
 
 ## Step 0 - Resolve open questions (blocking)
 
-- [ ] Answer questions in the chat widget / thread (see “Open questions”).
-- [ ] Fold answers into this plan before coding Steps 2–5.
+- [x] Answer questions in the chat widget / thread (see “Open questions”);
+      there are no remaining open questions.
+- [x] Fold the locked decisions below into the implementation before coding
+      Steps 2–5.
 
 ## Step 1 - Document current contracts
 
@@ -281,19 +284,24 @@ Verification run 2026-09-26:
 
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --all-targets --all-features -- -D warnings`
-- [x] `cargo test -p wm-common --lib` (70 passed)
-- [x] `cargo test -p wm --bin glazewm` (38 passed)
+- [x] `cargo test -p wm-common --lib` (71 passed)
+- [x] `cargo test -p wm --bin glazewm` (41 passed)
 - [x] `build.bat` (release WM, CLI, and watcher artifacts)
+- [x] Zebar provider tests (15 passed), full Zebar `build.bat`, and release
+      deployment completed.
 - [x] Deployed with the existing backup/deploy scripts; current WM starts and
       `query global-tiling-direction` returns successfully.
 - [x] Opposite-move config command parses and the live config starts without
-      the previous `keybindings[8].commands` fatal error.
-- [x] CLI toggle changed global horizontal → vertical while the layout tree
-      stayed unchanged, then restored horizontal.
-- [x] Vendored `spotco.tokyo-silence` bar launched and is visible to WM as the
-      ignored `Zebar - spotco.tokyo-silence / bar` window.
+      the previous `keybindings[8].commands` fatal error (the screenshot error
+      was caused by the direction selector being mutually exclusive with the
+      opposite flag).
+- [x] CLI toggle changed global horizontal → vertical while the structural
+      layout tree stayed unchanged, then restored horizontal.
+- [x] Vendored `spotco.tokyo-silence` bar launched from the deployed Zebar
+      build; its cached bundle matches the fork and WM reports the ignored
+      `Zebar - spotco.tokyo-silence / bar` window.
 - [ ] Physical Super+J / Super+Shift+Ctrl+Arrow and visual tray-hover checks
-      still need a human desktop pass; the computer-use surface did not expose
+      remain desktop-only observations; the computer-use surface did not expose
       native windows for those observations.
 
 ## Decisions (Step 0)
@@ -308,14 +316,6 @@ Verification run 2026-09-26:
 ## Open questions
 
 _(none — Step 0 complete)_
-
-## Non-goals (this plan)
-
-## Non-goals (this plan)
-
-## Non-goals (this plan)
-
-## Non-goals (this plan)
 
 ## Non-goals (this plan)
 
