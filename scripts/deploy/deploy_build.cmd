@@ -16,7 +16,13 @@ if not exist "%INSTALL%\" (
   exit /b 1
 )
 
-echo Stopping GlazeWM processes if running...
+echo Soft-exiting GlazeWM (wm-exit) so IPC listen socket is Dropped...
+REM Prefer soft exit over taskkill /F — hard kill leaves ghost LISTENING ports.
+if exist "%INSTALL%\glazewm.exe" (
+  "%INSTALL%\glazewm.exe" command wm-exit >nul 2>&1
+  timeout /t 2 /nobreak >nul
+)
+echo Stopping any remaining GlazeWM processes...
 taskkill /IM glazewm.exe /F >nul 2>&1
 taskkill /IM glazewm-watcher.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
@@ -43,8 +49,10 @@ echo.
 echo Deployed:
 dir "%INSTALL%\glazewm.exe" "%INSTALL%\glazewm-cli.exe" "%INSTALL%\glazewm-watcher.exe" 2>nul
 echo.
-echo Tip: start GlazeWM from Start menu or:
+echo Tip: start GlazeWM ONLY with a quoted path (or start_glazewm.cmd):
 echo   "%INSTALL%\glazewm.exe"
+echo   "%REPO%\scripts\deploy\start_glazewm.cmd"
+echo Never: start C:\Program Files\...  (unquoted -^> C:\Program popup)
 exit /b 0
 
 :copyfail

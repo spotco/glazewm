@@ -149,6 +149,11 @@ pub fn score_window(
       // (e.g. Microsoft.WindowsTerminal_1.22.x → 1.23.x). Treat same package
       // family + exe filename as a full path match.
       score += SCORE_PROCESS_PATH;
+    } else if same_exe_basename(c_path, t_path) {
+      // VS Code / portable installs: same Code.exe under Local\Programs vs
+      // Program Files. Basename match is weaker than full path but enough
+      // with process_name to clear the threshold.
+      score += SCORE_PROCESS_NAME;
     }
   }
 
@@ -233,6 +238,18 @@ fn windows_apps_same_package_exe(a: &str, b: &str) -> bool {
     }
     _ => false,
   }
+}
+
+fn same_exe_basename(a: &str, b: &str) -> bool {
+  fn basename(path: &str) -> &str {
+    path
+      .rsplit(['\\', '/'])
+      .next()
+      .unwrap_or(path)
+  }
+  let ba = basename(a);
+  let bb = basename(b);
+  !ba.is_empty() && eq_ignore_ascii_case(ba, bb)
 }
 
 fn windows_apps_identity(path: &str) -> Option<(String, String)> {
@@ -797,4 +814,29 @@ mod tests {
     assert!(score >= MATCH_SCORE_THRESHOLD);
   }
 
+
+
+  #[test]
+  fn same_exe_basename_boosts_score_across_install_roots() {
+    let snap = MatchableIdentity {
+      process_path: Some(
+        r"C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe"
+          .into(),
+      ),
+      process_name: "Code".into(),
+      class_name: Some("Chrome_WidgetWin_1".into()),
+      title: Some("config.yaml - Visual Studio Code".into()),
+    };
+    let live = MatchableIdentity {
+      process_path: Some(r"C:\Program Files\Microsoft VS Code\Code.exe".into()),
+      process_name: "Code".into(),
+      class_name: Some("Chrome_WidgetWin_1".into()),
+      title: Some("other - Visual Studio Code".into()),
+    };
+    let score = score_window(&live, &snap);
+    assert!(
+      score >= MATCH_SCORE_THRESHOLD,
+      "expected soft path+name+class to clear threshold, got {score}"
+    );
+  }
 }

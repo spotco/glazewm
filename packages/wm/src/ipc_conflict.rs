@@ -12,6 +12,11 @@
 //! 4. Detect ghost (netstat PID absent from process list) and fall back.
 //! 5. Fallback: try preferred+1..+10, then ephemeral `127.0.0.1:0`; write
 //!    `~/.glzr/glazewm/ipc.port` so CLI/`ipc_port()` find the new port.
+//!
+//! **Prevention:** soft `wm-exit` must Drop the TcpListener (SO_LINGER=0) via
+//! `IpcServer::stop_and_wait` before process exit. Prefer
+//! `scripts/deploy/start_glazewm.cmd` / deploy soft-exit. `taskkill /F` and
+//! crashes can still leave ghosts — reboot (or wait) is the only cure then.
 
 use std::{
   io,
@@ -263,7 +268,33 @@ async fn bind_fallback_ports(
 }
 
 async fn try_bind_port(port: u32) -> io::Result<TcpListener> {
-  TcpListener::bind(format!("127.0.0.1:{port}")).await
+  // Build the listen socket with SO_LINGER=0 so an abortive close on Drop /
+  // process soft-exit releases the port immediately on Windows instead of
+  // leaving a ghost LISTENING entry after taskkill-style deaths when possible.
+  // Soft wm-exit still must Drop the listener (see IpcServer::stop_and_wait);
+  // linger alone cannot fix TerminateProcess ghosts.
+  #[cfg(target_os = "windows")]
+  {
+    use std::net::SocketAddr;
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+      .parse()
+      .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    // Do NOT enable SO_REUSEADDR on Windows for exclusive IPC — reuse can mask
+    // live conflicts and confuse recovery. Linger=0 for abortive close on Drop.
+    socket.set_linger(Some(std::time::Duration::from_secs(0)))?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    return TcpListener::from_std(std_listener);
+  }
+  #[cfg(not(target_os = "windows"))]
+  {
+    TcpListener::bind(format!("127.0.0.1:{port}")).await
+  }
 }
 
 async fn poll_bind_port(

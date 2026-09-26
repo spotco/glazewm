@@ -4090,6 +4090,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shell-util",
+ "socket2",
  "tauri-winres",
  "tokio",
  "tokio-tungstenite",

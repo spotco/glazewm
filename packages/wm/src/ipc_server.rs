@@ -33,7 +33,9 @@ use crate::{
 };
 
 pub struct IpcServer {
-  abort_handle: task::AbortHandle,
+  /// Accept-loop task. Prefer joining on shutdown so TcpListener Drop runs
+  /// synchronously before process exit (abort races Drop and can ghost ports).
+  join_handle: Option<task::JoinHandle<()>>,
   /// Graceful accept-loop stop; dropping the listener closes the TCP port
   /// before process exit (abort alone is async and can leave ghost sockets).
   shutdown_tx: Option<oneshot::Sender<()>>,
@@ -92,7 +94,7 @@ impl IpcServer {
     });
 
     Ok(Self {
-      abort_handle: task.abort_handle(),
+      join_handle: Some(task),
       shutdown_tx: Some(shutdown_tx),
       #[allow(clippy::used_underscore_binding)]
       _event_rx,
@@ -524,22 +526,43 @@ impl IpcServer {
 
   pub fn stop(&mut self) {
     info!("Shutting down IPC server.");
-    // Signal accept loop to drop TcpListener *before* aborting the task.
-    // Abort alone is asynchronous; exiting the process while the listener
-    // is still alive leaves a ghost LISTENING socket on Windows.
+    // Signal accept loop to drop TcpListener. Do NOT abort here — aborting
+    // can race Drop on Windows and leave a ghost LISTENING socket. Callers
+    // on the tokio runtime should prefer `stop_and_wait` which joins.
     if let Some(tx) = self.shutdown_tx.take() {
       let _ = tx.send(());
     }
-    self.abort_handle.abort();
-    // Brief yield so the accept task can run drop(server) before we return
-    // into process teardown. Callers on the tokio runtime should prefer
-    // `stop_and_wait`; this sync path is best-effort for Drop.
   }
 
-  /// Stop the accept loop and give it a short window to drop the listener.
+  /// Stop the accept loop and wait until the TcpListener is dropped.
+  ///
+  /// On Windows, process exit / TerminateProcess before the listen socket is
+  /// closed can leave a ghost LISTENING entry (netstat PID with no process).
+  /// Soft wm-exit must always take this path; taskkill /F cannot free ghosts.
   pub async fn stop_and_wait(&mut self) {
     self.stop();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let Some(handle) = self.join_handle.take() else {
+      return;
+    };
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(std::time::Duration::from_millis(750), handle)
+      .await
+    {
+      Ok(Ok(())) => {
+        info!("IPC accept loop joined; TcpListener dropped.");
+      }
+      Ok(Err(err)) => {
+        warn!("IPC accept loop join error: {err}");
+      }
+      Err(_) => {
+        warn!(
+          "IPC accept loop did not finish within 750ms; aborting as last resort"
+        );
+        abort.abort();
+        // Give the abort a moment to drop the listener future locals.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+      }
+    }
   }
 }
 

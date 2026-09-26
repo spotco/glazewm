@@ -201,15 +201,19 @@ async fn start_wm(
   // Best-effort restore of persisted layout.json (beside config.yaml).
   // Runs after initial populate + startup commands so windows/workspaces exist.
   // Windows still cloaked / not yet in visible_windows() at populate() are
-  // absent from the first pass — schedule one deferred retry after the event
-  // loop can manage late arrivals (WindowManaged).
+  // absent from the first pass — schedule deferred retries after the event
+  // loop can manage late arrivals (WindowManaged), plus timed retries.
   let first_load =
     try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
-  let mut startup_layout_retry =
-    first_load.as_ref().is_some_and(|s| s.unmatched_snapshot > 0);
-  if startup_layout_retry {
+  let mut startup_layout_retries_left: u32 =
+    if first_load.as_ref().is_some_and(|s| s.unmatched_snapshot > 0) {
+      4
+    } else {
+      0
+    };
+  if startup_layout_retries_left > 0 {
     crate::commands::general::layout_debug_log(format!(
-      "startup load left unmatched_snapshot={}; scheduling one retry in 2s",
+      "startup load left unmatched_snapshot={}; scheduling up to {startup_layout_retries_left} retries (2s / WindowManaged)",
       first_load.as_ref().map(|s| s.unmatched_snapshot).unwrap_or(0)
     ));
   }
@@ -248,18 +252,18 @@ async fn start_wm(
   }
 
   // Startup event drain finished; allow layout auto-save scheduling.
-  // Keep auto-save off until a pending startup layout retry finishes so we
+  // Keep auto-save off until pending startup layout retries finish so we
   // do not persist the incomplete pre-retry arrangement over layout.json.
   crate::commands::general::layout_debug_log(
     "startup event drain complete; enabling layout auto-save",
   );
   let layout_path_for_retry = layout_path.clone();
   let mut layout_auto_save = LayoutAutoSave::new(layout_path);
-  if !startup_layout_retry {
+  if startup_layout_retries_left == 0 {
     layout_auto_save.enable();
   } else {
     crate::commands::general::layout_debug_log(
-      "auto-save deferred until startup layout retry completes",
+      "auto-save deferred until startup layout retries complete",
     );
   }
 
@@ -303,20 +307,31 @@ async fn start_wm(
           wm.state.cleanup_invalid_windows()
         }
       },
-      () = &mut startup_layout_retry_delay, if startup_layout_retry => {
-        startup_layout_retry = false;
-        crate::commands::general::layout_debug_log(
-          "startup layout retry firing after manage settle window",
-        );
-        let _ = try_load_persisted_layout_snapshot(
+      () = &mut startup_layout_retry_delay, if startup_layout_retries_left > 0 => {
+        crate::commands::general::layout_debug_log(format!(
+          "startup layout timed retry firing ({startup_layout_retries_left} left)",
+        ));
+        let summary = try_load_persisted_layout_snapshot(
           &layout_path_for_retry,
           &mut wm.state,
           &config,
         );
-        layout_auto_save.enable();
-        crate::commands::general::layout_debug_log(
-          "startup layout retry done; auto-save enabled",
-        );
+        let still = summary.as_ref().is_some_and(|s| s.unmatched_snapshot > 0);
+        if still && startup_layout_retries_left > 1 {
+          startup_layout_retries_left -= 1;
+          startup_layout_retry_delay
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(2));
+          crate::commands::general::layout_debug_log(format!(
+            "startup layout still unmatched; next timed retry in 2s ({startup_layout_retries_left} left)",
+          ));
+        } else {
+          startup_layout_retries_left = 0;
+          layout_auto_save.enable();
+          crate::commands::general::layout_debug_log(
+            "startup layout retries done; auto-save enabled",
+          );
+        }
         Ok(())
       },
       Some((
@@ -367,6 +382,34 @@ async fn start_wm(
               &[MouseEventKind::LeftButtonUp]
             },
           )?;
+        }
+
+        // Event-driven layout retry: when a late window is managed during the
+        // startup retry window, re-run load immediately (debounced by resetting
+        // the timer after a successful settle).
+        if startup_layout_retries_left > 0
+          && matches!(wm_event, WmEvent::WindowManaged { .. })
+        {
+          crate::commands::general::layout_debug_log(
+            "startup layout WindowManaged-driven retry",
+          );
+          let summary = try_load_persisted_layout_snapshot(
+            &layout_path_for_retry,
+            &mut wm.state,
+            &config,
+          );
+          if summary.as_ref().is_some_and(|s| s.unmatched_snapshot == 0) {
+            startup_layout_retries_left = 0;
+            layout_auto_save.enable();
+            crate::commands::general::layout_debug_log(
+              "startup layout fully matched after WindowManaged; auto-save enabled",
+            );
+          } else {
+            // Nudge the timed retry so we keep trying briefly.
+            startup_layout_retry_delay.as_mut().reset(
+              tokio::time::Instant::now() + Duration::from_secs(2),
+            );
+          }
         }
 
         if wm_event_affects_layout_snapshot(&wm_event) {

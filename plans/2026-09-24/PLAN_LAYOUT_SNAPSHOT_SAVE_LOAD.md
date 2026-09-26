@@ -277,20 +277,14 @@ cargo test -p wm-common --lib
 - [x] `cargo test -p wm-common --lib` (59 passed)
 - [ ] Commit + push PR #2 branch; Asus build/deploy (no GlazeWM kill)
 
-## 2026-09-25 follow-up — WS2 restore + Network Error
+## 2026-09-26 — Ghost IPC / C:\Program popup / disappeared windows
 
-### Bug A (WS2 Code/Brave/Terminal unmatched)
-Root cause: matching failure at load time (`skipping missing tiling window` for Code/brave/WindowsTerminal), not `move_window_to_workspace`. `populate()` only manages `visible_windows()`, so cloaked/late windows are absent when startup (and early CLI) load runs — `matched=4, unmatched_snapshot=4, workspace_moves=0`. Process-name-only scoring (≥50) is fine when the live window exists; inspect later matched Brave/Terminal once managed. Empty-title second Code still needs a second live Code window.
+Inventory + fixes (feature/layout-snapshot-save-load):
 
-Fixes: (1) one deferred startup layout reload after 2s when `unmatched_snapshot > 0`, holding auto-save until then; (2) log unmatched snapshot/live identities to `layout.log`; (3) WindowsApps path version-dir soft-match so Store Terminal path drift still scores as path match.
+1. **Ghost IPC LISTENING (PID dead on 6123/6124)** — Root cause: hard `taskkill /F` / crash before TcpListener Drop; abort-without-join raced Drop. Fix: `IpcServer` joins accept task on `stop_and_wait`; bind via socket2 with `SO_LINGER=0`; deploy soft `wm-exit` before taskkill. Residual OS ghosts after hard kill still need reboot/fallback ports.
+2. **C:\Program popup** — Unquoted `C:\Program Files\...` launches (agent restart scripts). Config shell-exec paths are fine (zebar/wt/%LOCALAPPDATA%). Fix: harden `parse_command` / refuse truncated `C:\Program`; add `scripts/deploy/start_glazewm.cmd`; quote in deploy tip.
+3. **~5 launch popups** — Repeated unquoted starts. Same as (2); soft-exit+quoted start.
+4. **Disappeared Terminal/Code on WS2** — Cloaked inactive-WS windows not uncloaked on clean exit (watcher skips restore on ApplicationExiting); next `visible_windows()` misses them → unmatched. Fix: `restore_visibility_on_exit` uncloak+show; multi timed + WindowManaged layout retries; soft exe-basename match.
 
-### Bug B (Network Error `\ ""`)
-Root cause: `shell_exec::parse_command` used `match_indices('"').nth(2)` (off-by-one). For `"" ""` (empty argv via `join_ipc_args`) that became program=`" ` (quote+space), which `ShellExecuteEx` can surface as a malformed UNC / Network Error dialog (live `cmd` titled Network Error observed).
-
-Fixes: use `nth(1)` for the closing quote; `validate_shell_program` rejects empty/quote-junk/bare-slash programs; `Dispatcher::shell_execute_ex` refuses the same before calling the API; unit tests cover the regression.
-
-### Bug C (IPC ghost socket / port not released)
-Live: `127.0.0.1:6123 LISTENING` owned by dead PID (ghost); `glazewm.exe` gone; watcher may linger. Kill+retry cannot free ghosts.
-
-Fixes: poll bind ~5s after each kill; detect ghost (netstat PID ∉ tasklist); auto-fallback to preferred+1..+10 then ephemeral; write `~/.glzr/glazewm/ipc.port` so `ipc_port()`/CLI follow; clear file when binding 6123; graceful IPC stop drops `TcpListener` via oneshot before abort; kill watcher on wm-exit; kill watcher before glazewm on conflict recovery.
+Verify: soft wm-exit → netstat no LISTENING on bound port within ~1s; start via quoted path only; windows remain visible.
 
