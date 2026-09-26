@@ -200,7 +200,21 @@ async fn start_wm(
 
   // Best-effort restore of persisted layout.json (beside config.yaml).
   // Runs after initial populate + startup commands so windows/workspaces exist.
-  let _ = try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
+  // Windows still cloaked / not yet in visible_windows() at populate() are
+  // absent from the first pass — schedule one deferred retry after the event
+  // loop can manage late arrivals (WindowManaged).
+  let first_load =
+    try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
+  let mut startup_layout_retry =
+    first_load.as_ref().is_some_and(|s| s.unmatched_snapshot > 0);
+  if startup_layout_retry {
+    crate::commands::general::layout_debug_log(format!(
+      "startup load left unmatched_snapshot={}; scheduling one retry in 2s",
+      first_load.as_ref().map(|s| s.unmatched_snapshot).unwrap_or(0)
+    ));
+  }
+  let startup_layout_retry_delay = tokio::time::sleep(Duration::from_secs(2));
+  tokio::pin!(startup_layout_retry_delay);
 
   // Drain events emitted by startup restore so IPC clients see them, but do
   // not arm auto-save yet (avoids thrashing a rewrite of the file we just loaded).
@@ -234,11 +248,20 @@ async fn start_wm(
   }
 
   // Startup event drain finished; allow layout auto-save scheduling.
+  // Keep auto-save off until a pending startup layout retry finishes so we
+  // do not persist the incomplete pre-retry arrangement over layout.json.
   crate::commands::general::layout_debug_log(
     "startup event drain complete; enabling layout auto-save",
   );
+  let layout_path_for_retry = layout_path.clone();
   let mut layout_auto_save = LayoutAutoSave::new(layout_path);
-  layout_auto_save.enable();
+  if !startup_layout_retry {
+    layout_auto_save.enable();
+  } else {
+    crate::commands::general::layout_debug_log(
+      "auto-save deferred until startup layout retry completes",
+    );
+  }
 
   // Create an interval for periodically cleaning up invalid windows.
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
@@ -279,6 +302,22 @@ async fn start_wm(
         } else {
           wm.state.cleanup_invalid_windows()
         }
+      },
+      () = &mut startup_layout_retry_delay, if startup_layout_retry => {
+        startup_layout_retry = false;
+        crate::commands::general::layout_debug_log(
+          "startup layout retry firing after manage settle window",
+        );
+        let _ = try_load_persisted_layout_snapshot(
+          &layout_path_for_retry,
+          &mut wm.state,
+          &config,
+        );
+        layout_auto_save.enable();
+        crate::commands::general::layout_debug_log(
+          "startup layout retry done; auto-save enabled",
+        );
+        Ok(())
       },
       Some((
         message,

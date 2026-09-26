@@ -17,6 +17,7 @@ pub fn shell_exec(
   state: &WmState,
 ) -> anyhow::Result<()> {
   let (program, args) = parse_command(command, state)?;
+  validate_shell_program(&program, command)?;
   tracing::info!(
     "Parsed command program: '{}', args: '{}'.",
     program,
@@ -64,6 +65,31 @@ pub fn shell_exec(
   Ok(())
 }
 
+/// Reject empty / quote-junk programs that would ShellExecute into UNC nonsense
+/// like `\\ "\"` (Windows "Network Error" dialog).
+fn validate_shell_program(program: &str, original: &str) -> anyhow::Result<()> {
+  let trimmed = program.trim();
+  if trimmed.is_empty() {
+    anyhow::bail!(
+      "Shell exec failed for '{original}': program path is empty."
+    );
+  }
+  // Quotes should have been stripped by parse; leftover quotes mean bad parse.
+  if trimmed.contains('"') {
+    anyhow::bail!(
+      "Shell exec failed for '{original}': program path contains leftover quotes ({trimmed:?})."
+    );
+  }
+  // Lone backslashes / malformed UNC stubs (e.g. `\\` or `\\ `) are never valid.
+  if trimmed.chars().all(|c| c == '\\' || c == '/' || c.is_whitespace()) {
+    anyhow::bail!(
+      "Shell exec failed for '{original}': program path is malformed ({trimmed:?})."
+    );
+  }
+  Ok(())
+}
+
+
 /// Parses a command string into a program name/path and arguments. This
 /// also expands any environment variables found in the command string if
 /// they are wrapped in `%` characters. If the command string is a path,
@@ -108,18 +134,30 @@ fn parse_command(
     }
   };
 
+  parse_expanded_command(&expanded_command).map_err(|err| {
+    anyhow::anyhow!("Shell exec failed for '{command}': {err}")
+  })
+}
+
+/// Parse an already-expanded command string into `(program, args)`.
+///
+/// Extracted so unit tests can cover quoting without a live `WmState`.
+fn parse_expanded_command(
+  expanded_command: &str,
+) -> anyhow::Result<(String, String)> {
   let command_parts =
     expanded_command.split_whitespace().collect::<Vec<_>>();
 
   // If the command starts with double quotes, then the program name/path
   // is wrapped in double quotes (e.g. `"C:\path\to\app.exe" --flag`).
   if expanded_command.starts_with('"') {
-    // Find the closing double quote.
+    // Closing quote is the *second* quote (index 1). Using nth(2) was an
+    // off-by-one that required a third quote and turned `"" ""` into
+    // program=`" ` (quote+space), which ShellExecute can surface as a
+    // Network Error UNC path like `\\ "\"`.
     let (closing_index, _) =
-      expanded_command.match_indices('"').nth(2).ok_or_else(|| {
-        anyhow::anyhow!(
-          "Shell exec failed for '{command}': command doesn't have an ending `\"`."
-        )
+      expanded_command.match_indices('"').nth(1).ok_or_else(|| {
+        anyhow::anyhow!("command doesn't have an ending `\"`.")
       })?;
 
     return Ok((
@@ -151,7 +189,65 @@ fn parse_command(
     }
   }
 
-  anyhow::bail!(
-    "Shell exec failed for '{command}': program path is not valid."
-  )
+  anyhow::bail!("program path is not valid.")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn quoted_program_with_spaces_uses_closing_quote() {
+    let (prog, args) =
+      parse_expanded_command(r#""C:\Program Files\app.exe" --flag"#)
+        .unwrap();
+    assert_eq!(prog, r"C:\Program Files\app.exe");
+    assert_eq!(args, "--flag");
+    validate_shell_program(&prog, "x").unwrap();
+  }
+
+  #[test]
+  fn quoted_program_with_quoted_arg() {
+    let (prog, args) =
+      parse_expanded_command(r#""C:\a b\c.exe" "d e""#).unwrap();
+    assert_eq!(prog, r"C:\a b\c.exe");
+    // Remainder keeps ShellExecute-style quoting for spaced args.
+    assert_eq!(args, r#""d e""#);
+    validate_shell_program(&prog, "x").unwrap();
+  }
+
+  #[test]
+  fn empty_quoted_program_rejected() {
+    // Input is two quote chars: empty quoted program.
+    let (prog, _args) = parse_expanded_command("\"\"").unwrap();
+    assert_eq!(prog, "");
+    assert!(validate_shell_program(&prog, "\"\"").is_err());
+  }
+
+  #[test]
+  fn empty_then_empty_does_not_yield_quote_space_program() {
+    // Regression for nth(2) bug: `"" ""` previously became program=`" `.
+    let input = "\"\" \"\"";
+    let (prog, args) = parse_expanded_command(input).unwrap();
+    assert_eq!(prog, "");
+    assert_eq!(args, "\"\"");
+    assert!(validate_shell_program(&prog, input).is_err());
+  }
+
+  #[test]
+  fn validate_rejects_quote_junk_and_bare_slashes() {
+    assert!(validate_shell_program("\" ", "x").is_err());
+    assert!(validate_shell_program(r"\\", "x").is_err());
+    assert!(validate_shell_program(r"\ ", "x").is_err());
+    assert!(validate_shell_program("zebar", "zebar start").is_ok());
+    assert!(validate_shell_program(r"C:\Tools\app.exe", "x").is_ok());
+  }
+
+  #[test]
+  fn unquoted_simple_program() {
+    let (prog, args) =
+      parse_expanded_command("zebar start-widget-preset --pack x").unwrap();
+    assert_eq!(prog, "zebar");
+    assert_eq!(args, "start-widget-preset --pack x");
+  }
 }

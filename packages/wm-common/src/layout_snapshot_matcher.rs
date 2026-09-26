@@ -144,6 +144,11 @@ pub fn score_window(
   {
     if eq_ignore_ascii_case(c_path, t_path) {
       score += SCORE_PROCESS_PATH;
+    } else if windows_apps_same_package_exe(c_path, t_path) {
+      // Store / WindowsApps installs bump version directories between restarts
+      // (e.g. Microsoft.WindowsTerminal_1.22.x → 1.23.x). Treat same package
+      // family + exe filename as a full path match.
+      score += SCORE_PROCESS_PATH;
     }
   }
 
@@ -216,6 +221,50 @@ fn normalize_title(title: &str) -> String {
 
 fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
   a.eq_ignore_ascii_case(b)
+}
+
+/// True when both paths look like WindowsApps package installs of the same
+/// exe (version folder may differ): 
+/// `...\WindowsApps\PackageFamily_VERSION_arch__publisher\App.exe`
+fn windows_apps_same_package_exe(a: &str, b: &str) -> bool {
+  match (windows_apps_identity(a), windows_apps_identity(b)) {
+    (Some((fam_a, exe_a)), Some((fam_b, exe_b))) => {
+      fam_a.eq_ignore_ascii_case(&fam_b) && exe_a.eq_ignore_ascii_case(&exe_b)
+    }
+    _ => false,
+  }
+}
+
+fn windows_apps_identity(path: &str) -> Option<(String, String)> {
+  let lower = path.to_ascii_lowercase();
+  let marker = "\\windowsapps\\";
+  let idx = lower.find(marker)?;
+  let after = &path[idx + marker.len()..];
+  let mut parts = after.split(['\\', '/']).filter(|p| !p.is_empty());
+  let package_dir = parts.next()?;
+  let exe = parts.next_back().unwrap_or(package_dir);
+  // Package dir: FamilyName_Version_Arch__PublisherId — family is before first '_'+digit version-ish.
+  // Prefer stripping from the last "__" publisher separator, then drop trailing _version_arch.
+  let family = package_family_name(package_dir);
+  Some((family, exe.to_string()))
+}
+
+fn package_family_name(package_dir: &str) -> String {
+  // `Microsoft.WindowsTerminal_1.22.12111.0_x64__8wekyb3d8bbwe`
+  // → family key `Microsoft.WindowsTerminal__8wekyb3d8bbwe` (name + publisher).
+  if let Some((name_and_ver, publisher)) = package_dir.rsplit_once("__") {
+    let name = name_and_ver
+      .split('_')
+      .next()
+      .unwrap_or(name_and_ver);
+    format!("{name}__{publisher}")
+  } else {
+    package_dir
+      .split('_')
+      .next()
+      .unwrap_or(package_dir)
+      .to_string()
+  }
 }
 
 /// Greedy best-score matching. Each live/snapshot key is assigned at most once.
@@ -720,6 +769,32 @@ mod tests {
       matched.iter().map(|(_, l)| l.clone()).collect();
     assert_eq!(snap_keys.len(), 2);
     assert_eq!(live_keys.len(), 2);
+  }
+
+  #[test]
+  fn windows_apps_path_version_drift_still_matches() {
+    let snap = ident(
+      Some(
+        r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.22.12111.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe",
+      ),
+      "WindowsTerminal",
+      Some("CASCADIA_HOSTING_WINDOW_CLASS"),
+      Some("old title"),
+    );
+    let live = ident(
+      Some(
+        r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.23.0.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe",
+      ),
+      "WindowsTerminal",
+      Some("CASCADIA_HOSTING_WINDOW_CLASS"),
+      Some("new title"),
+    );
+    let score = score_window(&live, &snap);
+    assert!(
+      score >= SCORE_PROCESS_PATH + SCORE_PROCESS_NAME + SCORE_CLASS_NAME,
+      "score={score}"
+    );
+    assert!(score >= MATCH_SCORE_THRESHOLD);
   }
 
 }

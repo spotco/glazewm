@@ -279,6 +279,16 @@ impl DispatcherExtWindows for Dispatcher {
     directory: &Path,
     hide_window: bool,
   ) -> crate::Result<()> {
+    let trimmed = program.trim();
+    if trimmed.is_empty()
+      || trimmed.contains('"')
+      || trimmed.chars().all(|c| c == '\\' || c == '/' || c.is_whitespace())
+    {
+      return Err(crate::Error::Platform(format!(
+        "Refusing ShellExecuteEx for malformed program {program:?} (args={args:?})."
+      )));
+    }
+
     let program_wide =
       program.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let args_wide = args.encode_utf16().chain(Some(0)).collect::<Vec<_>>();

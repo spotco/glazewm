@@ -277,3 +277,14 @@ cargo test -p wm-common --lib
 - [x] `cargo test -p wm-common --lib` (59 passed)
 - [ ] Commit + push PR #2 branch; Asus build/deploy (no GlazeWM kill)
 
+## 2026-09-25 follow-up — WS2 restore + Network Error
+
+### Bug A (WS2 Code/Brave/Terminal unmatched)
+Root cause: matching failure at load time (`skipping missing tiling window` for Code/brave/WindowsTerminal), not `move_window_to_workspace`. `populate()` only manages `visible_windows()`, so cloaked/late windows are absent when startup (and early CLI) load runs — `matched=4, unmatched_snapshot=4, workspace_moves=0`. Process-name-only scoring (≥50) is fine when the live window exists; inspect later matched Brave/Terminal once managed. Empty-title second Code still needs a second live Code window.
+
+Fixes: (1) one deferred startup layout reload after 2s when `unmatched_snapshot > 0`, holding auto-save until then; (2) log unmatched snapshot/live identities to `layout.log`; (3) WindowsApps path version-dir soft-match so Store Terminal path drift still scores as path match.
+
+### Bug B (Network Error `\ ""`)
+Root cause: `shell_exec::parse_command` used `match_indices('"').nth(2)` (off-by-one). For `"" ""` (empty argv via `join_ipc_args`) that became program=`" ` (quote+space), which `ShellExecuteEx` can surface as a malformed UNC / Network Error dialog (live `cmd` titled Network Error observed).
+
+Fixes: use `nth(1)` for the closing quote; `validate_shell_program` rejects empty/quote-junk/bare-slash programs; `Dispatcher::shell_execute_ex` refuses the same before calling the API; unit tests cover the regression.

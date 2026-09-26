@@ -121,6 +121,35 @@ pub fn load_layout_snapshot(
     ..Default::default()
   };
 
+  // Log unmatched identities so layout.log shows *why* leaves were skipped
+  // (missing live window vs weak score / greedy collision).
+  for leaf in leaves.iter().filter(|l| !matched_keys.contains(&l.key)) {
+    let id = &leaf.window.identity;
+    let msg = format!(
+      "Layout match: unmatched snapshot '{}' on workspace '{}' (process={}, path={:?}, class={:?}, title={:?})",
+      leaf.local_id,
+      leaf.workspace_name,
+      id.process_name,
+      id.process_path,
+      id.class_name,
+      id.title_hint
+    );
+    tracing::info!("{msg}");
+    layout_debug_log(&msg);
+  }
+  for live in live_matchables.iter().filter(|l| !matched_live.contains(&l.key)) {
+    let msg = format!(
+      "Layout match: unmatched live '{}' (process={}, path={:?}, class={:?}, title={:?})",
+      live.key,
+      live.identity.process_name,
+      live.identity.process_path,
+      live.identity.class_name,
+      live.identity.title
+    );
+    tracing::info!("{msg}");
+    layout_debug_log(&msg);
+  }
+
   // Workspace names are global/unique: move (or activate) each named
   // workspace onto its matched live monitor before placing windows.
   if let Err(err) =
