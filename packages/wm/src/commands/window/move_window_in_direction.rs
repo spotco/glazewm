@@ -132,9 +132,22 @@ fn move_parallel(
     );
   };
 
+  // `move_container_within_tree` detaches the focused window before using
+  // the target index. Adjust the neighbor's pre-detach index so the window
+  // lands immediately before/after that neighbor in the resulting tree.
+  let anchor_index = anchor.index();
+  let neighbor_index = neighbor.index();
   let insert_index = match direction {
-    Direction::Left | Direction::Up => neighbor.index(),
-    Direction::Right | Direction::Down => neighbor.index() + 1,
+    Direction::Left | Direction::Up if anchor_index < neighbor_index => {
+      neighbor_index.saturating_sub(1)
+    }
+    Direction::Left | Direction::Up => neighbor_index,
+    Direction::Right | Direction::Down
+      if anchor_index < neighbor_index =>
+    {
+      neighbor_index
+    }
+    Direction::Right | Direction::Down => neighbor_index + 1,
   };
 
   move_container_within_tree(
@@ -200,15 +213,18 @@ fn join_with_neighbor_on_stack(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  let wraps_window_neighbor =
+    matches!(&neighbor, TilingContainer::TilingWindow(_));
+
   match neighbor {
     TilingContainer::Split(split) => {
       if split.tiling_direction() != *stack_direction {
         split.set_tiling_direction(stack_direction.clone());
       }
-      let target_index = match direction {
-        Direction::Left | Direction::Up => split.child_count(),
-        Direction::Right | Direction::Down => 0,
-      };
+      // An orthogonal move into an existing global-direction stack appends
+      // the focused window and keeps the workspace axis unchanged. For
+      // example, H[1 V[2 3] 4] + opposite-right becomes H[V[2 3 1] 4].
+      let target_index = split.child_count();
       move_container_within_tree(
         &window_to_move.clone().into(),
         &split.clone().into(),
@@ -252,7 +268,12 @@ fn join_with_neighbor_on_stack(
     }
   }
 
-  workspace.set_tiling_direction(stack_direction.clone());
+  // A newly wrapped pair may still need to promote its stack direction
+  // when it becomes the workspace's sole child. Existing stacks with
+  // siblings retain the workspace axis, matching the pure move planner.
+  if wraps_window_neighbor {
+    workspace.set_tiling_direction(stack_direction.clone());
+  }
   flatten_child_split_containers(&workspace.clone().into())?;
 
   // Promote a lone stack-direction split to be the workspace children.
@@ -353,6 +374,85 @@ mod tests {
         .map(|child| live_node(&child))
         .collect(),
     }
+  }
+
+  fn wks2_fixture() -> (
+    EventLoop,
+    WmState,
+    UserConfig,
+    Workspace,
+    TilingWindow,
+    SplitContainer,
+  ) {
+    let (event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut state = WmState::new(dispatcher, event_tx, exit_tx);
+    let config = test_config();
+
+    let display = state
+      .dispatcher
+      .sorted_displays()
+      .expect("test display")
+      .into_iter()
+      .next()
+      .expect("at least one display");
+    let monitor_properties = NativeMonitorProperties::try_from(&display)
+      .expect("monitor properties");
+    let monitor = add_monitor(display, monitor_properties, &mut state)
+      .expect("attach test monitor");
+
+    let workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "wks2".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let workspace_container: Container = workspace.clone().into();
+    attach_container(&workspace_container, &monitor.clone().into(), None)
+      .expect("attach workspace");
+
+    let window_one = test_window(1);
+    let middle = SplitContainer::new(
+      TilingDirection::Vertical,
+      GapsConfig::default(),
+    );
+    let window_two = test_window(2);
+    let window_three = test_window(3);
+    let window_four = test_window(4);
+
+    attach_container(
+      &window_one.clone().into(),
+      &workspace_container,
+      None,
+    )
+    .expect("attach window one");
+    attach_container(&middle.clone().into(), &workspace_container, None)
+      .expect("attach middle split");
+    attach_container(
+      &window_four.clone().into(),
+      &workspace_container,
+      None,
+    )
+    .expect("attach window four");
+    attach_container(
+      &window_two.clone().into(),
+      &middle.clone().into(),
+      None,
+    )
+    .expect("attach window two");
+    attach_container(
+      &window_three.clone().into(),
+      &middle.clone().into(),
+      None,
+    )
+    .expect("attach window three");
+
+    (event_loop, state, config, workspace, window_one, middle)
   }
 
   fn assert_tree_integrity(root: &Container) {
@@ -472,6 +572,46 @@ mod tests {
 
     assert_eq!(live_tree(&workspace), expected);
     assert_eq!(live_tree(&workspace).format_compact(), "V[2 1 3]");
+    assert_tree_integrity(&workspace_container);
+  }
+
+  #[test]
+  fn wks2_normal_right_moves_focus_one_as_workspace_sibling() {
+    let (_event_loop, mut state, config, workspace, window_one, _middle) =
+      wks2_fixture();
+
+    move_tiling_window(
+      window_one,
+      &Direction::Right,
+      &TilingDirection::Horizontal,
+      &mut state,
+      &config,
+    )
+    .expect("move");
+
+    let workspace_container: Container = workspace.clone().into();
+    assert_eq!(live_tree(&workspace).format_compact(), "H[V[2 3] 1 4]");
+    assert_tree_integrity(&workspace_container);
+  }
+
+  #[test]
+  fn wks2_opposite_right_appends_focus_one_to_vertical_stack() {
+    let (_event_loop, mut state, config, workspace, window_one, middle) =
+      wks2_fixture();
+
+    join_with_neighbor_on_stack(
+      window_one,
+      middle.into(),
+      &Direction::Right,
+      &TilingDirection::Vertical,
+      &workspace,
+      &mut state,
+      &config,
+    )
+    .expect("move");
+
+    let workspace_container: Container = workspace.clone().into();
+    assert_eq!(live_tree(&workspace).format_compact(), "H[V[2 3 1] 4]");
     assert_tree_integrity(&workspace_container);
   }
 }

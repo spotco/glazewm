@@ -137,16 +137,16 @@ fn flatten_single_child_at(children: &mut Vec<MoveNode>, index: usize) {
 
 fn normalize(tree: &mut MoveTree) {
   normalize_children(&mut tree.children, &tree.direction);
-  // Unwrap single same-direction split at root.
+  // Promote a sole split child into the workspace. The live tree flips the
+  // workspace direction to the promoted split's direction when doing this.
   if tree.children.len() == 1 {
     if let MoveNode::Split {
       direction,
       children,
     } = &tree.children[0]
     {
-      if direction == &tree.direction {
-        tree.children = children.clone();
-      }
+      tree.direction = direction.clone();
+      tree.children = children.clone();
     }
   }
 }
@@ -320,11 +320,24 @@ fn plan_orthogonal(
         neighbor_idx.min(tree.children.len().saturating_sub(1))
       });
 
+    let preserves_workspace_direction = matches!(
+      &neighbor,
+      MoveNode::Split { direction, .. } if direction == stack_direction
+    );
     let neighbor = tree.children.remove(neighbor_idx);
     let mut joined = flatten_to_list(neighbor);
-    match direction {
-      Direction::Left | Direction::Up => joined.push(window),
-      Direction::Right | Direction::Down => joined.insert(0, window),
+    // An orthogonal move into an existing global-direction stack appends
+    // the focused window to that stack and leaves the workspace axis
+    // unchanged. This is the wks2 mental model: H[1 V[2 3] 4] +
+    // opposite-right becomes H[V[2 3 1] 4], rather than
+    // flattening/reorienting the workspace.
+    if preserves_workspace_direction {
+      joined.push(window);
+    } else {
+      match direction {
+        Direction::Left | Direction::Up => joined.push(window),
+        Direction::Right | Direction::Down => joined.insert(0, window),
+      }
     }
 
     let new_node = if joined.len() == 1 {
@@ -336,7 +349,9 @@ fn plan_orthogonal(
     tree
       .children
       .insert(neighbor_idx.min(tree.children.len()), new_node);
-    tree.direction = stack_direction.clone();
+    if !preserves_workspace_direction {
+      tree.direction = stack_direction.clone();
+    }
     return Some(());
   }
 
@@ -430,6 +445,19 @@ mod tests {
         TilingDirection::Vertical,
         vec![MoveNode::window("3"), MoveNode::window("4")],
       ),
+    ])
+  }
+
+  /// Workspace 2 example: rows `124` / `134`, with 1 spanning the left
+  /// column, 2/3 stacked in the middle, and 4 spanning the right column.
+  fn fixture_wks2_124_134() -> MoveTree {
+    h(vec![
+      MoveNode::window("1"),
+      MoveNode::split(
+        TilingDirection::Vertical,
+        vec![MoveNode::window("2"), MoveNode::window("3")],
+      ),
+      MoveNode::window("4"),
     ])
   }
 
@@ -583,7 +611,7 @@ mod tests {
       (
         TilingDirection::Vertical,
         Direction::Right,
-        Some("V[1 2 3 4]"),
+        Some("H[1 V[3 4 2]]"),
       ),
       (
         TilingDirection::Vertical,
@@ -650,5 +678,29 @@ mod tests {
     )
     .expect("move");
     assert_eq!(out.format_compact(), "H[V[1 2] 3]");
+  }
+
+  #[test]
+  fn wks2_focus_one_move_right_uses_global_horizontal_siblings() {
+    let out = plan_global_move(
+      &fixture_wks2_124_134(),
+      "1",
+      &Direction::Right,
+      &TilingDirection::Horizontal,
+    )
+    .expect("move");
+    assert_eq!(out.format_compact(), "H[V[2 3] 1 4]");
+  }
+
+  #[test]
+  fn wks2_focus_one_opposite_move_right_joins_bottom_of_vertical_stack() {
+    let out = plan_global_move(
+      &fixture_wks2_124_134(),
+      "1",
+      &Direction::Right,
+      &TilingDirection::Vertical,
+    )
+    .expect("move");
+    assert_eq!(out.format_compact(), "H[V[2 3 1] 4]");
   }
 }

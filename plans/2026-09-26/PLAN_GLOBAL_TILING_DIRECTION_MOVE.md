@@ -58,6 +58,15 @@ Starting from a layout like:
 - Super+Shift+Left with **global = vertical** → `1` / `2` / `3`
   (tree restructured so the stack axis is vertical)
 
+For the deeper workspace-2 case `H[1 V[2 3] 4]` (rows `124` / `134`,
+focus on `1`):
+
+- Super+Shift+Right with **global = horizontal** → `H[V[2 3] 1 4]`
+  (`214` / `314`): reorder the focused window among workspace siblings.
+- Super+Shift+Ctrl+Right with **global = horizontal** →
+  `H[V[2 3 1] 4]` (`24` / `34` / `14`): use the opposite vertical stack,
+  append into the adjacent stack, and preserve the workspace axis.
+
 Plus:
 
 1. Global direction toggled by Super+J (not “whatever the focused split is”).
@@ -304,9 +313,11 @@ Verification run 2026-09-26:
       `cargo clippy -p wm --bin glazewm --tests --all-features -- -D warnings`
       pass. The repository-wide all-targets clippy command still reports
       pre-existing layout-snapshot test lints outside this plan's diff.
-- [x] `cargo test -p wm-common --lib` (74 passed)
-- [x] `cargo test -p wm --bin glazewm` (43 passed, including a live
-      nested-move fixture compared directly with `global_move_plan`)
+- [x] `cargo test -p wm-common --lib` (76 passed, including both workspace-2
+      direction cases)
+- [x] `cargo test -p wm --bin glazewm` (45 passed, including live tests for
+      both workspace-2 moves and a nested-move fixture compared directly with
+      `global_move_plan`)
 - [x] `build.bat` (release WM, CLI, and watcher artifacts)
 - [x] Zebar provider tests (18 passed), Zebar Rust tests (15 passed), and the
       vendored bundle reproducibility check passed.
