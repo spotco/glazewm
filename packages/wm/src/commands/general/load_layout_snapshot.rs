@@ -298,10 +298,8 @@ fn restore_window(
   summary: &mut LoadLayoutSummary,
 ) -> anyhow::Result<()> {
   let window_id = window.id();
-  let current_ws = window
-    .workspace()
-    .map(|ws| ws.config().name)
-    .unwrap_or_default();
+  let current_ws =
+    window.workspace().map_or_default(|ws| ws.config().name);
 
   if current_ws != leaf.workspace_name {
     move_window_to_workspace(
