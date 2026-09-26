@@ -68,4 +68,3 @@ fn live_identity(window: &WindowContainer) -> MatchableIdentity {
     },
   }
 }
-

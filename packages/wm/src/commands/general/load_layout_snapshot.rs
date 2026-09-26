@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Context;
 use tracing::info;
-
-use super::layout_debug_log;
 use uuid::Uuid;
 use wm_common::{
   match_windows, plan_workspace_tiling_layout, resolve_floating_placement,
@@ -12,6 +10,7 @@ use wm_common::{
   SnapshotNodeKind, SnapshotWindow, WindowState, WorkspaceLayoutPlan,
 };
 
+use super::layout_debug_log;
 use crate::{
   commands::{
     container::{
@@ -27,8 +26,8 @@ use crate::{
     WorkspaceTarget,
   },
   traits::{
-    CommonGetters, PositionGetters, TilingDirectionGetters, TilingSizeGetters,
-    WindowGetters,
+    CommonGetters, PositionGetters, TilingDirectionGetters,
+    TilingSizeGetters, WindowGetters,
   },
   user_config::UserConfig,
   wm_state::WmState,
@@ -63,7 +62,8 @@ struct SnapshotLeaf {
 ///
 /// Does **not** launch missing applications. Ignored snapshot windows are
 /// left alone. Matched tiling windows are re-shaped into the snapshot's
-/// nested split tree (order, sizes, directions) with missing leaves pruned.
+/// nested split tree (order, sizes, directions) with missing leaves
+/// pruned.
 pub fn load_layout_snapshot(
   snapshot: &LayoutSnapshot,
   state: &mut WmState,
@@ -137,7 +137,10 @@ pub fn load_layout_snapshot(
     tracing::info!("{msg}");
     layout_debug_log(&msg);
   }
-  for live in live_matchables.iter().filter(|l| !matched_live.contains(&l.key)) {
+  for live in live_matchables
+    .iter()
+    .filter(|l| !matched_live.contains(&l.key))
+  {
     let msg = format!(
       "Layout match: unmatched live '{}' (process={}, path={:?}, class={:?}, title={:?})",
       live.key,
@@ -193,8 +196,7 @@ pub fn load_layout_snapshot(
     {
       let msg = format!(
         "Failed to restore window '{}' -> {}: {err:#}",
-        snap_key,
-        live_key
+        snap_key, live_key
       );
       tracing::warn!("{msg}");
       layout_debug_log(&msg);
@@ -217,11 +219,9 @@ pub fn load_layout_snapshot(
   // Activate focused workspaces from snapshot where monitors matched.
   for (snap_mon, live_mon) in &monitor_map {
     if let Some(name) = &snap_mon.focused_workspace_name {
-      if let Err(err) = focus_workspace(
-        WorkspaceTarget::Name(name.clone()),
-        state,
-        config,
-      ) {
+      if let Err(err) =
+        focus_workspace(WorkspaceTarget::Name(name.clone()), state, config)
+      {
         tracing::warn!(
           "Failed to focus workspace '{}' on monitor {}: {err:#}",
           name,
@@ -293,8 +293,7 @@ fn restore_window(
       if !window.state().is_same_state(prev)
         && !matches!(window.state(), WindowState::Minimized)
       {
-        window =
-          update_window_state(window, prev.clone(), state, config)?;
+        window = update_window_state(window, prev.clone(), state, config)?;
         summary.state_updates += 1;
       }
     }
@@ -384,8 +383,10 @@ fn restore_tiling_layouts(
   }
 
   let mut seen_workspaces: HashSet<String> = HashSet::new();
-  let mut workspace_plans: Vec<(WorkspaceLayoutPlan, HashMap<String, Uuid>)> =
-    Vec::new();
+  let mut workspace_plans: Vec<(
+    WorkspaceLayoutPlan,
+    HashMap<String, Uuid>,
+  )> = Vec::new();
 
   let mut consider_workspace =
     |ws: &wm_common::SnapshotWorkspace,
@@ -470,7 +471,10 @@ fn apply_workspace_tiling_plan(
   let workspace = state
     .workspace_by_name(&plan.workspace_name)
     .with_context(|| {
-      format!("Workspace '{}' not found during tiling restore.", plan.workspace_name)
+      format!(
+        "Workspace '{}' not found during tiling restore.",
+        plan.workspace_name
+      )
     })?;
 
   // Detach planned tiling windows so we can rebuild the tree cleanly.
@@ -492,12 +496,8 @@ fn apply_workspace_tiling_plan(
 
     // Should already be tiling after restore_window; force if needed.
     if !matches!(window, WindowContainer::TilingWindow(_)) {
-      let _ = update_window_state(
-        window,
-        WindowState::Tiling,
-        state,
-        config,
-      )?;
+      let _ =
+        update_window_state(window, WindowState::Tiling, state, config)?;
       window = state
         .windows()
         .into_iter()
@@ -545,12 +545,24 @@ fn apply_workspace_tiling_plan(
   }
 
   apply_plan_sizes(&plan.children, &local_to_container, state)?;
+  // Unmatched live tiling windows can remain as siblings after
+  // flatten+rebuild. Plan sizes sum to 1.0 among matched nodes only;
+  // renormalize the full sibling set so PositionGetters::to_rect never
+  // multiplies past the workspace.
+  renormalize_tiling_siblings_with_extras(
+    &workspace.clone().into(),
+    &local_to_container,
+  )?;
   apply_child_focus_order(
     &workspace.clone().into(),
     &plan.child_focus_order,
     &local_to_container,
   );
-  apply_focus_orders_recursive(&plan.children, &local_to_container, state)?;
+  apply_focus_orders_recursive(
+    &plan.children,
+    &local_to_container,
+    state,
+  )?;
 
   // Focus the first window in workspace focus order when available.
   if let Some(first_local) = plan.child_focus_order.first() {
@@ -592,11 +604,7 @@ fn attach_plan_nodes(
           format!("Detached window '{local_id}' missing during attach.")
         })?;
         let window_id = window.id();
-        attach_container(
-          &window.clone().into(),
-          parent,
-          Some(index),
-        )?;
+        attach_container(&window.clone().into(), parent, Some(index))?;
         local_to_container.insert(local_id.clone(), window_id);
         index += 1;
       }
@@ -652,6 +660,100 @@ fn apply_plan_sizes(
   Ok(())
 }
 
+/// After plan sizes are applied, any unplanned live tiling siblings still
+/// under `parent` would make the sibling set sum > 1.0. Allocate them an
+/// equal share of a defined remainder and scale planned siblings to fill
+/// the rest.
+fn renormalize_tiling_siblings_with_extras(
+  parent: &Container,
+  local_to_container: &HashMap<String, Uuid>,
+) -> anyhow::Result<()> {
+  let planned_ids: HashSet<Uuid> =
+    local_to_container.values().copied().collect();
+
+  let tiling_children: Vec<TilingContainer> =
+    parent.tiling_children().collect();
+  if tiling_children.is_empty() {
+    return Ok(());
+  }
+
+  let mut planned: Vec<(TilingContainer, f32)> = Vec::new();
+  let mut extras: Vec<TilingContainer> = Vec::new();
+  for child in tiling_children {
+    if planned_ids.contains(&child.id()) {
+      planned.push((child.clone(), child.tiling_size().max(0.0)));
+    } else {
+      extras.push(child);
+    }
+  }
+
+  if extras.is_empty() {
+    return Ok(());
+  }
+
+  let (planned_sizes, extra_sizes) = allocate_tiling_sizes_with_extras(
+    &planned.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+    extras.len(),
+  );
+
+  for ((child, _), size) in planned.iter().zip(planned_sizes.iter()) {
+    child.set_tiling_size(*size);
+  }
+  for (child, size) in extras.iter().zip(extra_sizes.iter()) {
+    child.set_tiling_size(*size);
+  }
+
+  let msg = format!(
+    "Renormalized tiling siblings with {} unplanned extra(s); planned={}, extras={}",
+    extras.len(),
+    planned_sizes.len(),
+    extra_sizes.len()
+  );
+  tracing::info!("{msg}");
+  layout_debug_log(&msg);
+
+  Ok(())
+}
+
+/// Pure size math for plan survivors + N unplanned live tiling siblings.
+///
+/// Planned sizes (already summing ~1.0 among themselves) are scaled to
+/// leave an equal per-extra remainder of `1 / (planned + extras)`. Returns
+/// `(scaled_planned, extra_sizes)`.
+fn allocate_tiling_sizes_with_extras(
+  planned_sizes: &[f32],
+  extra_count: usize,
+) -> (Vec<f32>, Vec<f32>) {
+  let planned_n = planned_sizes.len();
+  let total_n = planned_n + extra_count;
+  if total_n == 0 {
+    return (Vec::new(), Vec::new());
+  }
+  if extra_count == 0 {
+    // Preserve input (caller already renormalized plan siblings).
+    return (planned_sizes.to_vec(), Vec::new());
+  }
+  if planned_n == 0 {
+    let each = 1.0 / extra_count as f32;
+    return (Vec::new(), vec![each; extra_count]);
+  }
+
+  let extra_each = 1.0 / total_n as f32;
+  let planned_budget = 1.0 - extra_each * extra_count as f32;
+  let planned_sum: f32 = planned_sizes.iter().copied().sum();
+  let scaled_planned: Vec<f32> = if planned_sum > f32::EPSILON {
+    planned_sizes
+      .iter()
+      .map(|s| s / planned_sum * planned_budget)
+      .collect()
+  } else {
+    let each = planned_budget / planned_n as f32;
+    vec![each; planned_n]
+  };
+  let extras = vec![extra_each; extra_count];
+  (scaled_planned, extras)
+}
+
 fn apply_focus_orders_recursive(
   nodes: &[LayoutPlanNode],
   local_to_container: &HashMap<String, Uuid>,
@@ -674,11 +776,7 @@ fn apply_focus_orders_recursive(
           );
         }
       }
-      apply_focus_orders_recursive(
-        children,
-        local_to_container,
-        state,
-      )?;
+      apply_focus_orders_recursive(children, local_to_container, state)?;
     }
   }
   Ok(())
@@ -725,10 +823,7 @@ fn flatten_all_splits(parent: &Container) -> anyhow::Result<()> {
       }
     }
     // Safety: avoid infinite loop if something fails to detach.
-    let remaining = parent
-      .descendants()
-      .filter(|c| c.is_split())
-      .count();
+    let remaining = parent.descendants().filter(|c| c.is_split()).count();
     if remaining >= before {
       tracing::warn!(
         "flatten_all_splits made no progress ({} splits remain)",
@@ -933,9 +1028,9 @@ fn live_monitor_bounds(monitor: &Monitor) -> Option<SnapshotBounds> {
 /// Ensure each snapshot workspace lands on its matched live monitor.
 ///
 /// GlazeWM workspace names are globally unique (`workspace_by_name`), so
-/// `WorkspaceTarget::Name` alone cannot express "workspace X on monitor A".
-/// We therefore reassign (or activate) the named workspace onto the matched
-/// monitor before `move_window_to_workspace` places windows.
+/// `WorkspaceTarget::Name` alone cannot express "workspace X on monitor
+/// A". We therefore reassign (or activate) the named workspace onto the
+/// matched monitor before `move_window_to_workspace` places windows.
 ///
 /// Placement is derived from the snapshot monitor→workspace structure (via
 /// `monitor_map`), **including empty workspaces** that produce no window
@@ -966,12 +1061,7 @@ fn ensure_workspaces_on_matched_monitors(
         );
         info!("{msg}");
         layout_debug_log(&msg);
-        move_workspace_to_monitor(
-          &workspace,
-          &target_mon,
-          state,
-          config,
-        )?;
+        move_workspace_to_monitor(&workspace, &target_mon, state, config)?;
       }
     } else {
       let msg = format!(
@@ -981,12 +1071,7 @@ fn ensure_workspaces_on_matched_monitors(
       );
       info!("{msg}");
       layout_debug_log(&msg);
-      activate_workspace(
-        Some(&ws_name),
-        Some(target_mon),
-        state,
-        config,
-      )?;
+      activate_workspace(Some(&ws_name), Some(target_mon), state, config)?;
     }
   }
 
@@ -1032,3 +1117,53 @@ fn collect_node_windows(
   }
 }
 
+#[cfg(test)]
+mod tests {
+  use super::allocate_tiling_sizes_with_extras;
+
+  fn approx_eq(a: f32, b: f32) {
+    assert!((a - b).abs() < 1e-5, "{a} != {b}");
+  }
+
+  #[test]
+  fn extra_live_tiling_sibling_gets_defined_remainder() {
+    // Snapshot survivors restored to 0.5/0.5 plus one unmatched live at
+    // any prior size → complete sibling set must sum to 1.0.
+    let (planned, extras) =
+      allocate_tiling_sizes_with_extras(&[0.5, 0.5], 1);
+    assert_eq!(planned.len(), 2);
+    assert_eq!(extras.len(), 1);
+    approx_eq(extras[0], 1.0 / 3.0);
+    approx_eq(planned[0], (1.0 - extras[0]) / 2.0);
+    approx_eq(planned[1], (1.0 - extras[0]) / 2.0);
+    let total: f32 = planned.iter().chain(extras.iter()).sum();
+    approx_eq(total, 1.0);
+  }
+
+  #[test]
+  fn extra_live_preserves_planned_relative_ratios() {
+    let (planned, extras) =
+      allocate_tiling_sizes_with_extras(&[0.75, 0.25], 1);
+    approx_eq(planned[0] / planned[1], 3.0);
+    approx_eq(extras[0], 1.0 / 3.0);
+    let total: f32 = planned.iter().chain(extras.iter()).sum();
+    approx_eq(total, 1.0);
+  }
+
+  #[test]
+  fn no_extras_leaves_planned_unchanged() {
+    let (planned, extras) =
+      allocate_tiling_sizes_with_extras(&[0.6, 0.4], 0);
+    assert!(extras.is_empty());
+    approx_eq(planned[0], 0.6);
+    approx_eq(planned[1], 0.4);
+  }
+
+  #[test]
+  fn only_extras_share_equally() {
+    let (planned, extras) = allocate_tiling_sizes_with_extras(&[], 2);
+    assert!(planned.is_empty());
+    approx_eq(extras[0], 0.5);
+    approx_eq(extras[1], 0.5);
+  }
+}

@@ -65,30 +65,40 @@ pub fn shell_exec(
   Ok(())
 }
 
-/// Reject empty / quote-junk programs that would ShellExecute into UNC nonsense
-/// like `\\ "\"` (Windows "Network Error" dialog), and refuse truncated
-/// `C:\\Program` paths that produce the classic Windows "cannot find" popup.
-fn validate_shell_program(program: &str, original: &str) -> anyhow::Result<()> {
+/// Reject empty / quote-junk programs that would ShellExecute into UNC
+/// nonsense like `\\ "\"` (Windows "Network Error" dialog), and refuse
+/// truncated `C:\\Program` paths that produce the classic Windows "cannot
+/// find" popup.
+fn validate_shell_program(
+  program: &str,
+  original: &str,
+) -> anyhow::Result<()> {
   let trimmed = program.trim();
   if trimmed.is_empty() {
     anyhow::bail!(
       "Shell exec failed for '{original}': program path is empty."
     );
   }
-  // Quotes should have been stripped by parse; leftover quotes mean bad parse.
+  // Quotes should have been stripped by parse; leftover quotes mean bad
+  // parse.
   if trimmed.contains('"') {
     anyhow::bail!(
       "Shell exec failed for '{original}': program path contains leftover quotes ({trimmed:?})."
     );
   }
-  // Lone backslashes / malformed UNC stubs (e.g. `\\` or `\\ `) are never valid.
-  if trimmed.chars().all(|c| c == '\\' || c == '/' || c.is_whitespace()) {
+  // Lone backslashes / malformed UNC stubs (e.g. `\\` or `\\ `) are never
+  // valid.
+  if trimmed
+    .chars()
+    .all(|c| c == '\\' || c == '/' || c.is_whitespace())
+  {
     anyhow::bail!(
       "Shell exec failed for '{original}': program path is malformed ({trimmed:?})."
     );
   }
-  // Classic unquoted `C:\\Program Files\\...` split: program becomes `C:\\Program`.
-  // ShellExecute of that pops "Windows cannot find 'C:\\Program'".
+  // Classic unquoted `C:\\Program Files\\...` split: program becomes
+  // `C:\\Program`. ShellExecute of that pops "Windows cannot find
+  // 'C:\\Program'".
   if is_truncated_program_files_prefix(trimmed) {
     anyhow::bail!(
       "Shell exec failed for '{original}': program path looks like an unquoted        'Program Files' truncation ({trimmed:?}). Quote the full path."
@@ -194,9 +204,9 @@ fn parse_expanded_command(
     }
   }
 
-  // File may not exist yet (or WindowsApps path is virtual). Still recover a
-  // spaced path when the command clearly names an exe/bat/cmd/com under a
-  // drive root — never return the truncated first token alone.
+  // File may not exist yet (or WindowsApps path is virtual). Still recover
+  // a spaced path when the command clearly names an exe/bat/cmd/com
+  // under a drive root — never return the truncated first token alone.
   if let Some((prog, args)) = recover_spaced_exe_path(&command_parts) {
     if is_truncated_program_files_prefix(&prog) {
       anyhow::bail!(
@@ -206,7 +216,8 @@ fn parse_expanded_command(
     return Ok((prog, args));
   }
 
-  // Explicit guard: first whitespace token of an unquoted Program Files path.
+  // Explicit guard: first whitespace token of an unquoted Program Files
+  // path.
   if let Some(first) = command_parts.first() {
     if is_truncated_program_files_prefix(first) {
       anyhow::bail!(
@@ -308,7 +319,8 @@ mod tests {
   #[test]
   fn unquoted_simple_program() {
     let (prog, args) =
-      parse_expanded_command("zebar start-widget-preset --pack x").unwrap();
+      parse_expanded_command("zebar start-widget-preset --pack x")
+        .unwrap();
     assert_eq!(prog, "zebar");
     assert_eq!(args, "start-widget-preset --pack x");
   }
@@ -318,12 +330,15 @@ mod tests {
     assert!(validate_shell_program(r"C:\Program", "x").is_err());
     assert!(validate_shell_program(r"C:/Program", "x").is_err());
     assert!(validate_shell_program(r"C:\Program Files", "x").is_err());
-    assert!(validate_shell_program(r"C:\Program Files\app.exe", "x").is_ok());
+    assert!(
+      validate_shell_program(r"C:\Program Files\app.exe", "x").is_ok()
+    );
   }
 
   #[test]
   fn recover_unquoted_program_files_exe_even_if_missing() {
-    // is_file() fails for a fake path; recover by .exe suffix across spaces.
+    // is_file() fails for a fake path; recover by .exe suffix across
+    // spaces.
     let (prog, args) = parse_expanded_command(
       r"C:\Program Files\glzr.io\GlazeWM\glazewm.exe --foo",
     )

@@ -670,7 +670,9 @@ impl WmState {
     &mut self,
     config: &mut UserConfig,
   ) -> anyhow::Result<()> {
-    for native_window in self.dispatcher.visible_windows()?.into_iter().rev() {
+    for native_window in
+      self.dispatcher.visible_windows()?.into_iter().rev()
+    {
       if self.window_from_native(&native_window).is_some() {
         continue;
       }

@@ -1,6 +1,7 @@
 //! Pure best-effort matching of snapshot windows to live windows.
 //!
-//! No HWND / platform types - callers supply identity fields and opaque ids.
+//! No HWND / platform types - callers supply identity fields and opaque
+//! ids.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +50,8 @@ impl From<&SnapshotWindow> for MatchableIdentity {
 /// A live or snapshot window entry for matching.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatchableWindow {
-  /// Opaque key (e.g. live container Uuid string, or snapshot local id path).
+  /// Opaque key (e.g. live container Uuid string, or snapshot local id
+  /// path).
   pub key: String,
   pub identity: MatchableIdentity,
 }
@@ -145,9 +147,10 @@ pub fn score_window(
     if eq_ignore_ascii_case(c_path, t_path) {
       score += SCORE_PROCESS_PATH;
     } else if windows_apps_same_package_exe(c_path, t_path) {
-      // Store / WindowsApps installs bump version directories between restarts
-      // (e.g. Microsoft.WindowsTerminal_1.22.x → 1.23.x). Treat same package
-      // family + exe filename as a full path match.
+      // Store / WindowsApps installs bump version directories between
+      // restarts (e.g. Microsoft.WindowsTerminal_1.22.x → 1.23.x).
+      // Treat same package family + exe filename as a full path
+      // match.
       score += SCORE_PROCESS_PATH;
     } else if same_exe_basename(c_path, t_path) {
       // VS Code / portable installs: same Code.exe under Local\Programs vs
@@ -169,10 +172,8 @@ pub fn score_window(
     }
   }
 
-  score += title_score(
-    candidate.title.as_deref(),
-    target.title.as_deref(),
-  );
+  score +=
+    title_score(candidate.title.as_deref(), target.title.as_deref());
 
   score
 }
@@ -197,9 +198,10 @@ fn title_score(candidate: Option<&str>, target: Option<&str>) -> u32 {
     return SCORE_TITLE_CONTAINS;
   }
 
-  // Simple fuzzy: compare without whitespace / punctuation collapses already
-  // handled by normalize; treat near-equal prefixes as weak fuzzy.
-  // Use char counts / .chars().take so we never byte-slice mid code point.
+  // Simple fuzzy: compare without whitespace / punctuation collapses
+  // already handled by normalize; treat near-equal prefixes as weak
+  // fuzzy. Use char counts / .chars().take so we never byte-slice mid
+  // code point.
   let min_chars = c_norm.chars().count().min(t_norm.chars().count());
   if min_chars >= 4 {
     let prefix_len = min_chars.min(12);
@@ -229,12 +231,13 @@ fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
 }
 
 /// True when both paths look like WindowsApps package installs of the same
-/// exe (version folder may differ): 
+/// exe (version folder may differ):
 /// `...\WindowsApps\PackageFamily_VERSION_arch__publisher\App.exe`
 fn windows_apps_same_package_exe(a: &str, b: &str) -> bool {
   match (windows_apps_identity(a), windows_apps_identity(b)) {
     (Some((fam_a, exe_a)), Some((fam_b, exe_b))) => {
-      fam_a.eq_ignore_ascii_case(&fam_b) && exe_a.eq_ignore_ascii_case(&exe_b)
+      fam_a.eq_ignore_ascii_case(&fam_b)
+        && exe_a.eq_ignore_ascii_case(&exe_b)
     }
     _ => false,
   }
@@ -242,10 +245,7 @@ fn windows_apps_same_package_exe(a: &str, b: &str) -> bool {
 
 fn same_exe_basename(a: &str, b: &str) -> bool {
   fn basename(path: &str) -> &str {
-    path
-      .rsplit(['\\', '/'])
-      .next()
-      .unwrap_or(path)
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
   }
   let ba = basename(a);
   let bb = basename(b);
@@ -260,20 +260,19 @@ fn windows_apps_identity(path: &str) -> Option<(String, String)> {
   let mut parts = after.split(['\\', '/']).filter(|p| !p.is_empty());
   let package_dir = parts.next()?;
   let exe = parts.next_back().unwrap_or(package_dir);
-  // Package dir: FamilyName_Version_Arch__PublisherId — family is before first '_'+digit version-ish.
-  // Prefer stripping from the last "__" publisher separator, then drop trailing _version_arch.
+  // Package dir: FamilyName_Version_Arch__PublisherId — family is before
+  // first '_'+digit version-ish. Prefer stripping from the last "__"
+  // publisher separator, then drop trailing _version_arch.
   let family = package_family_name(package_dir);
   Some((family, exe.to_string()))
 }
 
 fn package_family_name(package_dir: &str) -> String {
   // `Microsoft.WindowsTerminal_1.22.12111.0_x64__8wekyb3d8bbwe`
-  // → family key `Microsoft.WindowsTerminal__8wekyb3d8bbwe` (name + publisher).
+  // → family key `Microsoft.WindowsTerminal__8wekyb3d8bbwe` (name +
+  // publisher).
   if let Some((name_and_ver, publisher)) = package_dir.rsplit_once("__") {
-    let name = name_and_ver
-      .split('_')
-      .next()
-      .unwrap_or(name_and_ver);
+    let name = name_and_ver.split('_').next().unwrap_or(name_and_ver);
     format!("{name}__{publisher}")
   } else {
     package_dir
@@ -284,8 +283,8 @@ fn package_family_name(package_dir: &str) -> String {
   }
 }
 
-/// Greedy best-score matching. Each live/snapshot key is assigned at most once.
-/// Pairs below [`MATCH_SCORE_THRESHOLD`] are skipped.
+/// Greedy best-score matching. Each live/snapshot key is assigned at most
+/// once. Pairs below [`MATCH_SCORE_THRESHOLD`] are skipped.
 #[must_use]
 pub fn match_windows(
   snapshot_windows: &[MatchableWindow],
@@ -339,27 +338,31 @@ pub fn match_windows_with_scores(
 /// Build an inspectable match report (scores, unmatched, planned moves).
 ///
 /// Does not mutate any WM state. `planned_workspace_move` is set when the
-/// snapshot workspace name differs from the live window's current workspace.
+/// snapshot workspace name differs from the live window's current
+/// workspace.
 #[must_use]
 pub fn build_layout_match_report(
   snapshot_windows: &[LayoutMatchWindow],
   live_windows: &[LayoutMatchWindow],
 ) -> LayoutMatchReport {
-  let snap_matchables: Vec<_> =
-    snapshot_windows.iter().map(LayoutMatchWindow::to_matchable).collect();
-  let live_matchables: Vec<_> =
-    live_windows.iter().map(LayoutMatchWindow::to_matchable).collect();
+  let snap_matchables: Vec<_> = snapshot_windows
+    .iter()
+    .map(LayoutMatchWindow::to_matchable)
+    .collect();
+  let live_matchables: Vec<_> = live_windows
+    .iter()
+    .map(LayoutMatchWindow::to_matchable)
+    .collect();
 
-  let scored = match_windows_with_scores(&snap_matchables, &live_matchables);
+  let scored =
+    match_windows_with_scores(&snap_matchables, &live_matchables);
 
   let snap_by_key: std::collections::HashMap<_, _> = snapshot_windows
     .iter()
     .map(|w| (w.key.clone(), w))
     .collect();
-  let live_by_key: std::collections::HashMap<_, _> = live_windows
-    .iter()
-    .map(|w| (w.key.clone(), w))
-    .collect();
+  let live_by_key: std::collections::HashMap<_, _> =
+    live_windows.iter().map(|w| (w.key.clone(), w)).collect();
 
   let mut matched = Vec::with_capacity(scored.len());
   let mut used_snap = std::collections::HashSet::new();
@@ -412,7 +415,8 @@ pub fn build_layout_match_report(
   }
 }
 
-/// Collect snapshot window leaves as [`LayoutMatchWindow`] for dry-run matching.
+/// Collect snapshot window leaves as [`LayoutMatchWindow`] for dry-run
+/// matching.
 ///
 /// Keys match the restore path: `{workspace}::{local_id}::{order}`.
 #[must_use]
@@ -452,7 +456,10 @@ fn collect_node_match_windows(
       if let Some(window) = &node.window {
         let identity = MatchableIdentity::from(window);
         out.push(LayoutMatchWindow {
-          key: format!("{}::{}::{}", workspace_name, node.local_id, *order),
+          key: format!(
+            "{}::{}::{}",
+            workspace_name, node.local_id, *order
+          ),
           process_name: identity.process_name,
           process_path: identity.process_path,
           class_name: identity.class_name,
@@ -534,7 +541,8 @@ mod tests {
 
   #[test]
   fn name_and_title_match_without_path() {
-    let snap = ident(None, "code", None, Some("main.rs - Visual Studio Code"));
+    let snap =
+      ident(None, "code", None, Some("main.rs - Visual Studio Code"));
     let live = ident(
       None,
       "Code",
@@ -571,14 +579,12 @@ mod tests {
 
     let matched = match_windows(&snaps, &lives);
     assert_eq!(matched.len(), 2);
-    assert!(matched.contains(&(
-      "snap-a".to_string(),
-      "live-notes".to_string()
-    )));
-    assert!(matched.contains(&(
-      "snap-b".to_string(),
-      "live-todo".to_string()
-    )));
+    assert!(
+      matched.contains(&("snap-a".to_string(), "live-notes".to_string()))
+    );
+    assert!(
+      matched.contains(&("snap-b".to_string(), "live-todo".to_string()))
+    );
   }
 
   #[test]
@@ -588,10 +594,8 @@ mod tests {
       win("snap-2", ident(None, "chrome", None, Some("Tab B"))),
     ];
     // Only one live chrome window - second snapshot must remain unmatched.
-    let lives = vec![win(
-      "live-1",
-      ident(None, "chrome", None, Some("Tab A")),
-    )];
+    let lives =
+      vec![win("live-1", ident(None, "chrome", None, Some("Tab A")))];
 
     let matched = match_windows(&snaps, &lives);
     assert_eq!(matched.len(), 1);
@@ -606,39 +610,31 @@ mod tests {
     let score = score_window(&live, &snap);
     assert!(score < MATCH_SCORE_THRESHOLD);
 
-    let matched = match_windows(
-      &[win("s", snap)],
-      &[win("l", live)],
-    );
+    let matched = match_windows(&[win("s", snap)], &[win("l", live)]);
     assert!(matched.is_empty());
   }
 
   #[test]
   fn title_contains_scores_medium() {
     let snap = ident(None, "firefox", None, Some("GitHub"));
-    let live = ident(
-      None,
-      "firefox",
-      None,
-      Some("GitHub - Pull requests"),
-    );
+    let live =
+      ident(None, "firefox", None, Some("GitHub - Pull requests"));
     let score = score_window(&live, &snap);
-    assert_eq!(
-      score,
-      SCORE_PROCESS_NAME + SCORE_TITLE_CONTAINS
-    );
+    assert_eq!(score, SCORE_PROCESS_NAME + SCORE_TITLE_CONTAINS);
   }
 
   #[test]
   fn fuzzy_title_prefix_handles_multibyte_utf8() {
     // 11 ASCII + 2-byte `é` would put a byte index of 12 mid-codepoint;
-    // char-based prefix extraction must not panic and should still fuzzy-match.
+    // char-based prefix extraction must not panic and should still
+    // fuzzy-match.
     let snap = ident(None, "app", None, Some("aaaaaaaaaaaé rest"));
     let live = ident(None, "app", None, Some("aaaaaaaaaaaé other"));
     let score = score_window(&live, &snap);
     assert_eq!(score, SCORE_PROCESS_NAME + SCORE_TITLE_FUZZY);
 
-    // Mixed Japanese + ASCII titles (regression for non-ASCII normalize path).
+    // Mixed Japanese + ASCII titles (regression for non-ASCII normalize
+    // path).
     let snap_jp = ident(None, "code", None, Some("編集.rs - 窓"));
     let live_jp = ident(None, "code", None, Some("編集.rs - 窓"));
     let score_jp = score_window(&live_jp, &snap_jp);
@@ -699,18 +695,10 @@ mod tests {
 
   #[test]
   fn build_layout_match_report_no_move_when_workspace_same() {
-    let snaps = vec![match_win(
-      "snap-a",
-      "notepad",
-      Some("a.txt"),
-      Some("work"),
-    )];
-    let lives = vec![match_win(
-      "live-a",
-      "notepad",
-      Some("a.txt"),
-      Some("work"),
-    )];
+    let snaps =
+      vec![match_win("snap-a", "notepad", Some("a.txt"), Some("work"))];
+    let lives =
+      vec![match_win("live-a", "notepad", Some("a.txt"), Some("work"))];
     let report = build_layout_match_report(&snaps, &lives);
     assert_eq!(report.matched.len(), 1);
     assert!(report.matched[0].planned_workspace_move.is_none());
@@ -718,9 +706,9 @@ mod tests {
     assert!(report.unmatched_live.is_empty());
   }
 
-  /// Greedy matching: identical exe + similar titles prefers exact title when
-  /// available; leftover live windows stay unmatched. Missing snapshot apps
-  /// simply leave that snap unmatched (no launch).
+  /// Greedy matching: identical exe + similar titles prefers exact title
+  /// when available; leftover live windows stay unmatched. Missing
+  /// snapshot apps simply leave that snap unmatched (no launch).
   #[test]
   fn ambiguity_same_exe_similar_titles_and_extra_live() {
     let snaps = vec![
@@ -747,21 +735,17 @@ mod tests {
         "live-notes-copy",
         ident(None, "notepad", None, Some("notes - Notepad")),
       ),
-      win(
-        "live-extra",
-        ident(None, "calc", None, Some("Calculator")),
-      ),
+      win("live-extra", ident(None, "calc", None, Some("Calculator"))),
     ];
 
     let matched = match_windows(&snaps, &lives);
     // Exact title wins for snap-notes; snap-missing has no live candidate.
-    assert!(matched.contains(&(
-      "snap-notes".to_string(),
-      "live-notes".to_string()
-    )));
+    assert!(matched
+      .contains(&("snap-notes".to_string(), "live-notes".to_string())));
     assert!(!matched.iter().any(|(s, _)| s == "snap-missing"));
     // Extra live windows (similar-title notepad + calc) remain unmatched.
-    let matched_lives: Vec<_> = matched.iter().map(|(_, l)| l.clone()).collect();
+    let matched_lives: Vec<_> =
+      matched.iter().map(|(_, l)| l.clone()).collect();
     assert!(!matched_lives.contains(&"live-extra".to_string()));
     assert_eq!(matched.len(), 1);
   }
@@ -814,8 +798,6 @@ mod tests {
     assert!(score >= MATCH_SCORE_THRESHOLD);
   }
 
-
-
   #[test]
   fn same_exe_basename_boosts_score_across_install_roots() {
     let snap = MatchableIdentity {
@@ -828,7 +810,9 @@ mod tests {
       title: Some("config.yaml - Visual Studio Code".into()),
     };
     let live = MatchableIdentity {
-      process_path: Some(r"C:\Program Files\Microsoft VS Code\Code.exe".into()),
+      process_path: Some(
+        r"C:\Program Files\Microsoft VS Code\Code.exe".into(),
+      ),
       process_name: "Code".into(),
       class_name: Some("Chrome_WidgetWin_1".into()),
       title: Some("other - Visual Studio Code".into()),

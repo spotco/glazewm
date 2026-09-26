@@ -1,10 +1,12 @@
 use anyhow::Context;
 
-/// Quote a single IPC argument so whitespace survives quote-aware splitting.
+/// Quote a single IPC argument so whitespace survives quote-aware
+/// splitting.
 ///
-/// Arguments without whitespace or double-quotes are left unquoted. Otherwise
-/// the value is wrapped in double quotes; embedded `"` are backslash-escaped.
-/// Backslashes are left literal (Windows paths) except for the `\"` escape.
+/// Arguments without whitespace or double-quotes are left unquoted.
+/// Otherwise the value is wrapped in double quotes; embedded `"` are
+/// backslash-escaped. Backslashes are left literal (Windows paths) except
+/// for the `\"` escape.
 ///
 /// Empty strings become `""` so a distinct empty argument survives the
 /// split/join round-trip.
@@ -28,12 +30,12 @@ pub fn quote_ipc_arg(arg: &str) -> String {
 
 /// Reconstruct an argv list after quote-aware splitting.
 ///
-/// `split_ipc_args` strips grouping quotes from tokens. Joining with a bare
-/// space would drop them (e.g. `shell-exec … "C:\My Scripts\foo.ps1"`
+/// `split_ipc_args` strips grouping quotes from tokens. Joining with a
+/// bare space would drop them (e.g. `shell-exec … "C:\My Scripts\foo.ps1"`
 /// becomes an unquoted multi-token path). Re-apply [`quote_ipc_arg`] so
 /// `ShellExec` / `parse_command` see the same quoting semantics as the
-/// original IPC/config message. Layout path commands keep using quote-aware
-/// split; only the reconstruct-for-exec path needs this join.
+/// original IPC/config message. Layout path commands keep using
+/// quote-aware split; only the reconstruct-for-exec path needs this join.
 #[must_use]
 pub fn join_ipc_args(args: &[impl AsRef<str>]) -> String {
   args
@@ -43,10 +45,12 @@ pub fn join_ipc_args(args: &[impl AsRef<str>]) -> String {
     .join(" ")
 }
 
-/// Split an IPC message into argv tokens, honouring double-quoted segments.
+/// Split an IPC message into argv tokens, honouring double-quoted
+/// segments.
 ///
-/// Unquoted whitespace separates arguments. Inside double quotes, `\"` is an escaped literal quote;
-/// other backslashes stay literal (Windows paths). Unclosed quotes are an error.
+/// Unquoted whitespace separates arguments. Inside double quotes, `\"` is
+/// an escaped literal quote; other backslashes stay literal (Windows
+/// paths). Unclosed quotes are an error.
 ///
 /// An empty quoted argument (`""`) yields one empty string token.
 pub fn split_ipc_args(message: &str) -> anyhow::Result<Vec<String>> {
@@ -99,29 +103,36 @@ pub fn split_ipc_args(message: &str) -> anyhow::Result<Vec<String>> {
 
 /// Parse `AppCommand`-compatible argv from an IPC message string.
 ///
-/// Prepends an empty binary name (clap convention) after quote-aware split.
+/// Prepends an empty binary name (clap convention) after quote-aware
+/// split.
 pub fn ipc_argv_from_message(
   message: &str,
 ) -> anyhow::Result<Vec<String>> {
-  let mut args = split_ipc_args(message)
-    .with_context(|| format!("Failed to tokenize IPC message: {message}"))?;
+  let mut args = split_ipc_args(message).with_context(|| {
+    format!("Failed to tokenize IPC message: {message}")
+  })?;
   args.insert(0, String::new());
   Ok(args)
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
   use std::path::Path;
+
+  use super::*;
 
   #[test]
   fn quote_leaves_simple_paths_alone() {
-    assert_eq!(quote_ipc_arg(r"C:\temp\layout.json"), r"C:\temp\layout.json");
+    assert_eq!(
+      quote_ipc_arg(r"C:\temp\layout.json"),
+      r"C:\temp\layout.json"
+    );
   }
 
   #[test]
   fn quote_wraps_paths_with_spaces() {
-    let path = r"C:\Users\mooto\AppData\Local\Temp\glazewm path test\a.json";
+    let path =
+      r"C:\Users\mooto\AppData\Local\Temp\glazewm path test\a.json";
     let quoted = quote_ipc_arg(path);
     assert_eq!(quoted, format!("\"{path}\""));
     let tokens = split_ipc_args(&format!("load-layout {quoted}")).unwrap();
@@ -149,7 +160,8 @@ mod tests {
 
   #[test]
   fn round_trip_empty_arg_among_others() {
-    let args = ["powershell".to_string(), String::new(), "-File".to_string()];
+    let args =
+      ["powershell".to_string(), String::new(), "-File".to_string()];
     let joined = join_ipc_args(&args);
     assert_eq!(joined, "powershell \"\" -File");
     let tokens = split_ipc_args(&joined).unwrap();
@@ -189,14 +201,16 @@ mod tests {
   #[test]
   fn escaped_quote_inside_path() {
     let tokens =
-      split_ipc_args(r#"inspect-layout "C:\odd\"name\file.json""#).unwrap();
+      split_ipc_args(r#"inspect-layout "C:\odd\"name\file.json""#)
+        .unwrap();
     assert_eq!(tokens.len(), 2);
     assert_eq!(tokens[1], r#"C:\odd"name\file.json"#);
   }
 
   #[test]
   fn ipc_argv_prepends_empty_bin() {
-    let argv = ipc_argv_from_message(r#"load-layout "C:\a b\c.json""#).unwrap();
+    let argv =
+      ipc_argv_from_message(r#"load-layout "C:\a b\c.json""#).unwrap();
     assert_eq!(argv[0], "");
     assert_eq!(argv[1], "load-layout");
     assert_eq!(argv[2], r"C:\a b\c.json");
@@ -237,10 +251,7 @@ mod tests {
         r"C:\My Project".to_string(),
       ]
     );
-    assert_eq!(
-      join_ipc_args(&tokens[1..]),
-      r#"code "C:\My Project""#
-    );
+    assert_eq!(join_ipc_args(&tokens[1..]), r#"code "C:\My Project""#);
   }
 
   #[test]
@@ -277,10 +288,8 @@ mod tests {
   #[test]
   fn shell_exec_unc_path_with_spaces() {
     let unc = r"\\server\share\My Folder\file.ps1";
-    let msg = format!(
-      "shell-exec powershell -File {}",
-      quote_ipc_arg(unc)
-    );
+    let msg =
+      format!("shell-exec powershell -File {}", quote_ipc_arg(unc));
     let tokens = split_ipc_args(&msg).unwrap();
     assert_eq!(tokens.last().map(String::as_str), Some(unc));
     let reconstructed = join_ipc_args(&tokens[1..]);

@@ -66,7 +66,8 @@ mod tests {
 
   #[test]
   fn load_guard_should_use_full_equality_not_is_same_state() {
-    // Documents the restore contract: same-variant config changes must apply.
+    // Documents the restore contract: same-variant config changes must
+    // apply.
     let live = WindowState::Floating(FloatingStateConfig {
       centered: true,
       shown_on_top: false,
@@ -83,4 +84,3 @@ mod tests {
     assert!(new_should_update);
   }
 }
-

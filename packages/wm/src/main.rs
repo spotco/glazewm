@@ -33,11 +33,14 @@ use crate::{
   commands::general::{
     copy_layout_snapshot_to_clipboard, layout_debug_log_path,
     layout_snapshot_path, load_layout_snapshot, pick_layout_snapshot_path,
-    platform_sync, read_layout_snapshot_file, save_layout_snapshot_with_dialog,
-    set_layout_debug_log_path, try_load_persisted_layout_snapshot,
-    wm_event_affects_layout_snapshot, LayoutAutoSave,
+    platform_sync, read_layout_snapshot_file,
+    save_layout_snapshot_with_dialog, set_layout_debug_log_path,
+    try_load_persisted_layout_snapshot, wm_event_affects_layout_snapshot,
+    LayoutAutoSave,
   },
-  ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
+  ipc_server::IpcServer,
+  sys_tray::SystemTray,
+  user_config::UserConfig,
   wm::WindowManager,
 };
 
@@ -201,29 +204,37 @@ async fn start_wm(
   }
 
   // Best-effort restore of persisted layout.json (beside config.yaml).
-  // Runs after initial populate + startup commands so windows/workspaces exist.
-  // Windows still cloaked / not yet in visible_windows() at populate() are
-  // absent from the first pass — schedule deferred retries after the event
-  // loop can manage late arrivals (WindowManaged), plus timed retries.
-  let first_load =
-    try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
-  let mut startup_layout_retries_left: u32 =
-    if first_load.as_ref().is_some_and(|s| s.unmatched_snapshot > 0) {
-      4
-    } else {
-      0
-    };
+  // Runs after initial populate + startup commands so windows/workspaces
+  // exist. Windows still cloaked / not yet in visible_windows() at
+  // populate() are absent from the first pass — schedule deferred
+  // retries after the event loop can manage late arrivals
+  // (WindowManaged), plus timed retries.
+  let first_load = try_load_persisted_layout_snapshot(
+    &layout_path,
+    &mut wm.state,
+    &config,
+  );
+  let mut startup_layout_retries_left: u32 = if first_load
+    .as_ref()
+    .is_some_and(|s| s.unmatched_snapshot > 0)
+  {
+    4
+  } else {
+    0
+  };
   if startup_layout_retries_left > 0 {
     crate::commands::general::layout_debug_log(format!(
       "startup load left unmatched_snapshot={}; scheduling up to {startup_layout_retries_left} retries (2s / WindowManaged)",
       first_load.as_ref().map(|s| s.unmatched_snapshot).unwrap_or(0)
     ));
   }
-  let startup_layout_retry_delay = tokio::time::sleep(Duration::from_secs(2));
+  let startup_layout_retry_delay =
+    tokio::time::sleep(Duration::from_secs(2));
   tokio::pin!(startup_layout_retry_delay);
 
-  // Drain events emitted by startup restore so IPC clients see them, but do
-  // not arm auto-save yet (avoids thrashing a rewrite of the file we just loaded).
+  // Drain events emitted by startup restore so IPC clients see them, but
+  // do not arm auto-save yet (avoids thrashing a rewrite of the file we
+  // just loaded).
   while let Ok(wm_event) = wm.event_rx.try_recv() {
     if let WmEvent::PauseChanged { is_paused } = wm_event {
       let _ = mouse_listener.enable(!is_paused);
@@ -509,8 +520,22 @@ async fn start_wm(
     }
   }
 
+  // Flush pending layout autosave before teardown mutates
+  // visibility/state. A structural move arms a 5s debounce; exiting
+  // within that window would otherwise drop the pending write and
+  // restore a stale layout.json on restart.
+  if layout_auto_save.is_armed() {
+    match layout_auto_save.flush(&wm.state) {
+      Ok(()) => tracing::info!("Flushed pending layout autosave on exit."),
+      Err(err) => tracing::warn!(
+        "Failed to flush pending layout autosave on exit: {err:#}"
+      ),
+    }
+  }
+
   tracing::info!("Window manager shutting down.");
-  // Close IPC listener first (sync signal + short wait) before other teardown.
+  // Close IPC listener first (sync signal + short wait) before other
+  // teardown.
   ipc_server.stop_and_wait().await;
   wm.cleanup(&mut config, &mut ipc_server);
 

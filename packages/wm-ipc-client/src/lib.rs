@@ -8,7 +8,7 @@ use tokio_tungstenite::{
 };
 use uuid::Uuid;
 use wm_common::{
-  ClientResponseMessage, EventSubscriptionMessage, ServerMessage, ipc_port,
+  ipc_port, ClientResponseMessage, EventSubscriptionMessage, ServerMessage,
 };
 
 pub struct IpcClient {

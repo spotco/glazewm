@@ -8,9 +8,9 @@ use windows::{
     Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
     Graphics::Dwm::{
       DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-      DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
-      DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
-      DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
+      DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_COLOR_NONE,
+      DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE,
+      DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
     },
     System::Threading::{
       OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -787,7 +787,6 @@ pub(crate) fn visible_windows(
       .collect(),
   )
 }
-
 
 /// Uncloak + show top-level DWM-cloaked windows, skipping `skip_handles`
 /// (typically currently managed GlazeWM window handles).

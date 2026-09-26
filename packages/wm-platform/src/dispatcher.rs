@@ -282,7 +282,9 @@ impl DispatcherExtWindows for Dispatcher {
     let trimmed = program.trim();
     if trimmed.is_empty()
       || trimmed.contains('"')
-      || trimmed.chars().all(|c| c == '\\' || c == '/' || c.is_whitespace())
+      || trimmed
+        .chars()
+        .all(|c| c == '\\' || c == '/' || c.is_whitespace())
     {
       return Err(crate::Error::Platform(format!(
         "Refusing ShellExecuteEx for malformed program {program:?} (args={args:?})."
@@ -563,7 +565,6 @@ impl Dispatcher {
   ) -> crate::Result<usize> {
     platform_impl::unhide_all_cloaked_windows(skip_handles, self)
   }
-
 
   /// Gets the currently focused (foreground) window.
   ///

@@ -15,10 +15,12 @@ pub const LAYOUT_SNAPSHOT_VERSION: u32 = 1;
 /// Unified JSON export of monitors, workspaces, tiling tree, ignored
 /// windows, and useful GlazeWM status. Foundation for save/load/restore.
 ///
-/// Live queries may populate ephemeral `id` / `handle` fields for debugging.
-/// Call [`LayoutSnapshot::strip_ephemeral`] before writing a durable file.
+/// Live queries may populate ephemeral `id` / `handle` fields for
+/// debugging. Call [`LayoutSnapshot::strip_ephemeral`] before writing a
+/// durable file.
 ///
-/// Tiling vs floating is the "dock" signal (user Super+T = toggle-floating).
+/// Tiling vs floating is the "dock" signal (user Super+T =
+/// toggle-floating).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LayoutSnapshot {
@@ -44,7 +46,8 @@ pub struct SnapshotMonitor {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub focused_workspace_name: Option<String>,
   pub workspaces: Vec<SnapshotWorkspace>,
-  /// Ephemeral live container id (cleared by [`LayoutSnapshot::strip_ephemeral`]).
+  /// Ephemeral live container id (cleared by
+  /// [`LayoutSnapshot::strip_ephemeral`]).
   #[serde(skip_serializing_if = "Option::is_none")]
   pub id: Option<Uuid>,
 }
@@ -60,8 +63,9 @@ pub struct SnapshotBounds {
 
 /// Floating window placement as fractions of the snapshot monitor bounds.
 ///
-/// Durable source of truth going forward (`floatingPlacementRelative`). Values
-/// are typically in 0..1 but slight out-of-range is allowed (partially off-monitor).
+/// Durable source of truth going forward (`floatingPlacementRelative`).
+/// Values are typically in 0..1 but slight out-of-range is allowed
+/// (partially off-monitor).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotRelativeRect {
@@ -93,7 +97,8 @@ pub struct SnapshotNode {
   pub tiling_direction: Option<TilingDirection>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub children: Option<Vec<SnapshotNode>>,
-  /// Local-id focus history for split nodes (from `SplitContainerDto.child_focus_order`).
+  /// Local-id focus history for split nodes (from
+  /// `SplitContainerDto.child_focus_order`).
   #[serde(skip_serializing_if = "Option::is_none")]
   pub child_focus_order: Option<Vec<String>>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,7 +121,8 @@ pub enum SnapshotNodeKind {
 pub struct SnapshotWindow {
   pub identity: SnapshotWindowIdentity,
   pub state: WindowState,
-  /// Prior state before minimize/fullscreen; needed so restore can leave Minimized.
+  /// Prior state before minimize/fullscreen; needed so restore can leave
+  /// Minimized.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub prev_state: Option<WindowState>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,10 +212,8 @@ impl LayoutSnapshot {
 
 impl SnapshotMonitor {
   fn from_monitor_dto(monitor: &MonitorDto) -> Self {
-    let focused_workspace_name = monitor
-      .child_focus_order
-      .first()
-      .and_then(|focus_id| {
+    let focused_workspace_name =
+      monitor.child_focus_order.first().and_then(|focus_id| {
         monitor.children.iter().find_map(|child| match child {
           ContainerDto::Workspace(ws) if ws.id == *focus_id => {
             Some(ws.name.clone())
@@ -260,9 +264,7 @@ impl SnapshotWorkspace {
     let mut children: Vec<SnapshotNode> = workspace
       .children
       .iter()
-      .filter_map(|child| {
-        convert_node(child, &mut id_map, &mut next_id)
-      })
+      .filter_map(|child| convert_node(child, &mut id_map, &mut next_id))
       .collect();
 
     apply_sibling_tiling_sizes(
@@ -277,14 +279,16 @@ impl SnapshotWorkspace {
       .filter_map(|uuid| id_map.get(uuid).cloned())
       .collect();
 
-    // Workspace root is a virtual split with the workspace tiling direction.
+    // Workspace root is a virtual split with the workspace tiling
+    // direction.
     let root = SnapshotNode {
       local_id: next_local_id(&mut next_id),
       kind: SnapshotNodeKind::Split,
       tiling_size: None,
       tiling_direction: Some(workspace.tiling_direction.clone()),
       children: Some(children),
-      // Workspace focus order lives on SnapshotWorkspace; virtual root has none.
+      // Workspace focus order lives on SnapshotWorkspace; virtual root has
+      // none.
       child_focus_order: None,
       window: None,
       id: Some(workspace.id),
@@ -397,7 +401,8 @@ impl SnapshotWindow {
       state: window.state.clone(),
       prev_state: window.prev_state.clone(),
       floating_placement: Some(window.floating_placement.clone()),
-      // Filled later from monitor bounds in `attach_floating_placement_relative`.
+      // Filled later from monitor bounds in
+      // `attach_floating_placement_relative`.
       floating_placement_relative: None,
       id: Some(window.id),
       handle: Some(window.handle),
@@ -407,9 +412,7 @@ impl SnapshotWindow {
 
 /// Format `SystemTime` as RFC3339 UTC without extra dependencies.
 #[must_use]
-pub fn format_system_time_rfc3339(
-  time: std::time::SystemTime,
-) -> String {
+pub fn format_system_time_rfc3339(time: std::time::SystemTime) -> String {
   let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) else {
     return "1970-01-01T00:00:00Z".to_string();
   };
@@ -454,17 +457,20 @@ fn civil_from_days(unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
   )
 }
 
-
-
 fn dto_is_tiling_sibling(dto: &ContainerDto) -> bool {
   match dto {
     ContainerDto::Split(_) => true,
-    ContainerDto::Window(window) => matches!(window.state, WindowState::Tiling),
+    ContainerDto::Window(window) => {
+      matches!(window.state, WindowState::Tiling)
+    }
     _ => false,
   }
 }
 
-fn dto_extent(dto: &ContainerDto, direction: &TilingDirection) -> Option<i32> {
+fn dto_extent(
+  dto: &ContainerDto,
+  direction: &TilingDirection,
+) -> Option<i32> {
   let (width, height) = match dto {
     ContainerDto::Window(window) => (window.width, window.height),
     ContainerDto::Split(split) => (split.width, split.height),
@@ -476,9 +482,10 @@ fn dto_extent(dto: &ContainerDto, direction: &TilingDirection) -> Option<i32> {
   })
 }
 
-/// Among tiling-only siblings, set `tiling_size` from on-screen geometry ratios
-/// (horizontal→width, vertical→height). Floaters are excluded. Falls back to
-/// renormalizing existing `tiling_size` when geometry is missing/zero.
+/// Among tiling-only siblings, set `tiling_size` from on-screen geometry
+/// ratios (horizontal→width, vertical→height). Floaters are excluded.
+/// Falls back to renormalizing existing `tiling_size` when geometry is
+/// missing/zero.
 fn apply_sibling_tiling_sizes(
   nodes: &mut [SnapshotNode],
   source_dtos: &[ContainerDto],
@@ -488,8 +495,9 @@ fn apply_sibling_tiling_sizes(
     return;
   }
 
-  // Convert keeps Split|Window 1:1 under workspace/split; if lengths diverge,
-  // fall back to size-only renormalize on nodes that look tiling.
+  // Convert keeps Split|Window 1:1 under workspace/split; if lengths
+  // diverge, fall back to size-only renormalize on nodes that look
+  // tiling.
   if nodes.len() != source_dtos.len() {
     renormalize_node_tiling_sizes(nodes);
     return;
@@ -511,12 +519,12 @@ fn apply_sibling_tiling_sizes(
     .map(|&index| dto_extent(&source_dtos[index], direction))
     .collect();
 
-  let geometry_ok = extents.iter().all(|extent| matches!(extent, Some(v) if *v > 0));
+  let geometry_ok = extents
+    .iter()
+    .all(|extent| matches!(extent, Some(v) if *v > 0));
   if geometry_ok {
-    let total: f32 = extents
-      .iter()
-      .map(|extent| extent.unwrap() as f32)
-      .sum();
+    let total: f32 =
+      extents.iter().map(|extent| extent.unwrap() as f32).sum();
     if total > f32::EPSILON {
       for (j, &index) in tiling_indices.iter().enumerate() {
         let size = extents[j].unwrap() as f32 / total;
@@ -549,14 +557,12 @@ fn renormalize_node_tiling_sizes(nodes: &mut [SnapshotNode]) {
   let tiling_indices: Vec<usize> = nodes
     .iter()
     .enumerate()
-    .filter(|(_, node)| {
-      match node.kind {
-        SnapshotNodeKind::Split => true,
-        SnapshotNodeKind::Window => node
-          .window
-          .as_ref()
-          .is_some_and(|w| matches!(w.state, WindowState::Tiling)),
-      }
+    .filter(|(_, node)| match node.kind {
+      SnapshotNodeKind::Split => true,
+      SnapshotNodeKind::Window => node
+        .window
+        .as_ref()
+        .is_some_and(|w| matches!(w.state, WindowState::Tiling)),
     })
     .map(|(index, _)| index)
     .collect();
@@ -633,13 +639,17 @@ pub fn absolute_rect_from_relative(
   monitor_bounds: &SnapshotBounds,
 ) -> Rect {
   #[allow(clippy::cast_possible_truncation)]
-  let x = monitor_bounds.x + (relative.x * monitor_bounds.width as f32).round() as i32;
+  let x = monitor_bounds.x
+    + (relative.x * monitor_bounds.width as f32).round() as i32;
   #[allow(clippy::cast_possible_truncation)]
-  let y = monitor_bounds.y + (relative.y * monitor_bounds.height as f32).round() as i32;
+  let y = monitor_bounds.y
+    + (relative.y * monitor_bounds.height as f32).round() as i32;
   #[allow(clippy::cast_possible_truncation)]
-  let width = (relative.width * monitor_bounds.width as f32).round() as i32;
+  let width =
+    (relative.width * monitor_bounds.width as f32).round() as i32;
   #[allow(clippy::cast_possible_truncation)]
-  let height = (relative.height * monitor_bounds.height as f32).round() as i32;
+  let height =
+    (relative.height * monitor_bounds.height as f32).round() as i32;
   Rect::from_xy(x, y, width.max(1), height.max(1))
 }
 
@@ -659,9 +669,9 @@ pub fn resolve_floating_placement(
 
 /// Validate snapshot schema version before any restore mutation.
 ///
-/// Returns `Ok(())` when `version == LAYOUT_SNAPSHOT_VERSION`. Callers must
-/// invoke this (or equivalent) before mutating WM state so unsupported
-/// versions fail cleanly with no partial apply.
+/// Returns `Ok(())` when `version == LAYOUT_SNAPSHOT_VERSION`. Callers
+/// must invoke this (or equivalent) before mutating WM state so
+/// unsupported versions fail cleanly with no partial apply.
 pub fn validate_layout_snapshot_version(
   snapshot: &LayoutSnapshot,
 ) -> Result<(), String> {
@@ -694,12 +704,18 @@ pub fn snapshot_workspace_monitor_indices(
 
 #[cfg(test)]
 mod tests {
-  use super::*;
   use std::collections::HashMap;
-  use crate::{DisplayState, SplitContainerDto};
+
   use wm_platform::{Rect, RectDelta};
 
-  fn sample_window(id: Uuid, name: &str, tiling_size: Option<f32>) -> WindowDto {
+  use super::*;
+  use crate::{DisplayState, SplitContainerDto};
+
+  fn sample_window(
+    id: Uuid,
+    name: &str,
+    tiling_size: Option<f32>,
+  ) -> WindowDto {
     WindowDto {
       id,
       parent_id: None,
@@ -835,7 +851,9 @@ mod tests {
         display_name: None,
         parent_id: Some(mon_id),
         children: vec![ContainerDto::Window(sample_window(
-          win_id, "alpha", Some(1.0),
+          win_id,
+          "alpha",
+          Some(1.0),
         ))],
         child_focus_order: vec![win_id],
         has_focus: true,
@@ -880,8 +898,11 @@ mod tests {
     assert!(snapshot.monitors[0].id.is_none());
     assert!(snapshot.monitors[0].workspaces[0].id.is_none());
     assert!(snapshot.monitors[0].workspaces[0].root.id.is_none());
-    let win = snapshot.monitors[0].workspaces[0].root.children.as_ref().unwrap()
-      [0]
+    let win = snapshot.monitors[0].workspaces[0]
+      .root
+      .children
+      .as_ref()
+      .unwrap()[0]
       .window
       .as_ref()
       .unwrap();
@@ -974,38 +995,45 @@ mod tests {
         hardware_id: Some("HW1".into()),
         device_path: None,
         device_name: "DISPLAY1".into(),
-        bounds: SnapshotBounds { x: 0, y: 0, width: 1920, height: 1080 },
+        bounds: SnapshotBounds {
+          x: 0,
+          y: 0,
+          width: 1920,
+          height: 1080,
+        },
         focused_workspace_name: Some("empty-focus".into()),
-        workspaces: vec![
-          SnapshotWorkspace {
-            name: "with-win".into(),
-            tiling_direction: TilingDirection::Horizontal,
-            child_focus_order: vec![],
-            root: empty_root.clone(),
-            id: None,
-          },
-        ],
+        workspaces: vec![SnapshotWorkspace {
+          name: "with-win".into(),
+          tiling_direction: TilingDirection::Horizontal,
+          child_focus_order: vec![],
+          root: empty_root.clone(),
+          id: None,
+        }],
         id: None,
       },
       SnapshotMonitor {
         hardware_id: Some("HW2".into()),
         device_path: None,
         device_name: "DISPLAY2".into(),
-        bounds: SnapshotBounds { x: 1920, y: 0, width: 1920, height: 1080 },
+        bounds: SnapshotBounds {
+          x: 1920,
+          y: 0,
+          width: 1920,
+          height: 1080,
+        },
         focused_workspace_name: Some("empty-focus".into()),
-        workspaces: vec![
-          SnapshotWorkspace {
-            name: "empty-focus".into(),
-            tiling_direction: TilingDirection::Horizontal,
-            child_focus_order: vec![],
-            root: empty_root,
-            id: None,
-          },
-        ],
+        workspaces: vec![SnapshotWorkspace {
+          name: "empty-focus".into(),
+          tiling_direction: TilingDirection::Horizontal,
+          child_focus_order: vec![],
+          root: empty_root,
+          id: None,
+        }],
         id: None,
       },
     ];
-    // Put a window only on monitor 0 so leaf-driven planning would miss monitor 1.
+    // Put a window only on monitor 0 so leaf-driven planning would miss
+    // monitor 1.
     let plan = snapshot_workspace_monitor_indices(&monitors);
     assert_eq!(plan.get("with-win").copied(), Some(0));
     assert_eq!(
@@ -1026,7 +1054,15 @@ mod tests {
     win.prev_state = Some(WindowState::Tiling);
     win.floating_placement = rect.clone();
     let snap = SnapshotWindow::from_window_dto(&win);
-    assert_eq!(snap.floating_placement.as_ref().map(|r| (r.x(), r.y(), r.width(), r.height())), Some((100, 200, 640, 480)));
+    assert_eq!(
+      snap.floating_placement.as_ref().map(|r| (
+        r.x(),
+        r.y(),
+        r.width(),
+        r.height()
+      )),
+      Some((100, 200, 640, 480))
+    );
     assert_eq!(snap.prev_state, Some(WindowState::Tiling));
     assert_eq!(
       snap.state,
@@ -1037,17 +1073,17 @@ mod tests {
     );
   }
 
-
   #[test]
   fn format_rfc3339_known_instant() {
-    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let t = std::time::UNIX_EPOCH
+      + std::time::Duration::from_secs(1_700_000_000);
     let s = format_system_time_rfc3339(t);
     assert_eq!(s, "2023-11-14T22:13:20Z");
   }
 
-
   /// Fields a successful restore is expected to bring back. Intentionally
-  /// excludes ephemeral ids/handles and `captured_at` (changes every save).
+  /// excludes ephemeral ids/handles and `captured_at` (changes every
+  /// save).
   #[derive(Clone, Debug, PartialEq)]
   struct RestoredLeafView {
     process_name: String,
@@ -1059,12 +1095,19 @@ mod tests {
     tiling_size: Option<f32>,
   }
 
-  fn collect_restored_leaf_views(snapshot: &LayoutSnapshot) -> Vec<RestoredLeafView> {
+  fn collect_restored_leaf_views(
+    snapshot: &LayoutSnapshot,
+  ) -> Vec<RestoredLeafView> {
     let mut leaves = Vec::new();
     for monitor in &snapshot.monitors {
       for workspace in &monitor.workspaces {
         let mut order = 0usize;
-        walk_node(&workspace.root, &workspace.name, &mut order, &mut leaves);
+        walk_node(
+          &workspace.root,
+          &workspace.name,
+          &mut order,
+          &mut leaves,
+        );
       }
     }
     leaves.sort_by(|a, b| a.process_name.cmp(&b.process_name));
@@ -1106,9 +1149,10 @@ mod tests {
     }
   }
 
-  /// Pure data-level restore: copy restored fields from target onto scrambled
-  /// live leaves matched by process_name. Covers the field set
-  /// `load_layout_snapshot` must preserve without needing a live WM session.
+  /// Pure data-level restore: copy restored fields from target onto
+  /// scrambled live leaves matched by process_name. Covers the field set
+  /// `load_layout_snapshot` must preserve without needing a live WM
+  /// session.
   fn virtual_restore_leaves(
     target: &LayoutSnapshot,
     scrambled: &LayoutSnapshot,
@@ -1166,7 +1210,9 @@ mod tests {
         let children: Vec<ContainerDto> = ws_ids
           .iter()
           .filter_map(|ws_id| {
-            workspaces.iter().find(|(id, _, parent, _)| id == ws_id && parent == &mon_id)
+            workspaces
+              .iter()
+              .find(|(id, _, parent, _)| id == ws_id && parent == &mon_id)
               .map(|(id, name, parent, children)| {
                 ContainerDto::Workspace(WorkspaceDto {
                   id: *id,
@@ -1220,7 +1266,9 @@ mod tests {
 
   #[test]
   fn restore_round_trip_after_scramble_virtual() {
-    use crate::{FloatingStateConfig, FullscreenStateConfig, SplitContainerDto};
+    use crate::{
+      FloatingStateConfig, FullscreenStateConfig, SplitContainerDto,
+    };
 
     let mon_a = Uuid::from_u128(10);
     let mon_b = Uuid::from_u128(11);
@@ -1228,8 +1276,16 @@ mod tests {
     let ws2 = Uuid::from_u128(21);
     let split_id = Uuid::from_u128(30);
 
-    let tiler = make_window(1, "tiler", WindowState::Tiling, None, Some(0.6), None);
-    let tiler_b = make_window(5, "tiler_b", WindowState::Tiling, None, Some(0.4), None);
+    let tiler =
+      make_window(1, "tiler", WindowState::Tiling, None, Some(0.6), None);
+    let tiler_b = make_window(
+      5,
+      "tiler_b",
+      WindowState::Tiling,
+      None,
+      Some(0.4),
+      None,
+    );
     let floater = make_window(
       2,
       "floater",
@@ -1300,7 +1356,10 @@ mod tests {
           ],
         ),
       ],
-      vec![(mon_a, "DISPLAY1", vec![ws1]), (mon_b, "DISPLAY2", vec![ws2])],
+      vec![
+        (mon_a, "DISPLAY1", vec![ws1]),
+        (mon_b, "DISPLAY2", vec![ws2]),
+      ],
       "2026-09-24T11:00:00Z",
     );
 
@@ -1318,10 +1377,26 @@ mod tests {
       None,
       Some((1, 2, 10, 10)),
     );
-    let tiler_b_s = make_window(5, "tiler_b", WindowState::Tiling, None, Some(0.75), None);
-    let floater_s = make_window(2, "floater", WindowState::Tiling, None, Some(0.25), None);
-    let fuller_s = make_window(3, "fuller", WindowState::Tiling, None, None, None);
-    let miner_s = make_window(4, "miner", WindowState::Tiling, None, None, None);
+    let tiler_b_s = make_window(
+      5,
+      "tiler_b",
+      WindowState::Tiling,
+      None,
+      Some(0.75),
+      None,
+    );
+    let floater_s = make_window(
+      2,
+      "floater",
+      WindowState::Tiling,
+      None,
+      Some(0.25),
+      None,
+    );
+    let fuller_s =
+      make_window(3, "fuller", WindowState::Tiling, None, None, None);
+    let miner_s =
+      make_window(4, "miner", WindowState::Tiling, None, None, None);
 
     let scrambled = snapshot_from_workspaces(
       vec![(
@@ -1529,7 +1604,10 @@ mod tests {
     let ws = &loaded.monitors[0].workspaces[0];
     assert_eq!(ws.tiling_direction, TilingDirection::Vertical);
     let children = ws.root.children.as_ref().expect("root children");
-    assert_eq!(children[1].tiling_direction, Some(TilingDirection::Horizontal));
+    assert_eq!(
+      children[1].tiling_direction,
+      Some(TilingDirection::Horizontal)
+    );
 
     // Plan after JSON load must still carry directions for attach.
     let matched: std::collections::HashSet<String> =
@@ -1537,10 +1615,14 @@ mod tests {
     let plan = crate::plan_workspace_tiling_layout(ws, &matched);
     assert_eq!(plan.tiling_direction, TilingDirection::Vertical);
     match &plan.children[1] {
-      crate::LayoutPlanNode::Split { tiling_direction, .. } => {
+      crate::LayoutPlanNode::Split {
+        tiling_direction, ..
+      } => {
         assert_eq!(*tiling_direction, TilingDirection::Horizontal);
       }
-      other => panic!("expected split after JSON round-trip, got {other:?}"),
+      other => {
+        panic!("expected split after JSON round-trip, got {other:?}")
+      }
     }
   }
 
@@ -1572,21 +1654,23 @@ mod tests {
       id: None,
     };
 
-    let ws = |name: &str, child: SnapshotNode, dir: TilingDirection| SnapshotWorkspace {
-      name: name.into(),
-      tiling_direction: dir.clone(),
-      child_focus_order: vec![child.local_id.clone()],
-      root: SnapshotNode {
-        local_id: "root".into(),
-        kind: SnapshotNodeKind::Split,
-        tiling_size: None,
-        tiling_direction: Some(dir),
-        children: Some(vec![child]),
-        child_focus_order: None,
-        window: None,
+    let ws = |name: &str, child: SnapshotNode, dir: TilingDirection| {
+      SnapshotWorkspace {
+        name: name.into(),
+        tiling_direction: dir.clone(),
+        child_focus_order: vec![child.local_id.clone()],
+        root: SnapshotNode {
+          local_id: "root".into(),
+          kind: SnapshotNodeKind::Split,
+          tiling_size: None,
+          tiling_direction: Some(dir),
+          children: Some(vec![child]),
+          child_focus_order: None,
+          window: None,
+          id: None,
+        },
         id: None,
-      },
-      id: None,
+      }
     };
 
     let snapshot = LayoutSnapshot {
@@ -1600,18 +1684,36 @@ mod tests {
           hardware_id: Some("HW1".into()),
           device_path: None,
           device_name: "DISPLAY1".into(),
-          bounds: SnapshotBounds { x: 0, y: 0, width: 1920, height: 1080 },
+          bounds: SnapshotBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+          },
           focused_workspace_name: Some("1".into()),
-          workspaces: vec![ws("1", win("n0", "editor"), TilingDirection::Horizontal)],
+          workspaces: vec![ws(
+            "1",
+            win("n0", "editor"),
+            TilingDirection::Horizontal,
+          )],
           id: None,
         },
         SnapshotMonitor {
           hardware_id: Some("HW2".into()),
           device_path: None,
           device_name: "DISPLAY2".into(),
-          bounds: SnapshotBounds { x: 1920, y: 0, width: 1920, height: 1080 },
+          bounds: SnapshotBounds {
+            x: 1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+          },
           focused_workspace_name: Some("2".into()),
-          workspaces: vec![ws("2", win("n0", "browser"), TilingDirection::Vertical)],
+          workspaces: vec![ws(
+            "2",
+            win("n0", "browser"),
+            TilingDirection::Vertical,
+          )],
           id: None,
         },
       ],
@@ -1622,10 +1724,28 @@ mod tests {
     let loaded: LayoutSnapshot = serde_json::from_str(&json).unwrap();
     assert_eq!(loaded.monitors[0].workspaces[0].name, "1");
     assert_eq!(loaded.monitors[1].workspaces[0].name, "2");
-    let p0 = loaded.monitors[0].workspaces[0].root.children.as_ref().unwrap()[0]
-      .window.as_ref().unwrap().identity.process_name.clone();
-    let p1 = loaded.monitors[1].workspaces[0].root.children.as_ref().unwrap()[0]
-      .window.as_ref().unwrap().identity.process_name.clone();
+    let p0 = loaded.monitors[0].workspaces[0]
+      .root
+      .children
+      .as_ref()
+      .unwrap()[0]
+      .window
+      .as_ref()
+      .unwrap()
+      .identity
+      .process_name
+      .clone();
+    let p1 = loaded.monitors[1].workspaces[0]
+      .root
+      .children
+      .as_ref()
+      .unwrap()[0]
+      .window
+      .as_ref()
+      .unwrap()
+      .identity
+      .process_name
+      .clone();
     assert_eq!(p0, "editor");
     assert_eq!(p1, "browser");
 
@@ -1720,10 +1840,7 @@ mod tests {
     assert_eq!(children.len(), 2);
     let left_size = children[0].tiling_size.unwrap();
     let steam_size = children[1].tiling_size.unwrap();
-    assert!(
-      (left_size - 0.458).abs() < 0.002,
-      "left size {left_size}"
-    );
+    assert!((left_size - 0.458).abs() < 0.002, "left size {left_size}");
     assert!(
       (steam_size - 0.542).abs() < 0.002,
       "steam size {steam_size}"
@@ -1731,10 +1848,7 @@ mod tests {
     assert!((left_size + steam_size - 1.0).abs() < 0.001);
 
     // Restore planning must keep ~46/54 when sizes already sum to ~1.
-    let matched = children
-      .iter()
-      .map(|c| c.local_id.clone())
-      .collect();
+    let matched = children.iter().map(|c| c.local_id.clone()).collect();
     let plan = crate::plan_workspace_tiling_layout(
       &snapshot.monitors[0].workspaces[0],
       &matched,
@@ -1894,7 +2008,8 @@ mod tests {
       handle: None,
     };
 
-    let from_rel = resolve_floating_placement(&window, Some(&live)).unwrap();
+    let from_rel =
+      resolve_floating_placement(&window, Some(&live)).unwrap();
     assert_eq!(from_rel, Rect::from_xy(250, 250, 500, 500));
 
     let mut absolute_only = window.clone();
@@ -1989,5 +2104,4 @@ mod tests {
     let json = serde_json::to_string(&snapshot).unwrap();
     assert!(json.contains("floatingPlacementRelative"));
   }
-
 }

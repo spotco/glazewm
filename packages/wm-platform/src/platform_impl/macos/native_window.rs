@@ -397,7 +397,6 @@ impl From<NativeWindow> for crate::NativeWindow {
   }
 }
 
-
 /// macOS has no DWM cloak; no-op for API parity.
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn unhide_all_cloaked_windows(

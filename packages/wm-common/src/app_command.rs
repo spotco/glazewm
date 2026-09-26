@@ -76,17 +76,20 @@ pub enum AppCommand {
     path: PathBuf,
   },
 
-  /// Load a layout snapshot JSON into the running WM (best-effort restore).
+  /// Load a layout snapshot JSON into the running WM (best-effort
+  /// restore).
   ///
   /// Requires an already running instance of the window manager.
-  /// Use `--clipboard` to load JSON previously copied via `copy-layout` / tray.
+  /// Use `--clipboard` to load JSON previously copied via `copy-layout` /
+  /// tray.
   #[clap(name = "load-layout")]
   LoadLayout {
     /// Path to a durable layout snapshot JSON file.
     #[clap(value_hint = clap::ValueHint::FilePath, required_unless_present = "clipboard")]
     path: Option<PathBuf>,
 
-    /// Load durable snapshot JSON from the system clipboard instead of a file.
+    /// Load durable snapshot JSON from the system clipboard instead of a
+    /// file.
     #[clap(long = "clipboard", conflicts_with = "path")]
     clipboard: bool,
   },
@@ -101,7 +104,8 @@ pub enum AppCommand {
     path: PathBuf,
   },
 
-  /// Copy a durable layout snapshot JSON to the system clipboard (CLI-local).
+  /// Copy a durable layout snapshot JSON to the system clipboard
+  /// (CLI-local).
   ///
   /// Requires an already running instance of the window manager.
   /// Same JSON as tray "Copy layout snapshot" / `save-layout`.
@@ -186,8 +190,9 @@ pub enum QueryCommand {
 
   /// Dry-run match a layout snapshot file against live managed windows.
   ///
-  /// Returns matched pairs (with scores), unmatched snapshot/live windows,
-  /// and optional planned workspace moves. Does not mutate WM state.
+  /// Returns matched pairs (with scores), unmatched snapshot/live
+  /// windows, and optional planned workspace moves. Does not mutate WM
+  /// state.
   #[clap(name = "layout-match")]
   LayoutMatch {
     /// Path to a durable layout snapshot JSON file.
@@ -321,7 +326,8 @@ pub enum InvokeCommand {
     name: String,
   },
   WmExit,
-  /// Uncloak DWM-cloaked top-level windows not currently managed (Windows).
+  /// Uncloak DWM-cloaked top-level windows not currently managed
+  /// (Windows).
   WmUncloakNonTracked,
   WmRedraw,
   WmReloadConfig,
@@ -344,11 +350,10 @@ impl<'de> Deserialize<'de> for InvokeCommand {
     // the binary name/path. When deserializing commands from the user
     // config, we therefore have to prepend an additional empty argument.
     let unparsed = String::deserialize(deserializer)?;
-    // Quote-aware split so `load-layout "C:\path with spaces\a.json"` works
-    // in config bindings and IPC `command load-layout ...`.
-    let unparsed_split = crate::ipc_argv_from_message(&unparsed).map_err(|err| {
-      serde::de::Error::custom(err.to_string())
-    })?;
+    // Quote-aware split so `load-layout "C:\path with spaces\a.json"`
+    // works in config bindings and IPC `command load-layout ...`.
+    let unparsed_split = crate::ipc_argv_from_message(&unparsed)
+      .map_err(|err| serde::de::Error::custom(err.to_string()))?;
 
     InvokeCommand::try_parse_from(unparsed_split).map_err(|err| {
       // Format the error message and remove the "error: " prefix.
@@ -549,7 +554,8 @@ mod shell_exec_ipc_tests {
 
   #[test]
   fn invoke_shell_exec_multiple_quoted_args_and_empty() {
-    let command = parse_shell_exec(r#"shell-exec tool "arg one" "" --flag"#);
+    let command =
+      parse_shell_exec(r#"shell-exec tool "arg one" "" --flag"#);
     assert_eq!(
       command,
       vec![
@@ -565,7 +571,8 @@ mod shell_exec_ipc_tests {
   #[test]
   fn invoke_shell_exec_unc_path_round_trip() {
     let unc = r"\\server\share\My Folder\file.ps1";
-    let msg = format!("shell-exec powershell -File {}", crate::quote_ipc_arg(unc));
+    let msg =
+      format!("shell-exec powershell -File {}", crate::quote_ipc_arg(unc));
     let command = parse_shell_exec(&msg);
     assert_eq!(command.last().map(String::as_str), Some(unc));
     let joined = join_ipc_args(&command);

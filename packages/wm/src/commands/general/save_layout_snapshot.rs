@@ -1,5 +1,6 @@
 use std::{
-  fs,
+  fs::{self, File},
+  io::Write,
   path::{Path, PathBuf},
   time::SystemTime,
 };
@@ -65,7 +66,8 @@ pub fn copy_layout_snapshot_to_clipboard(
   Ok(())
 }
 
-/// Save durable layout snapshot via native dialog and also copy to clipboard.
+/// Save durable layout snapshot via native dialog and also copy to
+/// clipboard.
 pub fn save_layout_snapshot_with_dialog(
   state: &WmState,
   dispatcher: &Dispatcher,
@@ -120,10 +122,90 @@ pub fn read_layout_snapshot_file(
 }
 
 pub fn write_snapshot_file(path: &Path, json: &str) -> anyhow::Result<()> {
-  fs::write(path, json)
-    .with_context(|| format!("Failed to write {}", path.display()))?;
+  atomic_write_snapshot_file(path, json.as_bytes())?;
   info!("Saved layout snapshot to {}.", path.display());
   Ok(())
+}
+
+/// Write `contents` via temp+replace so a crash mid-write cannot truncate
+/// the only recovery `layout.json`. Manual Save and autosave both use this
+/// helper.
+///
+/// On Windows, `rename` cannot clobber an existing destination, so the
+/// previous file is moved aside to `*.bak` first. If the final replace
+/// fails, the `.bak` is restored when possible.
+fn atomic_write_snapshot_file(
+  path: &Path,
+  contents: &[u8],
+) -> anyhow::Result<()> {
+  if let Some(parent) = path.parent() {
+    if !parent.as_os_str().is_empty() {
+      fs::create_dir_all(parent).with_context(|| {
+        format!("Failed to create directory {}", parent.display())
+      })?;
+    }
+  }
+
+  let temp_path = sibling_temp_path(path);
+  let bak_path = sibling_bak_path(path);
+
+  {
+    let mut file = File::create(&temp_path).with_context(|| {
+      format!("Failed to create temp snapshot {}", temp_path.display())
+    })?;
+    file.write_all(contents).with_context(|| {
+      format!("Failed to write temp snapshot {}", temp_path.display())
+    })?;
+    file.sync_all().with_context(|| {
+      format!("Failed to sync temp snapshot {}", temp_path.display())
+    })?;
+  }
+
+  // Move existing destination aside (Windows cannot rename over it).
+  if path.exists() {
+    let _ = fs::remove_file(&bak_path);
+    if let Err(err) = fs::rename(path, &bak_path) {
+      // If we cannot retain a .bak, still try a best-effort replace so a
+      // successful write is not blocked by a stubborn previous file.
+      tracing::warn!(
+        "Could not retain previous snapshot as {}: {err:#}; removing destination",
+        bak_path.display()
+      );
+      fs::remove_file(path).with_context(|| {
+        format!("Failed to remove previous snapshot {}", path.display())
+      })?;
+    }
+  }
+
+  match fs::rename(&temp_path, path) {
+    Ok(()) => Ok(()),
+    Err(err) => {
+      // Prefer restoring the previous file over leaving neither.
+      if bak_path.exists() {
+        let _ = fs::rename(&bak_path, path);
+      }
+      let _ = fs::remove_file(&temp_path);
+      Err(err).with_context(|| {
+        format!(
+          "Failed to replace snapshot {} with temp {}",
+          path.display(),
+          temp_path.display()
+        )
+      })
+    }
+  }
+}
+
+fn sibling_temp_path(path: &Path) -> PathBuf {
+  let mut os = path.as_os_str().to_owned();
+  os.push(".tmp");
+  PathBuf::from(os)
+}
+
+fn sibling_bak_path(path: &Path) -> PathBuf {
+  let mut os = path.as_os_str().to_owned();
+  os.push(".bak");
+  PathBuf::from(os)
 }
 
 fn set_clipboard_text(text: &str) -> anyhow::Result<()> {
@@ -137,15 +219,10 @@ fn set_clipboard_text(text: &str) -> anyhow::Result<()> {
 
 fn default_layout_filename() -> String {
   let rfc = format_system_time_rfc3339(SystemTime::now());
-  let digits: String =
-    rfc.chars().filter(char::is_ascii_digit).collect();
+  let digits: String = rfc.chars().filter(char::is_ascii_digit).collect();
   // RFC3339 UTC → at least YYYYMMDDHHMMSS
   if digits.len() >= 14 {
-    format!(
-      "glazewm-layout-{}-{}.json",
-      &digits[0..8],
-      &digits[8..14]
-    )
+    format!("glazewm-layout-{}-{}.json", &digits[0..8], &digits[8..14])
   } else {
     "glazewm-layout.json".to_string()
   }
@@ -185,19 +262,69 @@ fn snapshot_from_native_window(
 
 #[cfg(test)]
 mod tests {
-  use super::read_layout_snapshot_file;
+  use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+  };
+
+  use super::{
+    atomic_write_snapshot_file, read_layout_snapshot_file,
+    sibling_bak_path, sibling_temp_path,
+  };
+
+  fn temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+      "glazewm-{prefix}-{}-{}",
+      std::process::id(),
+      nanos
+    ));
+    let _ = fs::create_dir_all(&dir);
+    dir
+  }
+
+  #[test]
+  fn atomic_write_creates_file_and_is_readable() {
+    let dir = temp_dir("atomic-write");
+    let path = dir.join("layout.json");
+    atomic_write_snapshot_file(&path, br#"{"ok":true}"#).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"ok":true}"#);
+    assert!(!sibling_temp_path(&path).exists());
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn atomic_write_replaces_existing_and_keeps_bak() {
+    let dir = temp_dir("atomic-bak");
+    let path = dir.join("layout.json");
+    fs::write(&path, b"old").unwrap();
+    atomic_write_snapshot_file(&path, b"new-content").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "new-content");
+    let bak = sibling_bak_path(&path);
+    assert!(bak.exists(), "previous content should be retained as .bak");
+    assert_eq!(fs::read_to_string(&bak).unwrap(), "old");
+    let _ = fs::remove_dir_all(&dir);
+  }
 
   #[test]
   fn rejects_invalid_json_without_returning_snapshot() {
-    let dir = tempfile_dir();
+    let dir = temp_dir("layout-bad");
     let path = dir.join("bad.json");
-    std::fs::write(&path, "{not json").unwrap();
+    fs::write(&path, "{not json").unwrap();
     assert!(read_layout_snapshot_file(&path).is_err());
+    let _ = fs::remove_dir_all(&dir);
   }
 
   #[test]
   fn rejects_unsupported_version_at_load_gate() {
-    use wm_common::{validate_layout_snapshot_version, LayoutSnapshot, LAYOUT_SNAPSHOT_VERSION};
+    use wm_common::{
+      validate_layout_snapshot_version, LayoutSnapshot,
+      LAYOUT_SNAPSHOT_VERSION,
+    };
     let snap = LayoutSnapshot {
       version: LAYOUT_SNAPSHOT_VERSION + 1,
       captured_at: "t".into(),
@@ -208,14 +335,5 @@ mod tests {
       ignored_windows: vec![],
     };
     assert!(validate_layout_snapshot_version(&snap).is_err());
-  }
-
-  fn tempfile_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-      "glazewm-layout-test-{}",
-      std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
   }
 }

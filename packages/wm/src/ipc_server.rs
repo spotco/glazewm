@@ -12,13 +12,13 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{info, warn};
 use uuid::Uuid;
 use wm_common::{
-  AppCommand, AppMetadataData, BindingModesData, ClientResponseData,
-  ClientResponseMessage, CommandData, EventSubscribeData,
-  EventSubscriptionMessage, FocusedData, IgnoredWindowsData,
-  LayoutSnapshot, LoadLayoutData, MonitorsData, QueryCommand,
-  ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
+  format_system_time_rfc3339, AppCommand, AppMetadataData,
+  BindingModesData, ClientResponseData, ClientResponseMessage,
+  CommandData, EventSubscribeData, EventSubscriptionMessage, FocusedData,
+  IgnoredWindowsData, LayoutSnapshot, LoadLayoutData, MonitorsData,
+  QueryCommand, ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
   SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
-  WorkspacesData, format_system_time_rfc3339,
+  WorkspacesData,
 };
 use wm_platform::Dispatcher;
 
@@ -33,11 +33,13 @@ use crate::{
 };
 
 pub struct IpcServer {
-  /// Accept-loop task. Prefer joining on shutdown so TcpListener Drop runs
-  /// synchronously before process exit (abort races Drop and can ghost ports).
+  /// Accept-loop task. Prefer joining on shutdown so TcpListener Drop
+  /// runs synchronously before process exit (abort races Drop and can
+  /// ghost ports).
   join_handle: Option<task::JoinHandle<()>>,
   /// Graceful accept-loop stop; dropping the listener closes the TCP port
-  /// before process exit (abort alone is async and can leave ghost sockets).
+  /// before process exit (abort alone is async and can leave ghost
+  /// sockets).
   shutdown_tx: Option<oneshot::Sender<()>>,
   pub message_rx: mpsc::UnboundedReceiver<(
     String,
@@ -326,7 +328,9 @@ impl IpcServer {
       },
       AppCommand::LoadLayout { path, clipboard } => {
         if clipboard || path.is_none() {
-          bail!("load-layout --clipboard is handled by glazewm-cli locally.");
+          bail!(
+            "load-layout --clipboard is handled by glazewm-cli locally."
+          );
         }
         let path = path.expect("path required without --clipboard");
         let snapshot = read_layout_snapshot_file(&path)?;
@@ -368,7 +372,9 @@ impl IpcServer {
       }
       AppCommand::SaveLayout { .. } | AppCommand::CopyLayout => {
         // CLI handles durable write / clipboard after `query layout`.
-        bail!("save-layout/copy-layout are handled by glazewm-cli locally.")
+        bail!(
+          "save-layout/copy-layout are handled by glazewm-cli locally."
+        )
       }
       AppCommand::Command {
         subject_container_id,
@@ -536,9 +542,10 @@ impl IpcServer {
 
   /// Stop the accept loop and wait until the TcpListener is dropped.
   ///
-  /// On Windows, process exit / TerminateProcess before the listen socket is
-  /// closed can leave a ghost LISTENING entry (netstat PID with no process).
-  /// Soft wm-exit must always take this path; taskkill /F cannot free ghosts.
+  /// On Windows, process exit / TerminateProcess before the listen socket
+  /// is closed can leave a ghost LISTENING entry (netstat PID with no
+  /// process). Soft wm-exit must always take this path; taskkill /F
+  /// cannot free ghosts.
   pub async fn stop_and_wait(&mut self) {
     let started = std::time::Instant::now();
     crate::commands::general::layout_debug_log(
@@ -553,8 +560,11 @@ impl IpcServer {
       return;
     };
     let abort = handle.abort_handle();
-    match tokio::time::timeout(std::time::Duration::from_millis(750), handle)
-      .await
+    match tokio::time::timeout(
+      std::time::Duration::from_millis(750),
+      handle,
+    )
+    .await
     {
       Ok(Ok(())) => {
         info!("IPC accept loop joined; TcpListener dropped.");

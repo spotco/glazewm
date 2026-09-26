@@ -9,21 +9,20 @@ use crate::{
 pub const DEFAULT_IPC_PORT: u32 = 6123;
 
 /// File name written beside the user config when the WM falls back off the
-/// preferred IPC port (ghost socket / AddrInUse). CLI and `ipc_port()` read it.
+/// preferred IPC port (ghost socket / AddrInUse). CLI and `ipc_port()`
+/// read it.
 pub const IPC_PORT_FILE_NAME: &str = "ipc.port";
 
 fn glazewm_config_dir() -> Option<std::path::PathBuf> {
   #[cfg(target_os = "windows")]
   {
-    std::env::var_os("USERPROFILE").map(|h| {
-      std::path::PathBuf::from(h).join(".glzr").join("glazewm")
-    })
+    std::env::var_os("USERPROFILE")
+      .map(|h| std::path::PathBuf::from(h).join(".glzr").join("glazewm"))
   }
   #[cfg(not(target_os = "windows"))]
   {
-    std::env::var_os("HOME").map(|h| {
-      std::path::PathBuf::from(h).join(".glzr").join("glazewm")
-    })
+    std::env::var_os("HOME")
+      .map(|h| std::path::PathBuf::from(h).join(".glzr").join("glazewm"))
   }
 }
 
@@ -52,7 +51,8 @@ pub fn preferred_bind_port() -> u32 {
   DEFAULT_IPC_PORT
 }
 
-/// Resolve IPC port for **clients**: `GLAZEWM_IPC_PORT` env, else `ipc.port` file, else default.
+/// Resolve IPC port for **clients**: `GLAZEWM_IPC_PORT` env, else
+/// `ipc.port` file, else default.
 #[must_use]
 pub fn ipc_port() -> u32 {
   if let Ok(s) = std::env::var("GLAZEWM_IPC_PORT") {
@@ -86,7 +86,8 @@ pub fn write_ipc_port_file(port: u32) -> std::io::Result<()> {
   std::fs::write(&path, format!("{port}\n"))
 }
 
-/// Remove a stale fallback port file (call after binding the default port).
+/// Remove a stale fallback port file (call after binding the default
+/// port).
 pub fn clear_ipc_port_file() {
   if let Some(path) = ipc_port_file_path() {
     let _ = std::fs::remove_file(path);
@@ -113,8 +114,8 @@ pub struct ClientResponseMessage {
 #[serde(untagged)]
 pub enum ClientResponseData {
   AppMetadata(AppMetadataData),
-  // Layout before BindingModes: both have indingModes; empty array would
-  // otherwise deserialize as BindingModes and drop the snapshot.
+  // Layout before BindingModes: both have indingModes; empty array
+  // would otherwise deserialize as BindingModes and drop the snapshot.
   Layout(LayoutSnapshot),
   LayoutMatch(LayoutMatchReport),
   LoadLayout(LoadLayoutData),

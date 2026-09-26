@@ -32,7 +32,8 @@ use crate::{
 /// Debounce quiet period before writing `layout.json`.
 pub const LAYOUT_AUTO_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// File name written beside the user config (`config.yaml` → `layout.json`).
+/// File name written beside the user config (`config.yaml` →
+/// `layout.json`).
 pub const LAYOUT_SNAPSHOT_FILE_NAME: &str = "layout.json";
 
 /// Debug log beside the snapshot (`config.yaml` → `layout.log`).
@@ -41,7 +42,8 @@ pub const LAYOUT_DEBUG_LOG_FILE_NAME: &str = "layout.log";
 /// Soft size cap before rotating `layout.log` (keep a `.1` backup).
 const LAYOUT_DEBUG_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Process-wide path for layout persistence debug logging (set at startup).
+/// Process-wide path for layout persistence debug logging (set at
+/// startup).
 static LAYOUT_DEBUG_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Resolve `layout.json` next to the active config file (same directory
@@ -51,7 +53,9 @@ pub fn layout_snapshot_path(config: &UserConfig) -> PathBuf {
 }
 
 /// Pure path join used by [`layout_snapshot_path`] (unit-tested).
-pub fn layout_snapshot_path_from_config_path(config_path: &Path) -> PathBuf {
+pub fn layout_snapshot_path_from_config_path(
+  config_path: &Path,
+) -> PathBuf {
   config_path.with_file_name(LAYOUT_SNAPSHOT_FILE_NAME)
 }
 
@@ -61,7 +65,9 @@ pub fn layout_debug_log_path(config: &UserConfig) -> PathBuf {
 }
 
 /// Pure path join for the layout debug log (unit-tested).
-pub fn layout_debug_log_path_from_config_path(config_path: &Path) -> PathBuf {
+pub fn layout_debug_log_path_from_config_path(
+  config_path: &Path,
+) -> PathBuf {
   config_path.with_file_name(LAYOUT_DEBUG_LOG_FILE_NAME)
 }
 
@@ -93,7 +99,8 @@ pub fn wm_event_kind_name(event: &WmEvent) -> &'static str {
   }
 }
 
-/// Append a high-signal line to `layout.log` (and optionally mirror via tracing).
+/// Append a high-signal line to `layout.log` (and optionally mirror via
+/// tracing).
 ///
 /// Never fatal: I/O failures are swallowed after a single `warn!`.
 pub fn layout_debug_log(message: impl AsRef<str>) {
@@ -116,7 +123,10 @@ pub fn layout_debug_log(message: impl AsRef<str>) {
   }
 }
 
-fn append_layout_debug_line(path: &Path, message: &str) -> anyhow::Result<()> {
+fn append_layout_debug_line(
+  path: &Path,
+  message: &str,
+) -> anyhow::Result<()> {
   if let Some(parent) = path.parent() {
     fs::create_dir_all(parent).with_context(|| {
       format!("Unable to create directory {}.", parent.display())
@@ -133,11 +143,12 @@ fn append_layout_debug_line(path: &Path, message: &str) -> anyhow::Result<()> {
   }
 
   let ts = format_system_time_rfc3339(SystemTime::now());
-  let mut file = OpenOptions::new()
-    .create(true)
-    .append(true)
-    .open(path)
-    .with_context(|| format!("Unable to open {}.", path.display()))?;
+  let mut file =
+    OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(path)
+      .with_context(|| format!("Unable to open {}.", path.display()))?;
   writeln!(file, "[{ts}] {message}")
     .with_context(|| format!("Unable to write {}.", path.display()))?;
   Ok(())
@@ -173,7 +184,8 @@ pub struct LayoutAutoSave {
 
 impl LayoutAutoSave {
   pub fn new(path: PathBuf) -> Self {
-    // Far-future sleep placeholder until first arm (never fires while disarmed).
+    // Far-future sleep placeholder until first arm (never fires while
+    // disarmed).
     let far = Instant::now() + Duration::from_secs(60 * 60 * 24 * 365);
     Self {
       path,
@@ -239,7 +251,8 @@ impl LayoutAutoSave {
     }
   }
 
-  /// `true` while a debounced save is pending (for `tokio::select!` guards).
+  /// `true` while a debounced save is pending (for `tokio::select!`
+  /// guards).
   pub fn is_armed(&self) -> bool {
     self.armed
   }
@@ -279,10 +292,8 @@ impl LayoutAutoSave {
         Ok(())
       }
       Err(err) => {
-        let msg = format!(
-          "auto-save failed -> {}: {err:#}",
-          self.path.display()
-        );
+        let msg =
+          format!("auto-save failed -> {}: {err:#}", self.path.display());
         warn!("{msg}");
         layout_debug_log(&msg);
         Err(err)
@@ -405,12 +416,14 @@ pub fn try_load_persisted_layout_snapshot(
 
 #[cfg(test)]
 mod tests {
-  use super::*;
   use std::path::PathBuf;
+
+  use super::*;
 
   #[test]
   fn layout_path_joins_beside_config_yaml() {
-    let config = PathBuf::from(r"C:\Users\example\.glzr\glazewm\config.yaml");
+    let config =
+      PathBuf::from(r"C:\Users\example\.glzr\glazewm\config.yaml");
     assert_eq!(
       layout_snapshot_path_from_config_path(&config),
       PathBuf::from(r"C:\Users\example\.glzr\glazewm\layout.json")
@@ -428,7 +441,8 @@ mod tests {
 
   #[test]
   fn layout_debug_log_path_joins_beside_config() {
-    let config = PathBuf::from(r"C:\Users\example\.glzr\glazewm\config.yaml");
+    let config =
+      PathBuf::from(r"C:\Users\example\.glzr\glazewm\config.yaml");
     assert_eq!(
       layout_debug_log_path_from_config_path(&config),
       PathBuf::from(r"C:\Users\example\.glzr\glazewm\layout.log")
@@ -463,6 +477,33 @@ mod tests {
   }
 
   #[test]
+  fn auto_save_armed_flag_is_exit_flush_gate() {
+    // Clean exit (main.rs) flushes when is_armed() is true. Re-enable
+    // clears a pending debounce without writing (startup drain /
+    // disable path).
+    let rt = tokio::runtime::Builder::new_current_thread()
+      .enable_time()
+      .build()
+      .unwrap();
+    rt.block_on(async {
+      let mut auto = LayoutAutoSave::new(PathBuf::from("layout.json"));
+      auto.enable();
+      auto.schedule(&WmEvent::ApplicationExiting);
+      assert!(
+        auto.is_armed(),
+        "pending debounce must be visible to the exit flush gate"
+      );
+      // enable() is what startup uses to reset; it must clear armed
+      // without a WmState write so the exit path remains the only
+      // flush consumer here.
+      auto.enable();
+      assert!(!auto.is_armed());
+      auto.schedule(&WmEvent::ApplicationExiting);
+      assert!(auto.is_armed());
+    });
+  }
+
+  #[test]
   fn non_layout_events_do_not_affect_snapshot_gate() {
     assert!(!wm_event_affects_layout_snapshot(
       &WmEvent::ApplicationExiting
@@ -484,10 +525,8 @@ mod tests {
 
   #[test]
   fn empty_layout_file_trim_gate() {
-    let dir = std::env::temp_dir().join(format!(
-      "glazewm-layout-empty-{}",
-      std::process::id()
-    ));
+    let dir = std::env::temp_dir()
+      .join(format!("glazewm-layout-empty-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("layout.json");
     fs::write(&path, "   \n").unwrap();
@@ -499,10 +538,8 @@ mod tests {
 
   #[test]
   fn layout_debug_log_appends_when_path_set() {
-    let dir = std::env::temp_dir().join(format!(
-      "glazewm-layout-debug-{}",
-      std::process::id()
-    ));
+    let dir = std::env::temp_dir()
+      .join(format!("glazewm-layout-debug-{}", std::process::id()));
     let _ = fs::create_dir_all(&dir);
     let log_path = dir.join("layout.log");
     let _ = fs::remove_file(&log_path);

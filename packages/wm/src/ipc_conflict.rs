@@ -1,22 +1,27 @@
 //! Recovery when the GlazeWM IPC TCP port is already bound.
 //!
-//! On Windows, a crashed / half-dead `glazewm.exe` or `glazewm-watcher.exe`
-//! (or a **ghost** listen socket whose owning PID is already gone) can leave
-//! `127.0.0.1:<port>` in LISTENING state. Startup then fails with
-//! `std::io::ErrorKind::AddrInUse` / WSAEADDRINUSE (10048).
+//! On Windows, a crashed / half-dead `glazewm.exe` or
+//! `glazewm-watcher.exe` (or a **ghost** listen socket whose owning PID is
+//! already gone) can leave `127.0.0.1:<port>` in LISTENING state. Startup
+//! then fails with `std::io::ErrorKind::AddrInUse` / WSAEADDRINUSE
+//! (10048).
 //!
 //! Flow:
-//! 1. Try preferred bind port (`GLAZEWM_IPC_PORT` / 6123) - not `ipc.port`.
-//! 2. On AddrInUse: prompt Kill vs Quit; kill glazewm + watcher + listener PID.
+//! 1. Try preferred bind port (`GLAZEWM_IPC_PORT` / 6123) - not
+//!    `ipc.port`.
+//! 2. On AddrInUse: prompt Kill vs Quit; kill glazewm + watcher + listener
+//!    PID.
 //! 3. Poll bind for ~5s (ghost sockets are not freed by taskkill).
 //! 4. Detect ghost (netstat PID absent from process list) and fall back.
-//! 5. Fallback: try preferred+1.. (skip 6124 = Zebar asset server), then ephemeral; write
-//!    `~/.glzr/glazewm/ipc.port` so CLI/`ipc_port()` find the new port.
+//! 5. Fallback: try preferred+1.. (skip 6124 = Zebar asset server), then
+//!    ephemeral; write `~/.glzr/glazewm/ipc.port` so CLI/`ipc_port()` find
+//!    the new port.
 //!
-//! **Prevention:** soft `wm-exit` must Drop the TcpListener (SO_LINGER=0) via
-//! `IpcServer::stop_and_wait` before process exit. Prefer
-//! `scripts/deploy/start_glazewm.cmd` / deploy soft-exit. `taskkill /F` and
-//! crashes can still leave ghosts — reboot (or wait) is the only cure then.
+//! **Prevention:** soft `wm-exit` must Drop the TcpListener (SO_LINGER=0)
+//! via `IpcServer::stop_and_wait` before process exit. Prefer
+//! `scripts/deploy/start_glazewm.cmd` / deploy soft-exit. `taskkill /F`
+//! and crashes can still leave ghosts — reboot (or wait) is the only cure
+//! then.
 
 use std::{
   io,
@@ -27,9 +32,7 @@ use std::{
 use anyhow::{bail, Context};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
-use wm_common::{
-  preferred_bind_port, write_ipc_port_file,
-};
+use wm_common::{preferred_bind_port, write_ipc_port_file};
 use wm_platform::Dispatcher;
 
 use crate::commands::general::layout_debug_log;
@@ -37,7 +40,8 @@ use crate::commands::general::layout_debug_log;
 /// Max times we ask the user to kill+retry after an AddrInUse failure.
 const MAX_KILL_RETRY_ROUNDS: u32 = 2;
 
-/// After each kill round, keep trying to bind for this long before giving up.
+/// After each kill round, keep trying to bind for this long before giving
+/// up.
 const POST_KILL_POLL: Duration = Duration::from_millis(1500);
 const POST_KILL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -65,8 +69,9 @@ pub fn is_addr_in_use(err: &io::Error) -> bool {
     || msg.contains("Only one usage of each socket address")
 }
 
-/// Bind the IPC listener, offering Kill-existing vs Quit on AddrInUse, then
-/// falling back to alternate ports when a ghost socket cannot be freed.
+/// Bind the IPC listener, offering Kill-existing vs Quit on AddrInUse,
+/// then falling back to alternate ports when a ghost socket cannot be
+/// freed.
 pub async fn bind_ipc_listener(
   dispatcher: &Dispatcher,
 ) -> anyhow::Result<(TcpListener, String)> {
@@ -86,7 +91,8 @@ pub async fn bind_ipc_listener(
           "IPC preferred bind ok on {preferred} in {}ms",
           bind_started.elapsed().as_millis()
         ));
-        return finish_bind(listener, preferred, preferred, kill_rounds).await;
+        return finish_bind(listener, preferred, preferred, kill_rounds)
+          .await;
       }
       Err(err) if is_addr_in_use(&err) => {
         let err_text = format!("{err}");
@@ -100,8 +106,9 @@ pub async fn bind_ipc_listener(
         warn!("{log_line}");
         layout_debug_log(&log_line);
 
-        // Ghost sockets cannot be freed by taskkill — still best-effort kill
-        // watcher/glazewm once, then auto-fallback without blocking on dialog.
+        // Ghost sockets cannot be freed by taskkill — still best-effort
+        // kill watcher/glazewm once, then auto-fallback without
+        // blocking on dialog.
         if ghost {
           layout_debug_log(format!(
             "IPC ghost listener on {preferred}; best-effort kill then auto-fallback (no dialog)"
@@ -109,11 +116,20 @@ pub async fn bind_ipc_listener(
           let report = kill_existing_glazewm_and_free_port(preferred);
           layout_debug_log(format!("IPC ghost cleanup: {report}"));
           // Quick poll in case it was not actually a ghost.
-          if let Some(listener) =
-            poll_bind_port(preferred, Duration::from_millis(250), POST_KILL_POLL_INTERVAL)
-              .await
+          if let Some(listener) = poll_bind_port(
+            preferred,
+            Duration::from_millis(250),
+            POST_KILL_POLL_INTERVAL,
+          )
+          .await
           {
-            return finish_bind(listener, preferred, preferred, kill_rounds).await;
+            return finish_bind(
+              listener,
+              preferred,
+              preferred,
+              kill_rounds,
+            )
+            .await;
           }
           break;
         }
@@ -144,10 +160,8 @@ pub async fn bind_ipc_listener(
            No — Quit (do not start this instance)"
         );
 
-        let kill = dispatcher.show_yes_no_dialog(
-          "GlazeWM — IPC port in use",
-          &prompt,
-        );
+        let kill = dispatcher
+          .show_yes_no_dialog("GlazeWM — IPC port in use", &prompt);
         if !kill {
           let msg = format!(
             "IPC port {preferred} in use; user chose Quit (abort this instance)"
@@ -164,10 +178,14 @@ pub async fn bind_ipc_listener(
         ));
         info!("IPC kill+free-port round {kill_rounds}: {report}");
 
-        // Poll bind for several seconds — OS may release slowly; ghosts never release.
-        if let Some(listener) =
-          poll_bind_port(preferred, POST_KILL_POLL, POST_KILL_POLL_INTERVAL)
-            .await
+        // Poll bind for several seconds — OS may release slowly; ghosts
+        // never release.
+        if let Some(listener) = poll_bind_port(
+          preferred,
+          POST_KILL_POLL,
+          POST_KILL_POLL_INTERVAL,
+        )
+        .await
         {
           return finish_bind(listener, preferred, preferred, kill_rounds)
             .await;
@@ -225,8 +243,9 @@ async fn finish_bind(
   Ok((listener, addr))
 }
 
-/// Ports reserved by sibling glzr.io tools — never steal these for IPC fallback.
-/// Zebar's localhost asset server is hardcoded to 6124 (`asset_server.rs`).
+/// Ports reserved by sibling glzr.io tools — never steal these for IPC
+/// fallback. Zebar's localhost asset server is hardcoded to 6124
+/// (`asset_server.rs`).
 const RESERVED_FALLBACK_PORTS: &[u32] = &[6124];
 
 fn is_reserved_fallback_port(port: u32) -> bool {
@@ -293,22 +312,26 @@ async fn bind_fallback_ports(
 }
 
 async fn try_bind_port(port: u32) -> io::Result<TcpListener> {
-  // Build the listen socket with SO_LINGER=0 so an abortive close on Drop /
-  // process soft-exit releases the port immediately on Windows instead of
-  // leaving a ghost LISTENING entry after taskkill-style deaths when possible.
-  // Soft wm-exit still must Drop the listener (see IpcServer::stop_and_wait);
-  // linger alone cannot fix TerminateProcess ghosts.
+  // Build the listen socket with SO_LINGER=0 so an abortive close on Drop
+  // / process soft-exit releases the port immediately on Windows instead
+  // of leaving a ghost LISTENING entry after taskkill-style deaths when
+  // possible. Soft wm-exit still must Drop the listener (see
+  // IpcServer::stop_and_wait); linger alone cannot fix TerminateProcess
+  // ghosts.
   #[cfg(target_os = "windows")]
   {
     use std::net::SocketAddr;
+
     use socket2::{Domain, Protocol, Socket, Type};
 
     let addr: SocketAddr = format!("127.0.0.1:{port}")
       .parse()
       .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    // Do NOT enable SO_REUSEADDR on Windows for exclusive IPC — reuse can mask
-    // live conflicts and confuse recovery. Linger=0 for abortive close on Drop.
+    let socket =
+      Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    // Do NOT enable SO_REUSEADDR on Windows for exclusive IPC — reuse can
+    // mask live conflicts and confuse recovery. Linger=0 for abortive
+    // close on Drop.
     socket.set_linger(Some(std::time::Duration::from_secs(0)))?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
@@ -355,7 +378,8 @@ async fn poll_bind_port(
   None
 }
 
-/// True when netstat shows LISTEN on `port` but the PID is not a live process.
+/// True when netstat shows LISTEN on `port` but the PID is not a live
+/// process.
 #[must_use]
 pub fn port_has_ghost_listener(port: u32) -> bool {
   #[cfg(target_os = "windows")]
@@ -372,11 +396,11 @@ pub fn port_has_ghost_listener(port: u32) -> bool {
   }
 }
 
-
 #[cfg(target_os = "windows")]
 fn hidden_command(program: &str) -> Command {
   use std::os::windows::process::CommandExt;
-  // CREATE_NO_WINDOW: prevent blank console flashes for tasklist/netstat/taskkill.
+  // CREATE_NO_WINDOW: prevent blank console flashes for
+  // tasklist/netstat/taskkill.
   const CREATE_NO_WINDOW: u32 = 0x0800_0000;
   let mut cmd = Command::new(program);
   cmd.creation_flags(CREATE_NO_WINDOW);
@@ -399,14 +423,59 @@ fn process_exists(pid: u32) -> bool {
       continue;
     }
     // CSV line containing the PID means the process is alive.
-    if line.contains(&format!("\"{pid}\"")) || line.split(',').nth(1).map(|s| s.trim_matches('"') == pid.to_string()).unwrap_or(false) {
+    if line.contains(&format!("\"{pid}\""))
+      || line
+        .split(',')
+        .nth(1)
+        .map(|s| s.trim_matches('"') == pid.to_string())
+        .unwrap_or(false)
+    {
       return true;
     }
   }
   false
 }
 
-/// Best-effort: terminate other GlazeWM processes and the IPC listener PID.
+/// True when `image` is a GlazeWM main or watcher executable name.
+fn is_glazewm_image_name(image: &str) -> bool {
+  let lower = image.to_ascii_lowercase();
+  // Accept bare names and full paths; compare file name component only.
+  let name = std::path::Path::new(&lower)
+    .file_name()
+    .and_then(|s| s.to_str())
+    .unwrap_or(lower.as_str());
+  matches!(
+    name,
+    "glazewm.exe" | "glazewm-watcher.exe" | "glazewm" | "glazewm-watcher"
+  )
+}
+
+/// Best-effort image name for `pid` via `tasklist` CSV (Windows).
+#[cfg(target_os = "windows")]
+fn image_name_for_pid(pid: u32) -> Option<String> {
+  let output = hidden_command("tasklist")
+    .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+    .output()
+    .ok()?;
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  for line in stdout.lines() {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with("INFO:") {
+      continue;
+    }
+    // CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
+    let mut fields = line.split(',');
+    let image = fields.next()?.trim().trim_matches('"');
+    let pid_field = fields.next()?.trim().trim_matches('"');
+    if pid_field == pid.to_string() && !image.is_empty() {
+      return Some(image.to_string());
+    }
+  }
+  None
+}
+
+/// Best-effort: terminate other GlazeWM processes and the IPC listener
+/// PID.
 #[must_use]
 pub fn kill_existing_glazewm_and_free_port(port: u32) -> String {
   let self_pid = std::process::id();
@@ -415,10 +484,8 @@ pub fn kill_existing_glazewm_and_free_port(port: u32) -> String {
   #[cfg(target_os = "windows")]
   {
     // Watcher first — it may restart glazewm if we kill glazewm alone.
-    let killed_named = kill_named_others(
-      self_pid,
-      &["glazewm-watcher.exe", "glazewm.exe"],
-    );
+    let killed_named =
+      kill_named_others(self_pid, &["glazewm-watcher.exe", "glazewm.exe"]);
     notes.push(killed_named);
 
     match listener_pids_on_port(port) {
@@ -442,20 +509,39 @@ pub fn kill_existing_glazewm_and_free_port(port: u32) -> String {
             ));
             continue;
           }
+          // Only taskkill when the listener is positively GlazeWM /
+          // watcher. An unrelated process bound to the port must
+          // not be killed; fallback ports already exist for that
+          // case.
+          let image = image_name_for_pid(pid).unwrap_or_default();
+          if !is_glazewm_image_name(&image) {
+            let label = if image.is_empty() {
+              "<unknown>".to_string()
+            } else {
+              image.clone()
+            };
+            notes.push(format!(
+              "IPC listener PID {pid} on port {port} is '{label}' (not glazewm/glazewm-watcher); not killing — will fall back"
+            ));
+            tracing::warn!(
+              "IPC port {port} owned by non-GlazeWM process PID {pid} ({label}); skipping taskkill"
+            );
+            continue;
+          }
           match taskkill_pid(pid) {
             Ok(true) => {
               notes.push(format!(
-                "killed IPC listener PID {pid} on port {port}"
+                "killed IPC listener PID {pid} ({image}) on port {port}"
               ));
             }
             Ok(false) => {
               notes.push(format!(
-                "IPC listener PID {pid} on port {port} not found after kill attempt"
+                "IPC listener PID {pid} ({image}) on port {port} not found after kill attempt"
               ));
             }
             Err(err) => {
               notes.push(format!(
-                "failed to kill IPC listener PID {pid} on port {port}: {err}"
+                "failed to kill IPC listener PID {pid} ({image}) on port {port}: {err}"
               ));
             }
           }
@@ -516,13 +602,11 @@ fn kill_named_others(self_pid: u32, names: &[&str]) -> String {
         for pid in others {
           match taskkill_pid(pid) {
             Ok(true) => parts.push(format!("killed {name} PID {pid}")),
-            Ok(false) => parts.push(format!(
-              "{name} PID {pid} already gone / unkillable"
-            )),
+            Ok(false) => parts
+              .push(format!("{name} PID {pid} already gone / unkillable")),
             Err(err) => {
-              parts.push(format!(
-                "failed killing {name} PID {pid}: {err}"
-              ));
+              parts
+                .push(format!("failed killing {name} PID {pid}: {err}"));
             }
           }
         }
@@ -603,7 +687,8 @@ fn taskkill_pid(pid: u32) -> anyhow::Result<bool> {
   )
 }
 
-/// PIDs shown by `netstat -ano` as LISTENING on 127.0.0.1:`port` (or 0.0.0.0).
+/// PIDs shown by `netstat -ano` as LISTENING on 127.0.0.1:`port` (or
+/// 0.0.0.0).
 #[cfg(target_os = "windows")]
 fn listener_pids_on_port(port: u32) -> anyhow::Result<Vec<u32>> {
   let output = hidden_command("netstat")
@@ -642,8 +727,9 @@ fn listener_pids_on_port(port: u32) -> anyhow::Result<Vec<u32>> {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
   use std::io::{Error, ErrorKind};
+
+  use super::*;
 
   #[test]
   fn detects_addr_in_use_kind() {
@@ -664,5 +750,18 @@ mod tests {
   fn ignores_unrelated_errors() {
     let err = Error::new(ErrorKind::ConnectionRefused, "nope");
     assert!(!is_addr_in_use(&err));
+  }
+
+  #[test]
+  fn glazewm_image_names_are_recognized() {
+    assert!(is_glazewm_image_name("glazewm.exe"));
+    assert!(is_glazewm_image_name("GlazeWM.exe"));
+    assert!(is_glazewm_image_name("glazewm-watcher.exe"));
+    assert!(is_glazewm_image_name(
+      r"C:\Program Files\glzr.io\GlazeWM\glazewm.exe"
+    ));
+    assert!(!is_glazewm_image_name("firefox.exe"));
+    assert!(!is_glazewm_image_name(""));
+    assert!(!is_glazewm_image_name("not-glazewm.exe"));
   }
 }

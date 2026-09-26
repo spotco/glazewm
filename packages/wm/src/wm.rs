@@ -629,8 +629,12 @@ impl WindowManager {
       InvokeCommand::ShellExec {
         hide_window,
         command,
-      } => // Re-quote after split_ipc_args so paths with spaces stay one arg for ShellExec.
-        shell_exec(&wm_common::join_ipc_args(command), *hide_window, state),
+      } =>
+      // Re-quote after split_ipc_args so paths with spaces stay one arg
+      // for ShellExec.
+      {
+        shell_exec(&wm_common::join_ipc_args(command), *hide_window, state)
+      }
       InvokeCommand::Size(args) => {
         match subject_container.as_window_container() {
           Ok(window) => set_window_size(
@@ -782,9 +786,7 @@ impl WindowManager {
               crate::commands::general::layout_debug_log(msg);
             }
             Err(err) => {
-              let msg = format!(
-                "wm-uncloak-non-tracked: failed: {err:?}"
-              );
+              let msg = format!("wm-uncloak-non-tracked: failed: {err:?}");
               tracing::warn!("{msg}");
               crate::commands::general::layout_debug_log(msg);
             }
@@ -808,11 +810,10 @@ impl WindowManager {
         Ok(())
       }
       InvokeCommand::LoadLayout { path } => {
-        let snapshot = crate::commands::general::read_layout_snapshot_file(path)?;
+        let snapshot =
+          crate::commands::general::read_layout_snapshot_file(path)?;
         let _summary = crate::commands::general::load_layout_snapshot(
-          &snapshot,
-          state,
-          config,
+          &snapshot, state, config,
         )?;
         Ok(())
       }
@@ -859,9 +860,10 @@ impl WindowManager {
       }
     }
 
-    // Drop the IPC TcpListener before process exit so Windows does not leave
-    // a ghost LISTENING socket. Also stop the watcher so it does not restart us.
-    // Prefer stop_and_wait from main; this sync stop is a safety net for Drop.
+    // Drop the IPC TcpListener before process exit so Windows does not
+    // leave a ghost LISTENING socket. Also stop the watcher so it does
+    // not restart us. Prefer stop_and_wait from main; this sync stop
+    // is a safety net for Drop.
     ipc_server.stop();
     let watcher_report = crate::ipc_conflict::kill_watcher_on_exit();
     tracing::info!("Exit watcher cleanup: {watcher_report}");
@@ -870,7 +872,8 @@ impl WindowManager {
     ));
   }
 
-  /// Best-effort uncloak/show of all managed windows (Windows cloak hide_method).
+  /// Best-effort uncloak/show of all managed windows (Windows cloak
+  /// hide_method).
   fn restore_visibility_on_exit(&self, config: &UserConfig) {
     let cloak = config.value.general.hide_method == HideMethod::Cloak;
     let mut restored = 0usize;

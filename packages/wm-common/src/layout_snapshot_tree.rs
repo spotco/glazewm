@@ -7,11 +7,12 @@
 use std::collections::HashSet;
 
 use crate::{
-  SnapshotNode, SnapshotNodeKind, SnapshotWorkspace, SnapshotWindow,
+  SnapshotNode, SnapshotNodeKind, SnapshotWindow, SnapshotWorkspace,
   TilingDirection, WindowState,
 };
 
-/// A window leaf skipped while planning (missing live match or non-tiling).
+/// A window leaf skipped while planning (missing live match or
+/// non-tiling).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkippedSnapshotLeaf {
   pub local_id: String,
@@ -23,7 +24,8 @@ pub struct SkippedSnapshotLeaf {
 pub enum SkipReason {
   /// Snapshot leaf had no live window match.
   MissingLiveMatch,
-  /// Non-tiling windows are restored via state/floating paths, not the tree.
+  /// Non-tiling windows are restored via state/floating paths, not the
+  /// tree.
   NonTiling,
 }
 
@@ -57,9 +59,8 @@ impl LayoutPlanNode {
   #[must_use]
   pub fn tiling_size(&self) -> f32 {
     match self {
-      Self::Window { tiling_size, .. } | Self::Split { tiling_size, .. } => {
-        *tiling_size
-      }
+      Self::Window { tiling_size, .. }
+      | Self::Split { tiling_size, .. } => *tiling_size,
     }
   }
 
@@ -122,21 +123,18 @@ impl WorkspaceLayoutPlan {
 
 /// Build a tiling restore plan for `workspace`.
 ///
-/// `matched_tiling_local_ids` must contain only snapshot window `local_id`s
-/// that (1) matched a live window and (2) are `WindowState::Tiling` in the
-/// snapshot. Missing ids are skipped; relative structure among survivors is
-/// preserved and sibling sizes are renormalized to sum to 1.
+/// `matched_tiling_local_ids` must contain only snapshot window
+/// `local_id`s that (1) matched a live window and (2) are
+/// `WindowState::Tiling` in the snapshot. Missing ids are skipped;
+/// relative structure among survivors is preserved and sibling sizes are
+/// renormalized to sum to 1.
 #[must_use]
 pub fn plan_workspace_tiling_layout(
   workspace: &SnapshotWorkspace,
   matched_tiling_local_ids: &HashSet<String>,
 ) -> WorkspaceLayoutPlan {
   let mut skipped = Vec::new();
-  let root_children = workspace
-    .root
-    .children
-    .as_deref()
-    .unwrap_or(&[]);
+  let root_children = workspace.root.children.as_deref().unwrap_or(&[]);
 
   let mut children = Vec::new();
   for child in root_children {
@@ -302,7 +300,9 @@ fn filter_focus_order(
 
   let mut ordered: Vec<String> = focus_order
     .iter()
-    .filter(|id| child_ids.contains(id.as_str()) && surviving.contains(*id))
+    .filter(|id| {
+      child_ids.contains(id.as_str()) && surviving.contains(*id)
+    })
     .cloned()
     .collect();
 
@@ -315,7 +315,8 @@ fn filter_focus_order(
   ordered
 }
 
-/// Convenience: process names of tiling leaves under a snapshot node (DFS).
+/// Convenience: process names of tiling leaves under a snapshot node
+/// (DFS).
 #[must_use]
 pub fn snapshot_tiling_process_names(node: &SnapshotNode) -> Vec<String> {
   let mut out = Vec::new();
@@ -349,11 +350,10 @@ fn walk_tiling_windows(
 
 #[cfg(test)]
 mod tests {
-  use super::*;
-  use crate::{
-    SnapshotWindowIdentity, LAYOUT_SNAPSHOT_VERSION,
-  };
   use wm_platform::Rect;
+
+  use super::*;
+  use crate::{SnapshotWindowIdentity, LAYOUT_SNAPSHOT_VERSION};
 
   fn tiling_window(local_id: &str, name: &str, size: f32) -> SnapshotNode {
     SnapshotNode {
@@ -406,7 +406,9 @@ mod tests {
       tiling_size: Some(size),
       tiling_direction: Some(direction),
       children: Some(children),
-      child_focus_order: Some(focus.into_iter().map(str::to_string).collect()),
+      child_focus_order: Some(
+        focus.into_iter().map(str::to_string).collect(),
+      ),
       window: None,
       id: None,
     }
@@ -593,7 +595,10 @@ mod tests {
       ["n1", "n3"].into_iter().map(str::to_string).collect();
     let plan = plan_workspace_tiling_layout(&ws, &matched);
 
-    assert_eq!(plan.window_local_ids(), vec!["n1".to_string(), "n3".to_string()]);
+    assert_eq!(
+      plan.window_local_ids(),
+      vec!["n1".to_string(), "n3".to_string()]
+    );
     assert!(plan.skipped.iter().any(|s| {
       s.local_id == "n2" && s.reason == SkipReason::NonTiling
     }));
@@ -634,10 +639,12 @@ mod tests {
     assert!((plan.children[1].tiling_size() - 0.7).abs() < 1e-5);
   }
 
-  /// Collect split directions in DFS attach order (workspace children first,
-  /// then nested). Mirrors what `attach_plan_nodes` walks when creating
-  /// `SplitContainer`s during load.
-  fn collect_split_directions(nodes: &[LayoutPlanNode]) -> Vec<TilingDirection> {
+  /// Collect split directions in DFS attach order (workspace children
+  /// first, then nested). Mirrors what `attach_plan_nodes` walks when
+  /// creating `SplitContainer`s during load.
+  fn collect_split_directions(
+    nodes: &[LayoutPlanNode],
+  ) -> Vec<TilingDirection> {
     let mut out = Vec::new();
     for node in nodes {
       if let LayoutPlanNode::Split {
@@ -702,8 +709,10 @@ mod tests {
   }
 
   #[test]
-  fn plan_preserves_nested_horizontal_then_vertical_directions_for_attach() {
-    // Explicit H-then-V direction list that load's SplitContainer::new walks.
+  fn plan_preserves_nested_horizontal_then_vertical_directions_for_attach()
+  {
+    // Explicit H-then-V direction list that load's SplitContainer::new
+    // walks.
     let ws = workspace_with_root(
       "1",
       TilingDirection::Horizontal,
@@ -734,7 +743,8 @@ mod tests {
 
   #[test]
   fn plans_keep_windows_on_their_snapshot_workspaces() {
-    // Two workspaces; matched tiling ids per workspace must not cross-contaminate.
+    // Two workspaces; matched tiling ids per workspace must not
+    // cross-contaminate.
     let ws1 = workspace_with_root(
       "1",
       TilingDirection::Horizontal,
@@ -754,8 +764,8 @@ mod tests {
       vec!["b1", "b2"],
     );
 
-    // Best-effort across workspaces: ws1 keeps both tiling leaves; ws2 keeps browser,
-    // drops floating chat from the tiling plan.
+    // Best-effort across workspaces: ws1 keeps both tiling leaves; ws2
+    // keeps browser, drops floating chat from the tiling plan.
     let plan1 = plan_workspace_tiling_layout(
       &ws1,
       &["a1", "a2"].into_iter().map(str::to_string).collect(),
@@ -766,7 +776,10 @@ mod tests {
     );
 
     assert_eq!(plan1.workspace_name, "1");
-    assert_eq!(plan1.window_local_ids(), vec!["a1".to_string(), "a2".to_string()]);
+    assert_eq!(
+      plan1.window_local_ids(),
+      vec!["a1".to_string(), "a2".to_string()]
+    );
     assert_eq!(plan1.tiling_direction, TilingDirection::Horizontal);
 
     assert_eq!(plan2.workspace_name, "2");
@@ -779,7 +792,13 @@ mod tests {
       "floating leaf stays out of tiling plan but ws membership is via leaf path"
     );
     // No cross-workspace leakage of local ids.
-    assert!(!plan1.window_local_ids().iter().any(|id| id.starts_with('b')));
-    assert!(!plan2.window_local_ids().iter().any(|id| id.starts_with('a')));
+    assert!(!plan1
+      .window_local_ids()
+      .iter()
+      .any(|id| id.starts_with('b')));
+    assert!(!plan2
+      .window_local_ids()
+      .iter()
+      .any(|id| id.starts_with('a')));
   }
 }
