@@ -169,6 +169,8 @@ pub enum QueryCommand {
   Focused,
   /// Outputs the tiling direction of the focused container.
   TilingDirection,
+  /// Outputs the WM-wide global tiling / stack direction (spotcobuild).
+  GlobalTilingDirection,
   /// Outputs all monitors.
   Monitors,
   /// Outputs all windows.
@@ -213,6 +215,7 @@ pub enum SubscribableEvent {
   MonitorUpdated,
   MonitorRemoved,
   TilingDirectionChanged,
+  GlobalTilingDirectionChanged,
   UserConfigChanged,
   WindowManaged,
   WindowUnmanaged,
@@ -436,6 +439,11 @@ pub struct InvokeMoveCommand {
   #[clap(long)]
   pub direction: Option<Direction>,
 
+  /// Use the inverse of the WM global stack direction for this move only
+  /// (does not flip the stored global flag). Spotcobuild Super+Shift+Ctrl.
+  #[clap(long, group = "opposite_tiling_direction_flag")]
+  pub opposite_tiling_direction: bool,
+
   /// Move window to workspace in specified direction.
   #[clap(long)]
   pub workspace_in_direction: Option<Direction>,
@@ -580,3 +588,6 @@ mod shell_exec_ipc_tests {
     assert_eq!(again, command);
   }
 }
+
+
+

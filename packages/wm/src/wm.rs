@@ -340,9 +340,15 @@ impl WindowManager {
         match subject_container.as_window_container() {
           Ok(window) => {
             if let Some(direction) = &args.direction {
+              let stack_direction = if args.opposite_tiling_direction {
+                state.global_tiling_direction.inverse()
+              } else {
+                state.global_tiling_direction.clone()
+              };
               move_window_in_direction(
                 window.clone(),
                 direction,
+                &stack_direction,
                 state,
                 config,
               )?;

@@ -1,98 +1,63 @@
-use anyhow::Context;
 use wm_common::{TilingDirection, WmEvent};
 
-use super::{flatten_split_container, wrap_in_split_container};
 use crate::{
-  models::{Container, DirectionContainer, SplitContainer, TilingWindow},
-  traits::{CommonGetters, TilingDirectionGetters},
+  models::Container,
   user_config::UserConfig,
   wm_state::WmState,
 };
 
+/// Spotcobuild: flip the WM-wide global_tiling_direction only.
+///
+/// Does not wrap/flatten the focused window or mutate per-split directions.
 pub fn toggle_tiling_direction(
-  container: Container,
+  _container: Container,
   state: &mut WmState,
-  config: &UserConfig,
+  _config: &UserConfig,
 ) -> anyhow::Result<()> {
-  let direction_container = match container {
-    Container::TilingWindow(tiling_window) => {
-      toggle_window_direction(tiling_window, config)
-    }
-    Container::Workspace(workspace) => {
-      workspace
-        .set_tiling_direction(workspace.tiling_direction().inverse());
-
-      Ok(workspace.into())
-    }
-    // Can only toggle tiling direction from a tiling window or workspace.
-    _ => return Ok(()),
-  }?;
-
-  state.emit_event(WmEvent::TilingDirectionChanged {
-    direction_container: direction_container.to_dto()?,
-    new_tiling_direction: direction_container.tiling_direction(),
-  });
-
+  let new_dir = state.global_tiling_direction.inverse();
+  set_global_tiling_direction(state, new_dir);
   Ok(())
 }
 
-fn toggle_window_direction(
-  tiling_window: TilingWindow,
-  config: &UserConfig,
-) -> anyhow::Result<DirectionContainer> {
-  let parent = tiling_window
-    .direction_container()
-    .context("No direction container.")?;
-
-  // If the window is an only child, then either change the tiling
-  // direction of its parent workspace or flatten its parent split
-  // container.
-  if tiling_window.tiling_siblings().count() == 0 {
-    return match parent {
-      DirectionContainer::Workspace(workspace) => {
-        workspace
-          .set_tiling_direction(workspace.tiling_direction().inverse());
-
-        Ok(workspace.into())
-      }
-      DirectionContainer::Split(split_container) => {
-        flatten_split_container(split_container.clone())?;
-
-        tiling_window
-          .direction_container()
-          .context("No direction container.")
-      }
-    };
-  }
-
-  // Create a new split container to wrap the window.
-  let split_container = SplitContainer::new(
-    parent.tiling_direction().inverse(),
-    config.value.gaps.clone(),
-  );
-
-  wrap_in_split_container(
-    &split_container,
-    &parent.into(),
-    &[tiling_window.into()],
-  )?;
-
-  Ok(split_container.into())
-}
-
+/// Spotcobuild: set the WM-wide global_tiling_direction only.
 pub fn set_tiling_direction(
-  container: Container,
+  _container: Container,
   state: &mut WmState,
-  config: &UserConfig,
+  _config: &UserConfig,
   tiling_direction: &TilingDirection,
 ) -> anyhow::Result<()> {
-  let direction_container = container
-    .direction_container()
-    .context("No direction container.")?;
+  if state.global_tiling_direction != *tiling_direction {
+    set_global_tiling_direction(state, tiling_direction.clone());
+  }
+  Ok(())
+}
 
-  if direction_container.tiling_direction() == *tiling_direction {
-    Ok(())
-  } else {
-    toggle_tiling_direction(container, state, config)
+fn set_global_tiling_direction(
+  state: &mut WmState,
+  new_tiling_direction: TilingDirection,
+) {
+  state.global_tiling_direction = new_tiling_direction.clone();
+  state.emit_event(WmEvent::GlobalTilingDirectionChanged {
+    new_tiling_direction,
+  });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use wm_platform::Dispatcher;
+
+  // Lightweight check that inverse toggles Horizontal <-> Vertical on the
+  // enum itself (WmState construction needs a real dispatcher in full tests).
+  #[test]
+  fn tiling_direction_inverse_round_trips() {
+    assert_eq!(
+      TilingDirection::Horizontal.inverse(),
+      TilingDirection::Vertical
+    );
+    assert_eq!(
+      TilingDirection::Vertical.inverse(),
+      TilingDirection::Horizontal
+    );
   }
 }

@@ -9,13 +9,13 @@ Scope: multi-day feature work (WM move semantics + global direction state + Zeba
 
 - [x] Step 0 - Resolve open questions (blocking) — locked 2026-09-26
 - [x] Step 1 - Document current contracts (commands, events, Zebar)
-- [ ] Step 2 - Add WM-global tiling direction state + commands/events/query
-- [ ] Step 3 - Retarget `toggle-tiling-direction` / Super+J to the global flag
-- [ ] Step 4 - Change `move --direction` to insert using global stack direction
-- [ ] Step 5 - Add opposite-direction move command + Super+Shift+Ctrl bindings
-- [ ] Step 6 - Unit tests for move matrices (H/V global × arrow × layouts)
+- [x] Step 2 - Add WM-global tiling direction state + commands/events/query
+- [x] Step 3 - Retarget `toggle-tiling-direction` / Super+J to the global flag
+- [x] Step 4 - Change `move --direction` to insert using global stack direction
+- [x] Step 5 - Add opposite-direction move command + Super+Shift+Ctrl bindings
+- [x] Step 6 - Unit tests for move matrices (H/V global × arrow × layouts)
 - [ ] Step 7 - Zebar: show + toggle global tiling direction
-- [ ] Step 8 - Make live `config.yaml` the spotcobuild sample default
+- [x] Step 8 - Make live `config.yaml` the spotcobuild sample default
 - [ ] Step 9 - Manual smoke on Asus + build/deploy readiness
 
 ## Objective
@@ -181,46 +181,46 @@ Horizontal, or from config — see open questions).
 
 ## Step 2 - Add WM-global tiling direction state + commands/events/query
 
-- [ ] Add `global_tiling_direction` to `WmState` (and optional config default).
-- [ ] Persist `global_tiling_direction` in `layout.json` (LOCKED 2026-09-26) alongside the tree snapshot.
-- [ ] IPC query + event for global direction changes.
-- [ ] Unit tests: default, toggle, set, event payload.
+- [x] Add `global_tiling_direction` to `WmState` (and optional config default).
+- [x] Persist `global_tiling_direction` in `layout.json` (LOCKED 2026-09-26) alongside the tree snapshot.
+- [x] IPC query + event for global direction changes.
+- [x] Unit tests: default, toggle, set, event payload.
 
 ## Step 3 - Retarget Super+J
 
-- [ ] Change `toggle_tiling_direction` / `set_tiling_direction` spotcobuild
+- [x] Change `toggle_tiling_direction` / `set_tiling_direction` spotcobuild
       behavior to flip/set the **global** flag (per Step 0).
-- [ ] Ensure focused-container query either follows global or Zebar switches
+- [x] Ensure focused-container query either follows global or Zebar switches
       to the new field in the same PR.
-- [ ] Update sample/default keybinding comments (`Mod+J - toggle global
+- [x] Update sample/default keybinding comments (`Mod+J - toggle global
       tiling direction`).
 
 ## Step 4 - Global-aware `move --direction`
 
-- [ ] Refactor tiling branch of `move_window_in_direction` to take an
+- [x] Refactor tiling branch of `move_window_in_direction` to take an
       explicit `stack_direction: TilingDirection` argument (from global).
-- [ ] Implement consistent insert/reorder rules covering the user’s
+- [x] Implement consistent insert/reorder rules covering the user’s
       `13/23` → horizontal vs vertical examples.
-- [ ] Keep floating / fullscreen / cross-monitor paths behind clear
+- [x] Keep floating / fullscreen / cross-monitor paths behind clear
       early-returns.
-- [ ] Add debug lines to `layout.log` for move decisions (direction, global,
+- [x] Add debug lines to `layout.log` for move decisions (direction, global,
       before/after brief tree) — helpful for Asus smoke.
 
 ## Step 5 - Opposite stack-direction move + bindings
 
-- [ ] Add CLI/IPC flag or command for opposite (or explicit) stack direction.
-- [ ] Wire Super+Shift+Ctrl+Arrow(+HJKL) in spotcobuild sample + live config.
-- [ ] Confirm no chord collisions with existing
+- [x] Add CLI/IPC flag or command for opposite (or explicit) stack direction.
+- [x] Wire Super+Shift+Ctrl+Arrow(+HJKL) in spotcobuild sample + live config.
+- [x] Confirm no chord collisions with existing
       `lwin+ctrl+shift+f4` (wm-exit) etc.
 
 ## Step 6 - Automated tests
 
-- [ ] Table-driven tests for:
+- [x] Table-driven tests for:
       - global H/V × move L/R/U/D on the `13/23` fixture
       - deeper nested splits (3+ levels)
       - only-child / single-window workspace
       - opposite-flag moves do not mutate stored global
-- [ ] Regression: layout snapshot save/load still round-trips nested
+- [x] Regression: layout snapshot save/load still round-trips nested
       directions (geometry), independent of global flag.
 
 ## Step 7 - Zebar updates (vendor tokyo-silence as spotcobuild default)
@@ -251,11 +251,11 @@ Built-in pack pattern already exists: `resources/starter` +
 
 ## Step 8 - Spotcobuild default config
 
-- [ ] Copy live Asus `config.yaml` → `resources/assets/sample-config.yaml`
+- [x] Copy live Asus `config.yaml` → `resources/assets/sample-config.yaml`
       (review for machine-specific paths; keep generic where possible).
-- [ ] Include new opposite-move bindings + comment block for global
+- [x] Include new opposite-move bindings + comment block for global
       direction semantics.
-- [ ] Commit on `glazewm-spotcobuild`.
+- [x] Commit on `glazewm-spotcobuild`.
 
 ## Step 9 - Verification
 

@@ -17,7 +17,7 @@ use wm_common::{
   CommandData, EventSubscribeData, EventSubscriptionMessage, FocusedData,
   IgnoredWindowsData, LayoutSnapshot, LoadLayoutData, MonitorsData,
   QueryCommand, ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
-  SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
+  SubscribableEvent, GlobalTilingDirectionData, TilingDirectionData, WindowsData, WmEvent,
   WorkspacesData,
 };
 use wm_platform::Dispatcher;
@@ -272,7 +272,20 @@ impl IpcServer {
           ClientResponseData::TilingDirection(TilingDirectionData {
             direction_container: direction_container.to_dto()?,
             tiling_direction: direction_container.tiling_direction(),
+            global_tiling_direction: Some(
+              wm.state.global_tiling_direction.clone(),
+            ),
           })
+        }
+        QueryCommand::GlobalTilingDirection => {
+          ClientResponseData::GlobalTilingDirection(
+            GlobalTilingDirectionData {
+              global_tiling_direction: wm
+                .state
+                .global_tiling_direction
+                .clone(),
+            },
+          )
         }
         QueryCommand::Paused => {
           ClientResponseData::Paused(wm.state.is_paused)
@@ -306,6 +319,7 @@ impl IpcServer {
             binding_modes,
             Some(env!("VERSION_NUMBER").to_string()),
             format_system_time_rfc3339(std::time::SystemTime::now()),
+            Some(wm.state.global_tiling_direction.clone()),
           );
 
           ClientResponseData::Layout(snapshot)
@@ -502,6 +516,9 @@ impl IpcServer {
       WmEvent::MonitorRemoved { .. } => SubscribableEvent::MonitorRemoved,
       WmEvent::TilingDirectionChanged { .. } => {
         SubscribableEvent::TilingDirectionChanged
+      }
+      WmEvent::GlobalTilingDirectionChanged { .. } => {
+        SubscribableEvent::GlobalTilingDirectionChanged
       }
       WmEvent::UserConfigChanged { .. } => {
         SubscribableEvent::UserConfigChanged

@@ -4,7 +4,7 @@ use anyhow::Context;
 use tokio::sync::mpsc::{self};
 use tracing::warn;
 use uuid::Uuid;
-use wm_common::{BindingModeConfig, HideCorner, WindowState, WmEvent};
+use wm_common::{BindingModeConfig, HideCorner, TilingDirection, WindowState, WmEvent};
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
 };
@@ -61,6 +61,9 @@ pub struct WmState {
   /// `ignore` command.
   pub ignored_windows: Vec<NativeWindow>,
 
+  /// WM-wide insertion / stack axis for directional moves (spotcobuild).
+  pub global_tiling_direction: TilingDirection,
+
   /// Whether the WM is paused.
   pub is_paused: bool,
 
@@ -92,6 +95,7 @@ impl WmState {
       unmanaged_or_minimized_timestamp: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
+      global_tiling_direction: TilingDirection::Horizontal,
       is_paused: false,
       is_focus_synced: false,
       has_initialized: false,
@@ -734,3 +738,4 @@ impl Drop for WmState {
     }
   }
 }
+

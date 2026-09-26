@@ -2,12 +2,14 @@ general:
   # Commands to run when the WM has started. This is useful for running a
   # script or launching another application.
   # Example: The below command launches Zebar.
-  startup_commands: ['shell-exec zebar']
+  # Launch default Zebar starter bar
+  startup_commands:
+    - 'shell-exec zebar start-widget-preset --pack y4m3.tokyo-silence --widget-name bar --preset default'
 
-  # Commands to run just before the WM is shutdown.
-  # Example: The below command kills Zebar.
-  shutdown_commands: ['shell-exec taskkill /IM zebar.exe /F']
 
+  # Kill Zebar on WM exit so restart leaves a clean bar process.
+  shutdown_commands:
+    - 'shell-exec taskkill /IM zebar.exe /F'
   # Commands to run after the WM config is reloaded.
   config_reload_commands: []
 
@@ -45,56 +47,50 @@ gaps:
   scale_with_dpi: true
 
   # Gap between adjacent windows.
-  inner_gap: '20px'
+  inner_gap: '0px'
 
   # Gap between windows and the screen edge.
+  # Match Zebar bar height (40px) so windows sit flush under the bar.
   outer_gap:
-    top: '60px'
-    right: '20px'
-    bottom: '20px'
-    left: '20px'
+    top: '0px'
+    right: '0px'
+    bottom: '0px'
+    left: '0px'
 
 window_effects:
   # Visual effects to apply to the focused window.
   focused_window:
-    # Highlight the window with a colored border.
-    # ** Exclusive to Windows 11 due to API limitations.
+    # Bright focus border (Win11 only).
     border:
       enabled: true
-      color: '#8dbcff'
+      color: '#6cb6ff'
 
-    # Remove the title bar from the window's frame. Note that this can
-    # cause rendering issues for some applications.
     hide_title_bar:
       enabled: false
 
-    # Change the corner style of the window's frame.
-    # ** Exclusive to Windows 11 due to API limitations.
     corner_style:
       enabled: false
-      # Allowed values: 'square', 'rounded', 'small_rounded'.
       style: 'square'
 
-    # Change the transparency of the window.
+    # Focused window stays fully opaque.
     transparency:
       enabled: false
-      # Can be something like '95%' or '0.95' for slightly transparent windows.
-      # '0' or '0%' is fully transparent (and, by consequence, unfocusable).
-      opacity: '95%'
+      opacity: '100%'
 
   # Visual effects to apply to non-focused windows.
   other_windows:
     border:
       enabled: true
-      color: '#a1a1a1'
+      color: '#3a3a3a'
     hide_title_bar:
       enabled: false
     corner_style:
       enabled: false
       style: 'square'
+    # Very subtle dim on unfocused windows.
     transparency:
-      enabled: false
-      opacity: '0%'
+      enabled: true
+      opacity: '100%'
 
 window_behavior:
   # New windows are created in this state whenever possible.
@@ -132,6 +128,20 @@ workspaces:
   - name: '9'
 
 window_rules:
+  - commands: ['set-floating']
+    match:
+      - window_process: { equals: 'devenv' }
+      - window_process: { equals: 'RobloxStudioBeta' }
+      - window_process: { equals: 'RobloxPlayerBeta' }
+      - window_process: { equals: 'UmamusumePrettyDerby' }
+      - window_process: { equals: 'p4merge' }
+      - window_process: { equals: 'ESMP4' }
+      - window_process: { equals: 'p4v' }
+        window_title: { not_regex: '.*Perforce Helix P4V.*' }
+      - window_process: { equals: 'ccollabgui' }
+      - window_process: { equals: 'CreationKit' }
+      - window_process: { equals: 'PowerToys' }
+      
   - commands: ['ignore']
     match:
       # Ignores any Zebar windows.
@@ -142,12 +152,14 @@ window_rules:
         window_class: { regex: 'Chrome_WidgetWin_1|MozillaDialogClass' }
 
       # Ignore rules for various 3rd-party apps.
-      - window_process: { equals: 'PowerToys' }
-        window_class: { regex: 'HwndWrapper\[PowerToys\.PowerAccent.*?\]' }
+      
+      # Snipping Tool + capture overlay / popups (Win+Shift+S)
+      - window_process: { equals: 'SnippingTool' }
+      - window_process: { equals: 'ScreenSketch' }
+      - window_process: { equals: 'ScreenClippingHost' }
+      - window_title: { equals: 'Screen Snipping' }
       - window_title: { equals: 'Command Palette' }
         window_class: { equals: 'WinUIDesktopWin32WindowClass' }
-      - window_process: { equals: 'PowerToys' }
-        window_title: { regex: '.*? - Peek' }
       - window_process: { equals: 'Lively' }
         window_class: { regex: 'HwndWrapper' }
       - window_process: { equals: 'EXCEL' }
@@ -174,151 +186,170 @@ binding_modes:
         bindings: ['escape', 'enter']
 
 keybindings:
-  # Shift focus in a given direction.
+  # --- Omarchy-style bindings (Mod = Win/Super) ---
+
+  # Mod + H/K/L + arrows — focus (J is Omarchy tiling-direction)
   - commands: ['focus --direction left']
-    bindings: ['alt+h', 'alt+left']
-  - commands: ['focus --direction right']
-    bindings: ['alt+l', 'alt+right']
-  - commands: ['focus --direction up']
-    bindings: ['alt+k', 'alt+up']
+    bindings: ['lwin+h', 'lwin+left']
   - commands: ['focus --direction down']
-    bindings: ['alt+j', 'alt+down']
+    bindings: ['lwin+down']
+  - commands: ['focus --direction up']
+    bindings: ['lwin+k', 'lwin+up']
+  - commands: ['focus --direction right']
+    bindings: ['lwin+l', 'lwin+right']
 
-  # Move focused window in a given direction.
+  # Mod + Shift + H/K/L + arrows - move window using global stack direction
   - commands: ['move --direction left']
-    bindings: ['alt+shift+h', 'alt+shift+left']
-  - commands: ['move --direction right']
-    bindings: ['alt+shift+l', 'alt+shift+right']
-  - commands: ['move --direction up']
-    bindings: ['alt+shift+k', 'alt+shift+up']
+    bindings: ['lwin+shift+h', 'lwin+shift+left']
   - commands: ['move --direction down']
-    bindings: ['alt+shift+j', 'alt+shift+down']
+    bindings: ['lwin+shift+down']
+  - commands: ['move --direction up']
+    bindings: ['lwin+shift+k', 'lwin+shift+up']
+  - commands: ['move --direction right']
+    bindings: ['lwin+shift+l', 'lwin+shift+right']
 
-  # Resize focused window by a percentage or pixel amount.
-  - commands: ['resize --width -2%']
-    bindings: ['alt+u']
-  - commands: ['resize --width +2%']
-    bindings: ['alt+p']
-  - commands: ['resize --height +2%']
-    bindings: ['alt+o']
-  - commands: ['resize --height -2%']
-    bindings: ['alt+i']
+  # Mod + Shift + Ctrl + H/K/L + arrows - same move with opposite stack axis
+  # (does not flip Super+J / global tiling direction)
+  - commands: ['move --direction left --opposite-tiling-direction']
+    bindings: ['lwin+shift+control+h', 'lwin+shift+control+left']
+  - commands: ['move --direction down --opposite-tiling-direction']
+    bindings: ['lwin+shift+control+down']
+  - commands: ['move --direction up --opposite-tiling-direction']
+    bindings: ['lwin+shift+control+k', 'lwin+shift+control+up']
+  - commands: ['move --direction right --opposite-tiling-direction']
+    bindings: ['lwin+shift+control+l', 'lwin+shift+control+right']
 
-  # As an alternative to the resize keybindings above, resize mode enables
-  # resizing via arrow keys or HJKL. The binding mode is defined above with
-  # the name 'resize'.
-  - commands: ['wm-enable-binding-mode --name resize']
-    bindings: ['alt+r']
-
-  # Disables window management and all other keybindings until alt+shift+p
-  # is pressed again.
-  - commands: ['wm-toggle-pause']
-    bindings: ['alt+shift+p']
-
-  # Change tiling direction. This determines where new tiling windows will
-  # be inserted.
-  - commands: ['toggle-tiling-direction']
-    bindings: ['alt+v']
-
-  # Change focus from tiling windows -> floating -> fullscreen.
-  - commands: ['wm-cycle-focus']
-    bindings: ['alt+space']
-
-  # Change the focused window to be floating.
-  - commands: ['toggle-floating --centered']
-    bindings: ['alt+shift+space']
-
-  # Change the focused window to be tiling.
-  - commands: ['toggle-tiling']
-    bindings: ['alt+t']
-
-  # Change the focused window to be fullscreen.
+  # Mod + F — fullscreen (true fullscreen)
   - commands: ['toggle-fullscreen']
-    bindings: ['alt+f']
+    bindings: ['lwin+f']
+
+  # Mod + Alt + F — full width / maximize (Omarchy Super+Alt+F)
+  - commands: ['toggle-fullscreen --maximized=true']
+    bindings: ['lwin+alt+f']
+
+  # Mod + T — toggle floating/tiling (Omarchy Super+T)
+  - commands: ['toggle-floating --centered']
+    bindings: ['lwin+t']
+
+  # Mod + J — toggle global tiling / stack direction (spotcobuild; no wrap)
+  - commands: ['toggle-tiling-direction']
+    bindings: ['lwin+j']
+
+  # Mod + W — close window (Omarchy Super+W)
+  - commands: ['close']
+    bindings: ['lwin+w']
+
+  # Mod + Enter — terminal (Windows Terminal)
+  - commands: ['shell-exec wt']
+    bindings: ['lwin+enter']
+
+  # Mod + Space — app launcher (PowerToys Run)
+  - commands: ['shell-exec %LOCALAPPDATA%/PowerToys/PowerToys.PowerLauncher.exe']
+    bindings: ['lwin+space']
+
+  # Mod + 1..9 — switch workspace
+  - commands: ['focus --workspace 1']
+    bindings: ['lwin+1']
+  - commands: ['focus --workspace 2']
+    bindings: ['lwin+2']
+  - commands: ['focus --workspace 3']
+    bindings: ['lwin+3']
+  - commands: ['focus --workspace 4']
+    bindings: ['lwin+4']
+  - commands: ['focus --workspace 5']
+    bindings: ['lwin+5']
+  - commands: ['focus --workspace 6']
+    bindings: ['lwin+6']
+  - commands: ['focus --workspace 7']
+    bindings: ['lwin+7']
+  - commands: ['focus --workspace 8']
+    bindings: ['lwin+8']
+  - commands: ['focus --workspace 9']
+    bindings: ['lwin+9']
+
+  # Mod + Shift + 1..9 — move window to workspace (and follow)
+  - commands: ['move --workspace 1', 'focus --workspace 1']
+    bindings: ['lwin+shift+1']
+  - commands: ['move --workspace 2', 'focus --workspace 2']
+    bindings: ['lwin+shift+2']
+  - commands: ['move --workspace 3', 'focus --workspace 3']
+    bindings: ['lwin+shift+3']
+  - commands: ['move --workspace 4', 'focus --workspace 4']
+    bindings: ['lwin+shift+4']
+  - commands: ['move --workspace 5', 'focus --workspace 5']
+    bindings: ['lwin+shift+5']
+  - commands: ['move --workspace 6', 'focus --workspace 6']
+    bindings: ['lwin+shift+6']
+  - commands: ['move --workspace 7', 'focus --workspace 7']
+    bindings: ['lwin+shift+7']
+  - commands: ['move --workspace 8', 'focus --workspace 8']
+    bindings: ['lwin+shift+8']
+  - commands: ['move --workspace 9', 'focus --workspace 9']
+    bindings: ['lwin+shift+9']
+
+  # --- Extra utilities (kept, remapped off Omarchy chords) ---
+
+  # Resize: Win + - shrinks, Win + = grows (plus=bigger, minus=smaller)
+  # Shift variants adjust height the same way
+  - commands: ['resize --width -5%']
+    bindings: ['lwin+oem_minus']
+  - commands: ['resize --width +5%']
+    bindings: ['lwin+oem_plus']
+  - commands: ['resize --height -5%']
+    bindings: ['lwin+shift+oem_minus']
+  - commands: ['resize --height +5%']
+    bindings: ['lwin+shift+oem_plus']
+
+  # Optional: enter resize mode (HJKL / arrows), exit with Esc/Enter.
+  - commands: ['wm-enable-binding-mode --name resize']
+    bindings: ['lwin+r']
+
+  # Pause/resume window management.
+  - commands: ['wm-toggle-pause']
+    bindings: ['lwin+shift+p']
+
+  # Cycle focus: tiling -> floating -> fullscreen.
+  - commands: ['wm-cycle-focus']
+    bindings: ['lwin+shift+space']
 
   # Minimize focused window.
   - commands: ['toggle-minimized']
-    bindings: ['alt+m']
+    bindings: ['lwin+m']
 
-  # Close focused window.
-  - commands: ['close']
-    bindings: ['alt+shift+q']
-
-  # Kill GlazeWM process safely.
+  # Kill GlazeWM process safely (hard chord to avoid accidental exits).
   - commands: ['wm-exit']
-    bindings: ['alt+shift+e']
+    bindings: ['lwin+ctrl+shift+f4']
 
   # Re-evaluate configuration file.
   - commands: ['wm-reload-config']
-    bindings: ['alt+shift+r']
+    bindings: ['lwin+shift+r']
 
   # Redraw all windows.
   - commands: ['wm-redraw']
-    bindings: ['alt+shift+w']
+    bindings: ['lwin+shift+w']
 
-  # Launch CMD terminal. Alternatively, use `shell-exec wt` or
-  # `shell-exec %ProgramFiles%/Git/git-bash.exe` to start Windows
-  # Terminal and Git Bash respectively.
-  - commands: ['shell-exec cmd']
-    bindings: ['alt+enter']
-
-  # Focus the next/previous active workspace defined in `workspaces` config.
+  # Mod + Tab / Shift+Tab — next / previous workspace (Omarchy)
   - commands: ['focus --next-active-workspace']
-    bindings: ['alt+s']
+    bindings: ['lwin+tab']
   - commands: ['focus --prev-active-workspace']
-    bindings: ['alt+a']
+    bindings: ['lwin+shift+tab']
 
-  # Focus the workspace that last had focus.
+  # Also keep , / . as prev/next workspace
+  - commands: ['focus --next-active-workspace']
+    bindings: ['lwin+period']
+  - commands: ['focus --prev-active-workspace']
+    bindings: ['lwin+comma']
+
+  # Mod + Ctrl + Tab — recent workspace (Omarchy Super+Ctrl+Tab)
   - commands: ['focus --recent-workspace']
-    bindings: ['alt+d']
+    bindings: ['lwin+control+tab']
 
-  # Change focus to a workspace defined in `workspaces` config.
-  - commands: ['focus --workspace 1']
-    bindings: ['alt+1']
-  - commands: ['focus --workspace 2']
-    bindings: ['alt+2']
-  - commands: ['focus --workspace 3']
-    bindings: ['alt+3']
-  - commands: ['focus --workspace 4']
-    bindings: ['alt+4']
-  - commands: ['focus --workspace 5']
-    bindings: ['alt+5']
-  - commands: ['focus --workspace 6']
-    bindings: ['alt+6']
-  - commands: ['focus --workspace 7']
-    bindings: ['alt+7']
-  - commands: ['focus --workspace 8']
-    bindings: ['alt+8']
-  - commands: ['focus --workspace 9']
-    bindings: ['alt+9']
-
-  # Move the focused window's parent workspace to a monitor in a given
-  # direction.
+  # Move the focused window's parent workspace to another monitor.
   - commands: ['move-workspace --direction left']
-    bindings: ['alt+shift+a']
+    bindings: ['lwin+alt+left']
   - commands: ['move-workspace --direction right']
-    bindings: ['alt+shift+f']
+    bindings: ['lwin+alt+right']
   - commands: ['move-workspace --direction up']
-    bindings: ['alt+shift+d']
+    bindings: ['lwin+alt+up']
   - commands: ['move-workspace --direction down']
-    bindings: ['alt+shift+s']
-
-  # Move focused window to a workspace defined in `workspaces` config.
-  - commands: ['move --workspace 1', 'focus --workspace 1']
-    bindings: ['alt+shift+1']
-  - commands: ['move --workspace 2', 'focus --workspace 2']
-    bindings: ['alt+shift+2']
-  - commands: ['move --workspace 3', 'focus --workspace 3']
-    bindings: ['alt+shift+3']
-  - commands: ['move --workspace 4', 'focus --workspace 4']
-    bindings: ['alt+shift+4']
-  - commands: ['move --workspace 5', 'focus --workspace 5']
-    bindings: ['alt+shift+5']
-  - commands: ['move --workspace 6', 'focus --workspace 6']
-    bindings: ['alt+shift+6']
-  - commands: ['move --workspace 7', 'focus --workspace 7']
-    bindings: ['alt+shift+7']
-  - commands: ['move --workspace 8', 'focus --workspace 8']
-    bindings: ['alt+shift+8']
-  - commands: ['move --workspace 9', 'focus --workspace 9']
-    bindings: ['alt+shift+9']
+    bindings: ['lwin+alt+down']

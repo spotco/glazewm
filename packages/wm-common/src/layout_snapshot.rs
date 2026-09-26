@@ -30,6 +30,10 @@ pub struct LayoutSnapshot {
   pub glazewm_version: Option<String>,
   pub paused: bool,
   pub binding_modes: Vec<String>,
+  /// Spotcobuild WM-wide insertion / stack axis. Absent in older snapshots
+  /// (treated as Horizontal on load).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub global_tiling_direction: Option<TilingDirection>,
   pub monitors: Vec<SnapshotMonitor>,
   pub ignored_windows: Vec<SnapshotWindow>,
 }
@@ -166,6 +170,7 @@ impl LayoutSnapshot {
     binding_modes: Vec<String>,
     glazewm_version: Option<String>,
     captured_at: String,
+    global_tiling_direction: Option<TilingDirection>,
   ) -> Self {
     let monitors = monitors
       .iter()
@@ -183,6 +188,7 @@ impl LayoutSnapshot {
       glazewm_version,
       paused,
       binding_modes,
+      global_tiling_direction,
       monitors,
       ignored_windows,
     }
@@ -808,7 +814,8 @@ mod tests {
       vec!["mode_a".into()],
       Some("9.9.9".into()),
       "2026-09-23T00:00:00Z".into(),
-    );
+    None,
+  );
 
     assert_eq!(snapshot.version, 1);
     assert_eq!(snapshot.binding_modes, vec!["mode_a".to_string()]);
@@ -895,7 +902,8 @@ mod tests {
       vec![],
       None,
       "t".into(),
-    );
+    None,
+  );
     snapshot.strip_ephemeral();
 
     assert!(snapshot.monitors[0].id.is_none());
@@ -955,6 +963,7 @@ mod tests {
       glazewm_version: None,
       paused: false,
       binding_modes: vec![],
+      global_tiling_direction: None,
       monitors: vec![],
       ignored_windows: vec![],
     };
@@ -974,6 +983,7 @@ mod tests {
       glazewm_version: None,
       paused: false,
       binding_modes: vec![],
+      global_tiling_direction: None,
       monitors: vec![],
       ignored_windows: vec![],
     };
@@ -1263,7 +1273,8 @@ mod tests {
       vec![],
       Some("test".into()),
       captured_at.into(),
-    )
+    None,
+  )
     .into_durable()
   }
 
@@ -1569,6 +1580,7 @@ mod tests {
       glazewm_version: Some("test".into()),
       paused: false,
       binding_modes: vec![],
+      global_tiling_direction: None,
       monitors: vec![SnapshotMonitor {
         hardware_id: None,
         device_path: None,
@@ -1682,6 +1694,7 @@ mod tests {
       glazewm_version: None,
       paused: false,
       binding_modes: vec![],
+      global_tiling_direction: None,
       monitors: vec![
         SnapshotMonitor {
           hardware_id: Some("HW1".into()),
@@ -1832,7 +1845,8 @@ mod tests {
       vec![],
       None,
       "2026-09-25T00:00:00Z".into(),
-    )
+    None,
+  )
     .into_durable();
 
     let children = snapshot.monitors[0].workspaces[0]
@@ -1932,7 +1946,8 @@ mod tests {
       vec![],
       None,
       "t".into(),
-    );
+    None,
+  );
 
     let children = snapshot.monitors[0].workspaces[0]
       .root
@@ -2086,7 +2101,8 @@ mod tests {
       vec![],
       None,
       "t".into(),
-    )
+    None,
+  )
     .into_durable();
 
     let win = snapshot.monitors[0].workspaces[0]
@@ -2108,3 +2124,4 @@ mod tests {
     assert!(json.contains("floatingPlacementRelative"));
   }
 }
+

@@ -44,6 +44,7 @@ pub fn build_layout_snapshot(
     binding_modes,
     Some(env!("VERSION_NUMBER").to_string()),
     format_system_time_rfc3339(SystemTime::now()),
+    Some(state.global_tiling_direction.clone()),
   ))
 }
 
@@ -318,6 +319,7 @@ mod tests {
       glazewm_version: None,
       paused: false,
       binding_modes: vec![],
+      global_tiling_direction: None,
       monitors: vec![],
       ignored_windows: vec![],
     };

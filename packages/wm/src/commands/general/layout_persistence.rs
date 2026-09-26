@@ -89,6 +89,9 @@ pub fn wm_event_kind_name(event: &WmEvent) -> &'static str {
     WmEvent::MonitorRemoved { .. } => "MonitorRemoved",
     WmEvent::MonitorUpdated { .. } => "MonitorUpdated",
     WmEvent::TilingDirectionChanged { .. } => "TilingDirectionChanged",
+    WmEvent::GlobalTilingDirectionChanged { .. } => {
+      "GlobalTilingDirectionChanged"
+    }
     WmEvent::UserConfigChanged { .. } => "UserConfigChanged",
     WmEvent::WindowManaged { .. } => "WindowManaged",
     WmEvent::WindowUnmanaged { .. } => "WindowUnmanaged",
@@ -168,6 +171,7 @@ pub fn wm_event_affects_layout_snapshot(event: &WmEvent) -> bool {
       | WmEvent::WorkspaceDeactivated { .. }
       | WmEvent::WorkspaceUpdated { .. }
       | WmEvent::TilingDirectionChanged { .. }
+      | WmEvent::GlobalTilingDirectionChanged { .. }
       | WmEvent::MonitorAdded { .. }
       | WmEvent::MonitorRemoved { .. }
       | WmEvent::MonitorUpdated { .. }

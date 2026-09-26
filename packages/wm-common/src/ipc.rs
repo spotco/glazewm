@@ -126,6 +126,7 @@ pub enum ClientResponseData {
   Focused(FocusedData),
   Monitors(MonitorsData),
   TilingDirection(TilingDirectionData),
+  GlobalTilingDirection(GlobalTilingDirectionData),
   Windows(WindowsData),
   Workspaces(WorkspacesData),
   Paused(bool),
@@ -173,6 +174,15 @@ pub struct MonitorsData {
 pub struct TilingDirectionData {
   pub tiling_direction: TilingDirection,
   pub direction_container: ContainerDto,
+  /// Spotcobuild WM-wide stack axis (also available via `query global-tiling-direction`).
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub global_tiling_direction: Option<TilingDirection>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalTilingDirectionData {
+  pub global_tiling_direction: TilingDirection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -206,3 +216,4 @@ pub struct EventSubscriptionMessage {
   pub subscription_id: Uuid,
   pub success: bool,
 }
+

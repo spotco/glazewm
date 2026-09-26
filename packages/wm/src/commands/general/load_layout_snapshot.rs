@@ -73,10 +73,23 @@ pub fn load_layout_snapshot(
     anyhow::bail!("{msg}");
   }
 
+  // Spotcobuild: restore WM-wide stack axis (default Horizontal if absent).
+  let global_dir = snapshot
+    .global_tiling_direction
+    .clone()
+    .unwrap_or(wm_common::TilingDirection::Horizontal);
+  if state.global_tiling_direction != global_dir {
+    state.global_tiling_direction = global_dir.clone();
+    state.emit_event(wm_common::WmEvent::GlobalTilingDirectionChanged {
+      new_tiling_direction: global_dir,
+    });
+  }
+
   layout_debug_log(format!(
-    "restore begin: snapshot monitors={}, version={}",
+    "restore begin: snapshot monitors={}, version={}, global_tiling_direction={:?}",
     snapshot.monitors.len(),
-    snapshot.version
+    snapshot.version,
+    state.global_tiling_direction,
   ));
 
   let monitor_map = match_monitors(&snapshot.monitors, &state.monitors());
