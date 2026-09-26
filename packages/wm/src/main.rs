@@ -424,6 +424,8 @@ async fn start_wm(
   }
 
   tracing::info!("Window manager shutting down.");
+  // Close IPC listener first (sync signal + short wait) before other teardown.
+  ipc_server.stop_and_wait().await;
   wm.cleanup(&mut config, &mut ipc_server);
 
   Ok(())

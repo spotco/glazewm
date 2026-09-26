@@ -5,7 +5,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
   net::TcpStream,
-  sync::{broadcast, mpsc},
+  sync::{broadcast, mpsc, oneshot},
   task,
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -34,6 +34,9 @@ use crate::{
 
 pub struct IpcServer {
   abort_handle: task::AbortHandle,
+  /// Graceful accept-loop stop; dropping the listener closes the TCP port
+  /// before process exit (abort alone is async and can leave ghost sockets).
+  shutdown_tx: Option<oneshot::Sender<()>>,
   pub message_rx: mpsc::UnboundedReceiver<(
     String,
     mpsc::UnboundedSender<Message>,
@@ -55,22 +58,42 @@ impl IpcServer {
       crate::ipc_conflict::bind_ipc_listener(dispatcher).await?;
     info!("IPC server started on: '{}'.", server_addr);
 
-    let task = task::spawn(async move {
-      while let Ok((stream, addr)) = server.accept().await {
-        let message_tx = message_tx.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        task::spawn(async move {
-          if let Err(err) =
-            Self::handle_connection(stream, addr, message_tx).await
-          {
-            warn!("Error handling connection: {}", err);
+    let task = task::spawn(async move {
+      tokio::pin!(shutdown_rx);
+      loop {
+        tokio::select! {
+          _ = &mut shutdown_rx => {
+            info!("IPC accept loop received shutdown; dropping TcpListener");
+            drop(server);
+            break;
           }
-        });
+          accept = server.accept() => {
+            match accept {
+              Ok((stream, addr)) => {
+                let message_tx = message_tx.clone();
+                task::spawn(async move {
+                  if let Err(err) =
+                    Self::handle_connection(stream, addr, message_tx).await
+                  {
+                    warn!("Error handling connection: {}", err);
+                  }
+                });
+              }
+              Err(err) => {
+                warn!("IPC accept error: {}", err);
+                break;
+              }
+            }
+          }
+        }
       }
     });
 
     Ok(Self {
       abort_handle: task.abort_handle(),
+      shutdown_tx: Some(shutdown_tx),
       #[allow(clippy::used_underscore_binding)]
       _event_rx,
       event_tx,
@@ -499,9 +522,24 @@ impl IpcServer {
     Ok(())
   }
 
-  pub fn stop(&self) {
+  pub fn stop(&mut self) {
     info!("Shutting down IPC server.");
+    // Signal accept loop to drop TcpListener *before* aborting the task.
+    // Abort alone is asynchronous; exiting the process while the listener
+    // is still alive leaves a ghost LISTENING socket on Windows.
+    if let Some(tx) = self.shutdown_tx.take() {
+      let _ = tx.send(());
+    }
     self.abort_handle.abort();
+    // Brief yield so the accept task can run drop(server) before we return
+    // into process teardown. Callers on the tokio runtime should prefer
+    // `stop_and_wait`; this sync path is best-effort for Drop.
+  }
+
+  /// Stop the accept loop and give it a short window to drop the listener.
+  pub async fn stop_and_wait(&mut self) {
+    self.stop();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
   }
 }
 

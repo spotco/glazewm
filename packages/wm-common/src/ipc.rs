@@ -8,13 +8,69 @@ use crate::{
 
 pub const DEFAULT_IPC_PORT: u32 = 6123;
 
-/// Resolve IPC port: `GLAZEWM_IPC_PORT` env if set and valid, else [`DEFAULT_IPC_PORT`].
+/// File name written beside the user config when the WM falls back off the
+/// preferred IPC port (ghost socket / AddrInUse). CLI and `ipc_port()` read it.
+pub const IPC_PORT_FILE_NAME: &str = "ipc.port";
+
+fn glazewm_config_dir() -> Option<std::path::PathBuf> {
+  #[cfg(target_os = "windows")]
+  {
+    std::env::var_os("USERPROFILE").map(|h| {
+      std::path::PathBuf::from(h).join(".glzr").join("glazewm")
+    })
+  }
+  #[cfg(not(target_os = "windows"))]
+  {
+    std::env::var_os("HOME").map(|h| {
+      std::path::PathBuf::from(h).join(".glzr").join("glazewm")
+    })
+  }
+}
+
+/// `~/.glzr/glazewm/ipc.port` when a home directory is available.
+#[must_use]
+pub fn ipc_port_file_path() -> Option<std::path::PathBuf> {
+  glazewm_config_dir().map(|d| d.join(IPC_PORT_FILE_NAME))
+}
+
+/// Resolve IPC port: `GLAZEWM_IPC_PORT` env, else `ipc.port` file, else default.
 #[must_use]
 pub fn ipc_port() -> u32 {
-  std::env::var("GLAZEWM_IPC_PORT")
-    .ok()
-    .and_then(|s| s.parse().ok())
-    .unwrap_or(DEFAULT_IPC_PORT)
+  if let Ok(s) = std::env::var("GLAZEWM_IPC_PORT") {
+    if let Ok(p) = s.parse::<u32>() {
+      if p > 0 {
+        return p;
+      }
+    }
+  }
+  if let Some(path) = ipc_port_file_path() {
+    if let Ok(s) = std::fs::read_to_string(&path) {
+      if let Ok(p) = s.trim().parse::<u32>() {
+        if p > 0 {
+          return p;
+        }
+      }
+    }
+  }
+  DEFAULT_IPC_PORT
+}
+
+/// Persist the active IPC port so CLI clients find a fallback bind.
+pub fn write_ipc_port_file(port: u32) -> std::io::Result<()> {
+  let path = ipc_port_file_path().ok_or_else(|| {
+    std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory")
+  })?;
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent)?;
+  }
+  std::fs::write(&path, format!("{port}\n"))
+}
+
+/// Remove a stale fallback port file (call after binding the default port).
+pub fn clear_ipc_port_file() {
+  if let Some(path) = ipc_port_file_path() {
+    let _ = std::fs::remove_file(path);
+  }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -821,5 +821,14 @@ impl WindowManager {
         tracing::warn!("{:?}", err);
       }
     }
+
+    // Drop the IPC TcpListener before process exit so Windows does not leave
+    // a ghost LISTENING socket. Also stop the watcher so it does not restart us.
+    ipc_server.stop();
+    let watcher_report = crate::ipc_conflict::kill_watcher_on_exit();
+    tracing::info!("Exit watcher cleanup: {watcher_report}");
+    crate::commands::general::layout_debug_log(format!(
+      "wm-exit: IPC stopped; watcher cleanup: {watcher_report}"
+    ));
   }
 }

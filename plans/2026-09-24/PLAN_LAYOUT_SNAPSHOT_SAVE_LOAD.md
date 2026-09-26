@@ -288,3 +288,9 @@ Fixes: (1) one deferred startup layout reload after 2s when `unmatched_snapshot 
 Root cause: `shell_exec::parse_command` used `match_indices('"').nth(2)` (off-by-one). For `"" ""` (empty argv via `join_ipc_args`) that became program=`" ` (quote+space), which `ShellExecuteEx` can surface as a malformed UNC / Network Error dialog (live `cmd` titled Network Error observed).
 
 Fixes: use `nth(1)` for the closing quote; `validate_shell_program` rejects empty/quote-junk/bare-slash programs; `Dispatcher::shell_execute_ex` refuses the same before calling the API; unit tests cover the regression.
+
+### Bug C (IPC ghost socket / port not released)
+Live: `127.0.0.1:6123 LISTENING` owned by dead PID (ghost); `glazewm.exe` gone; watcher may linger. Kill+retry cannot free ghosts.
+
+Fixes: poll bind ~5s after each kill; detect ghost (netstat PID ∉ tasklist); auto-fallback to preferred+1..+10 then ephemeral; write `~/.glzr/glazewm/ipc.port` so `ipc_port()`/CLI follow; clear file when binding 6123; graceful IPC stop drops `TcpListener` via oneshot before abort; kill watcher on wm-exit; kill watcher before glazewm on conflict recovery.
+
