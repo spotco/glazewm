@@ -9,7 +9,7 @@ use crate::{
 pub const DEFAULT_IPC_PORT: u32 = 6123;
 
 /// File name written beside the user config when the WM falls back off the
-/// preferred IPC port (ghost socket / AddrInUse). CLI and `ipc_port()`
+/// preferred IPC port (ghost socket / `AddrInUse`). CLI and `ipc_port()`
 /// read it.
 pub const IPC_PORT_FILE_NAME: &str = "ipc.port";
 

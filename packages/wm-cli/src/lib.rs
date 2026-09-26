@@ -8,6 +8,7 @@ use clap::Parser;
 use wm_common::{AppCommand, ClientResponseData, QueryCommand};
 use wm_ipc_client::IpcClient;
 
+#[allow(clippy::too_many_lines)]
 pub async fn start(args: Vec<String>) -> anyhow::Result<()> {
   let app_command = AppCommand::parse_from(&args);
 

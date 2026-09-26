@@ -230,8 +230,8 @@ fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
   a.eq_ignore_ascii_case(b)
 }
 
-/// True when both paths look like WindowsApps package installs of the same
-/// exe (version folder may differ):
+/// True when both paths look like `WindowsApps` package installs of the
+/// same exe (version folder may differ):
 /// `...\WindowsApps\PackageFamily_VERSION_arch__publisher\App.exe`
 fn windows_apps_same_package_exe(a: &str, b: &str) -> bool {
   match (windows_apps_identity(a), windows_apps_identity(b)) {

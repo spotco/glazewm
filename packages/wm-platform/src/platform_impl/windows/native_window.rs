@@ -789,11 +789,11 @@ pub(crate) fn visible_windows(
 }
 
 /// Uncloak + show top-level DWM-cloaked windows, skipping `skip_handles`
-/// (typically currently managed GlazeWM window handles).
+/// (typically currently managed `GlazeWM` window handles).
 ///
 /// Unlike `visible_windows` / managed-container restore, this uses raw
 /// `EnumWindows` and does **not** filter out cloaked HWNDs - so orphaned
-/// windows left cloaked by a prior GlazeWM session (Brave/Edge/Terminal)
+/// windows left cloaked by a prior `GlazeWM` session (Brave/Edge/Terminal)
 /// are included.
 ///
 /// Returns how many windows were successfully unhidden.

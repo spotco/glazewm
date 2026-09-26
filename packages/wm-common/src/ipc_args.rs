@@ -53,6 +53,7 @@ pub fn join_ipc_args(args: &[impl AsRef<str>]) -> String {
 /// paths). Unclosed quotes are an error.
 ///
 /// An empty quoted argument (`""`) yields one empty string token.
+#[allow(clippy::missing_panics_doc)]
 pub fn split_ipc_args(message: &str) -> anyhow::Result<Vec<String>> {
   let mut args = Vec::new();
   let mut current = String::new();

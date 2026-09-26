@@ -41,7 +41,7 @@ pub enum LayoutPlanNode {
     tiling_direction: TilingDirection,
     tiling_size: f32,
     children: Vec<LayoutPlanNode>,
-    /// Surviving child local_ids in snapshot focus order.
+    /// Surviving child `local_ids` in snapshot focus order.
     child_focus_order: Vec<String>,
   },
 }
@@ -75,7 +75,7 @@ impl LayoutPlanNode {
     }
   }
 
-  /// DFS window local_ids under this node.
+  /// DFS window `local_ids` under this node.
   #[must_use]
   pub fn window_local_ids(&self) -> Vec<String> {
     let mut out = Vec::new();
@@ -129,6 +129,7 @@ impl WorkspaceLayoutPlan {
 /// relative structure among survivors is preserved and sibling sizes are
 /// renormalized to sum to 1.
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn plan_workspace_tiling_layout(
   workspace: &SnapshotWorkspace,
   matched_tiling_local_ids: &HashSet<String>,

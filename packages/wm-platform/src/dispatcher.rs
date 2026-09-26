@@ -687,10 +687,6 @@ impl Dispatcher {
     Ok(())
   }
 
-  /// Shows a modal error dialog with the given title and message.
-  ///
-  /// Blocks the current thread until the user dismisses the dialog.
-  #[allow(clippy::missing_panics_doc)]
   /// Shows a modal Yes/No dialog. Returns `true` if the user chose Yes.
   ///
   /// Blocks the current thread until the user dismisses the dialog.
@@ -712,7 +708,7 @@ impl Dispatcher {
           MB_ICONWARNING | MB_YESNO | MB_SYSTEMMODAL,
         )
       };
-      return result == IDYES;
+      result == IDYES
     }
     #[cfg(target_os = "macos")]
     {
@@ -739,6 +735,10 @@ impl Dispatcher {
     }
   }
 
+  /// Shows a modal error dialog with the given title and message.
+  ///
+  /// Blocks the current thread until the user dismisses the dialog.
+  #[allow(clippy::missing_panics_doc)]
   pub fn show_error_dialog(&self, title: &str, message: &str) {
     #[cfg(target_os = "windows")]
     {

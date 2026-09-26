@@ -13,7 +13,7 @@ use crate::{
 pub const LAYOUT_SNAPSHOT_VERSION: u32 = 1;
 
 /// Unified JSON export of monitors, workspaces, tiling tree, ignored
-/// windows, and useful GlazeWM status. Foundation for save/load/restore.
+/// windows, and useful `GlazeWM` status. Foundation for save/load/restore.
 ///
 /// Live queries may populate ephemeral `id` / `handle` fields for
 /// debugging. Call [`LayoutSnapshot::strip_ephemeral`] before writing a
@@ -429,7 +429,8 @@ pub fn format_system_time_rfc3339(time: std::time::SystemTime) -> String {
   }
 }
 
-/// Howard Hinnant civil_from_days (UTC).
+/// Howard Hinnant `civil_from_days` (UTC).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn civil_from_days(unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
   let z = (i64::try_from(unix_secs / 86_400).unwrap_or(0)) + 719_468;
   let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -486,6 +487,7 @@ fn dto_extent(
 /// ratios (horizontal→width, vertical→height). Floaters are excluded.
 /// Falls back to renormalizing existing `tiling_size` when geometry is
 /// missing/zero.
+#[allow(clippy::cast_precision_loss)]
 fn apply_sibling_tiling_sizes(
   nodes: &mut [SnapshotNode],
   source_dtos: &[ContainerDto],
@@ -634,6 +636,7 @@ pub fn relative_rect_from_absolute(
 
 /// Convert monitor-relative fractions back into an absolute `Rect`.
 #[must_use]
+#[allow(clippy::cast_precision_loss)]
 pub fn absolute_rect_from_relative(
   relative: &SnapshotRelativeRect,
   monitor_bounds: &SnapshotBounds,
@@ -675,13 +678,13 @@ pub fn resolve_floating_placement(
 pub fn validate_layout_snapshot_version(
   snapshot: &LayoutSnapshot,
 ) -> Result<(), String> {
-  if snapshot.version != LAYOUT_SNAPSHOT_VERSION {
+  if snapshot.version == LAYOUT_SNAPSHOT_VERSION {
+    Ok(())
+  } else {
     Err(format!(
       "Unsupported layout snapshot version {} (expected {}).",
       snapshot.version, LAYOUT_SNAPSHOT_VERSION
     ))
-  } else {
-    Ok(())
   }
 }
 

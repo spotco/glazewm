@@ -186,17 +186,14 @@ impl LayoutAutoSave {
   pub fn new(path: PathBuf) -> Self {
     // Far-future sleep placeholder until first arm (never fires while
     // disarmed).
-    let far = Instant::now() + Duration::from_secs(60 * 60 * 24 * 365);
+    #[allow(clippy::duration_suboptimal_units)]
+    let far = Instant::now() + Duration::from_secs(86_400 * 365);
     Self {
       path,
       sleep: Box::pin(sleep_until(far)),
       armed: false,
       enabled: false,
     }
-  }
-
-  pub fn path(&self) -> &Path {
-    &self.path
   }
 
   #[allow(dead_code)] // exercised in unit tests
@@ -317,10 +314,183 @@ pub fn save_layout_snapshot_to_path(
   Ok(())
 }
 
-/// Best-effort startup load from `layout.json`.
+/// Sibling `*.bak` path used by atomic write / startup recovery.
+fn sibling_bak_path(path: &Path) -> PathBuf {
+  let mut os = path.as_os_str().to_owned();
+  os.push(".bak");
+  PathBuf::from(os)
+}
+
+/// Outcome of trying to read + parse one snapshot path.
+#[derive(Debug)]
+enum SnapshotReadOutcome {
+  Missing,
+  Empty,
+  IoError(String),
+  ParseError(String),
+  Ok(LayoutSnapshot),
+}
+
+fn read_snapshot_file_outcome(path: &Path) -> SnapshotReadOutcome {
+  if !path.exists() {
+    return SnapshotReadOutcome::Missing;
+  }
+  let text = match fs::read_to_string(path) {
+    Ok(t) => t,
+    Err(err) => {
+      return SnapshotReadOutcome::IoError(format!("{err:#}"));
+    }
+  };
+  if text.trim().is_empty() {
+    return SnapshotReadOutcome::Empty;
+  }
+  match serde_json::from_str::<LayoutSnapshot>(&text) {
+    Ok(snapshot) => SnapshotReadOutcome::Ok(snapshot),
+    Err(err) => SnapshotReadOutcome::ParseError(format!("{err:#}")),
+  }
+}
+
+fn describe_snapshot_read_failure(
+  path: &Path,
+  outcome: &SnapshotReadOutcome,
+) -> String {
+  match outcome {
+    SnapshotReadOutcome::Missing => {
+      format!("no file at {}", path.display())
+    }
+    SnapshotReadOutcome::Empty => {
+      format!("{} is empty", path.display())
+    }
+    SnapshotReadOutcome::IoError(err) => {
+      format!("failed to read {}: {err}", path.display())
+    }
+    SnapshotReadOutcome::ParseError(err) => {
+      format!("parse failed for {}: {err}", path.display())
+    }
+    SnapshotReadOutcome::Ok(_) => {
+      format!("{} is valid", path.display())
+    }
+  }
+}
+
+/// Promote a valid `.bak` snapshot back to the primary path.
+///
+/// Best-effort: recovery still succeeds even if promotion fails (e.g. file
+/// locks), so the next startup can try `.bak` again.
+fn promote_bak_to_primary(primary: &Path, bak: &Path) {
+  // Remove a corrupt/empty primary so rename can succeed on Windows.
+  if primary.exists() {
+    if let Err(err) = fs::remove_file(primary) {
+      let msg = format!(
+        "startup load: could not remove unusable primary {}: {err:#}; leaving .bak in place",
+        primary.display()
+      );
+      warn!("{msg}");
+      layout_debug_log(&msg);
+      return;
+    }
+  }
+  match fs::rename(bak, primary) {
+    Ok(()) => {
+      let msg = format!(
+        "startup load: promoted {} -> {}",
+        bak.display(),
+        primary.display()
+      );
+      info!("{msg}");
+      layout_debug_log(&msg);
+    }
+    Err(err) => {
+      let msg = format!(
+        "startup load: could not promote {} -> {}: {err:#}; will retry .bak next launch",
+        bak.display(),
+        primary.display()
+      );
+      warn!("{msg}");
+      layout_debug_log(&msg);
+    }
+  }
+}
+
+/// Read a persisted layout snapshot for startup, falling back to `.bak`
+/// when the primary is missing / empty / unreadable / invalid JSON.
+///
+/// On successful `.bak` recovery, attempts to promote `.bak` back to the
+/// primary path so the next launch does not depend on the crash-window
+/// leftover. Pure file I/O + parse (no `WmState`) so unit tests cover
+/// the real startup selection path.
+pub fn resolve_persisted_layout_snapshot(
+  path: &Path,
+) -> Option<LayoutSnapshot> {
+  let primary = read_snapshot_file_outcome(path);
+  if let SnapshotReadOutcome::Ok(snapshot) = primary {
+    return Some(snapshot);
+  }
+
+  let bak_path = sibling_bak_path(path);
+  let bak = read_snapshot_file_outcome(&bak_path);
+  if let SnapshotReadOutcome::Ok(snapshot) = bak {
+    let msg = format!(
+      "startup load: primary unusable ({}); recovering from {}",
+      describe_snapshot_read_failure(path, &primary),
+      bak_path.display()
+    );
+    warn!("{msg}");
+    layout_debug_log(&msg);
+    promote_bak_to_primary(path, &bak_path);
+    return Some(snapshot);
+  }
+
+  // Neither primary nor bak worked — keep prior messaging style.
+  let msg = format!(
+    "startup load: {}; using default layout behaviour",
+    describe_snapshot_read_failure(path, &primary)
+  );
+  match &primary {
+    SnapshotReadOutcome::Missing => {
+      // Only mention .bak if it exists but was also unusable, or if we
+      // looked and found nothing useful.
+      if bak_path.exists() {
+        let bak_msg = format!(
+          "startup load: also tried {}: {}",
+          bak_path.display(),
+          describe_snapshot_read_failure(&bak_path, &bak)
+        );
+        warn!("{msg}");
+        layout_debug_log(&msg);
+        warn!("{bak_msg}");
+        layout_debug_log(&bak_msg);
+      } else {
+        info!("{msg}");
+        layout_debug_log(&msg);
+      }
+    }
+    _ => {
+      if matches!(bak, SnapshotReadOutcome::Missing) {
+        warn!("{msg}");
+        layout_debug_log(&msg);
+      } else {
+        let bak_msg = format!(
+          "startup load: also tried {}: {}",
+          bak_path.display(),
+          describe_snapshot_read_failure(&bak_path, &bak)
+        );
+        warn!("{msg}");
+        layout_debug_log(&msg);
+        warn!("{bak_msg}");
+        layout_debug_log(&bak_msg);
+      }
+    }
+  }
+  None
+}
+
+/// Best-effort startup load from `layout.json` (with `.bak` recovery).
 ///
 /// Missing / empty / invalid JSON / restore errors are logged and ignored
-/// (default GlazeWM behaviour). Never fatal.
+/// (default GlazeWM behaviour). Never fatal. When the primary file is
+/// missing or invalid but `layout.json.bak` is valid, that backup is
+/// loaded and promoted back to the primary path when possible.
 pub fn try_load_persisted_layout_snapshot(
   path: &Path,
   state: &mut WmState,
@@ -330,51 +500,7 @@ pub fn try_load_persisted_layout_snapshot(
   info!("{attempt}");
   layout_debug_log(&attempt);
 
-  if !path.exists() {
-    let msg = format!(
-      "startup load: no file at {}; using default layout behaviour",
-      path.display()
-    );
-    info!("{msg}");
-    layout_debug_log(&msg);
-    return None;
-  }
-
-  let text = match fs::read_to_string(path) {
-    Ok(t) => t,
-    Err(err) => {
-      let msg = format!(
-        "startup load: failed to read {}: {err:#}; using default",
-        path.display()
-      );
-      warn!("{msg}");
-      layout_debug_log(&msg);
-      return None;
-    }
-  };
-
-  if text.trim().is_empty() {
-    let msg = format!(
-      "startup load: {} is empty; using default layout behaviour",
-      path.display()
-    );
-    warn!("{msg}");
-    layout_debug_log(&msg);
-    return None;
-  }
-
-  let snapshot: LayoutSnapshot = match serde_json::from_str(&text) {
-    Ok(s) => s,
-    Err(err) => {
-      let msg = format!(
-        "startup load: parse failed for {}: {err:#}; using default",
-        path.display()
-      );
-      warn!("{msg}");
-      layout_debug_log(&msg);
-      return None;
-    }
-  };
+  let snapshot = resolve_persisted_layout_snapshot(path)?;
 
   match load_layout_snapshot(&snapshot, state, config) {
     Ok(summary) => {
@@ -531,7 +657,7 @@ mod tests {
     let path = dir.join("layout.json");
     fs::write(&path, "   \n").unwrap();
     let text = fs::read_to_string(&path).unwrap();
-    assert!(text.trim().is_empty());
+    assert_eq!(text.trim(), "");
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir(&dir);
   }
@@ -549,5 +675,93 @@ mod tests {
     assert!(text.contains("unit-test line"));
     let _ = fs::remove_file(&log_path);
     let _ = fs::remove_dir(&dir);
+  }
+
+  fn minimal_valid_snapshot_json(marker: &str) -> String {
+    format!(
+      r#"{{"version":1,"capturedAt":"{marker}","paused":false,"bindingModes":[],"monitors":[],"ignoredWindows":[]}}"#
+    )
+  }
+
+  fn temp_layout_dir(prefix: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+      "glazewm-layout-bak-{}-{}-{}",
+      prefix,
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let _ = fs::create_dir_all(&dir);
+    dir
+  }
+
+  #[test]
+  fn resolve_recovers_when_primary_missing_and_bak_valid() {
+    let dir = temp_layout_dir("missing-primary");
+    let primary = dir.join("layout.json");
+    let bak = sibling_bak_path(&primary);
+    let _ = fs::remove_file(&primary);
+    fs::write(&bak, minimal_valid_snapshot_json("from-bak")).unwrap();
+
+    let snapshot = resolve_persisted_layout_snapshot(&primary)
+      .expect("should recover from .bak");
+    assert_eq!(snapshot.captured_at, "from-bak");
+    assert!(
+      primary.exists(),
+      "successful .bak recovery should promote backup to primary"
+    );
+    assert!(fs::read_to_string(&primary).unwrap().contains("from-bak"));
+    assert!(
+      !bak.exists(),
+      "promoted .bak should no longer sit beside primary"
+    );
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn resolve_recovers_when_primary_corrupt_and_bak_valid() {
+    let dir = temp_layout_dir("corrupt-primary");
+    let primary = dir.join("layout.json");
+    let bak = sibling_bak_path(&primary);
+    fs::write(&primary, "{not-json").unwrap();
+    fs::write(&bak, minimal_valid_snapshot_json("bak-wins")).unwrap();
+
+    let snapshot = resolve_persisted_layout_snapshot(&primary)
+      .expect("should recover from .bak when primary is corrupt");
+    assert_eq!(snapshot.captured_at, "bak-wins");
+    assert!(primary.exists());
+    let promoted = fs::read_to_string(&primary).unwrap();
+    assert!(promoted.contains("bak-wins"));
+    assert!(!promoted.contains("not-json"));
+    assert!(!bak.exists());
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn resolve_returns_none_when_primary_and_bak_missing() {
+    let dir = temp_layout_dir("both-missing");
+    let primary = dir.join("layout.json");
+    let _ = fs::remove_file(&primary);
+    let _ = fs::remove_file(sibling_bak_path(&primary));
+    assert!(resolve_persisted_layout_snapshot(&primary).is_none());
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn resolve_prefers_valid_primary_over_bak() {
+    let dir = temp_layout_dir("prefer-primary");
+    let primary = dir.join("layout.json");
+    let bak = sibling_bak_path(&primary);
+    fs::write(&primary, minimal_valid_snapshot_json("primary")).unwrap();
+    fs::write(&bak, minimal_valid_snapshot_json("bak")).unwrap();
+
+    let snapshot = resolve_persisted_layout_snapshot(&primary)
+      .expect("valid primary should load");
+    assert_eq!(snapshot.captured_at, "primary");
+    // Primary left alone; bak untouched.
+    assert!(bak.exists());
+    let _ = fs::remove_dir_all(&dir);
   }
 }
