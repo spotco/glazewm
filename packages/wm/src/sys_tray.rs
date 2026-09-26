@@ -20,7 +20,6 @@ use wm_platform::{Dispatcher, ThreadBound};
 enum TrayMenuId {
   ReloadConfig,
   ShowConfigFolder,
-  CopyLayoutSnapshot,
   SaveLayoutSnapshot,
   LoadLayoutSnapshot,
   #[cfg(target_os = "windows")]
@@ -35,9 +34,6 @@ impl Display for TrayMenuId {
     match self {
       TrayMenuId::ReloadConfig => write!(f, "reload_config"),
       TrayMenuId::ShowConfigFolder => write!(f, "show_config_folder"),
-      TrayMenuId::CopyLayoutSnapshot => {
-        write!(f, "copy_layout_snapshot")
-      }
       TrayMenuId::SaveLayoutSnapshot => {
         write!(f, "save_layout_snapshot")
       }
@@ -64,7 +60,6 @@ impl FromStr for TrayMenuId {
     match event {
       "show_config_folder" => Ok(Self::ShowConfigFolder),
       "reload_config" => Ok(Self::ReloadConfig),
-      "copy_layout_snapshot" => Ok(Self::CopyLayoutSnapshot),
       "save_layout_snapshot" => Ok(Self::SaveLayoutSnapshot),
       "load_layout_snapshot" => Ok(Self::LoadLayoutSnapshot),
       #[cfg(target_os = "windows")]
@@ -79,7 +74,6 @@ impl FromStr for TrayMenuId {
 
 pub struct SystemTray {
   pub config_reload_rx: mpsc::UnboundedReceiver<()>,
-  pub copy_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
   pub save_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
   pub load_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
   pub exit_rx: mpsc::UnboundedReceiver<()>,
@@ -98,8 +92,6 @@ impl SystemTray {
     let (uncloak_non_tracked_tx, uncloak_non_tracked_rx) =
       mpsc::unbounded_channel();
     let (config_reload_tx, config_reload_rx) = mpsc::unbounded_channel();
-    let (copy_layout_snapshot_tx, copy_layout_snapshot_rx) =
-      mpsc::unbounded_channel();
     let (save_layout_snapshot_tx, save_layout_snapshot_rx) =
       mpsc::unbounded_channel();
     let (load_layout_snapshot_tx, load_layout_snapshot_rx) =
@@ -145,7 +137,6 @@ impl SystemTray {
             &dispatcher,
             &config_path,
             &config_reload_tx,
-            &copy_layout_snapshot_tx,
             &save_layout_snapshot_tx,
             &load_layout_snapshot_tx,
             &exit_tx,
@@ -161,7 +152,6 @@ impl SystemTray {
 
     Ok(Self {
       config_reload_rx,
-      copy_layout_snapshot_rx,
       save_layout_snapshot_rx,
       load_layout_snapshot_rx,
       exit_rx,
@@ -187,13 +177,6 @@ impl SystemTray {
     let config_dir_item = MenuItem::with_id(
       TrayMenuId::ShowConfigFolder,
       "Show config folder",
-      true,
-      None,
-    );
-
-    let copy_layout_item = MenuItem::with_id(
-      TrayMenuId::CopyLayoutSnapshot,
-      "Copy layout snapshot",
       true,
       None,
     );
@@ -245,7 +228,6 @@ impl SystemTray {
       &reload_config_item,
       &config_dir_item,
       &PredefinedMenuItem::separator(),
-      &copy_layout_item,
       &save_layout_item,
       &load_layout_item,
       &PredefinedMenuItem::separator(),
@@ -295,7 +277,6 @@ impl SystemTray {
     dispatcher: &Dispatcher,
     config_path: &Path,
     config_reload_tx: &mpsc::UnboundedSender<()>,
-    copy_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
     save_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
     load_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
     exit_tx: &mpsc::UnboundedSender<()>,
@@ -326,10 +307,6 @@ impl SystemTray {
       }
       TrayMenuId::ReloadConfig => {
         config_reload_tx.send(())?;
-        Ok(())
-      }
-      TrayMenuId::CopyLayoutSnapshot => {
-        copy_layout_snapshot_tx.send(())?;
         Ok(())
       }
       TrayMenuId::SaveLayoutSnapshot => {

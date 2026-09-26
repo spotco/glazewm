@@ -53,19 +53,6 @@ pub fn durable_snapshot_json(state: &WmState) -> anyhow::Result<String> {
   Ok(serde_json::to_string_pretty(&snapshot)?)
 }
 
-/// Copy durable layout snapshot JSON to the system clipboard.
-pub fn copy_layout_snapshot_to_clipboard(
-  state: &WmState,
-) -> anyhow::Result<()> {
-  let json = durable_snapshot_json(state)?;
-  set_clipboard_text(&json)?;
-  info!(
-    "Copied layout snapshot to clipboard ({} bytes).",
-    json.len()
-  );
-  Ok(())
-}
-
 /// Save durable layout snapshot via native dialog and also copy to
 /// clipboard.
 pub fn save_layout_snapshot_with_dialog(

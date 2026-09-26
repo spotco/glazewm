@@ -31,7 +31,7 @@ use wm_platform::{
 
 use crate::{
   commands::general::{
-    copy_layout_snapshot_to_clipboard, layout_debug_log_path,
+    layout_debug_log_path,
     layout_snapshot_path, load_layout_snapshot, pick_layout_snapshot_path,
     platform_sync, read_layout_snapshot_file,
     save_layout_snapshot_with_dialog, set_layout_debug_log_path,
@@ -485,9 +485,6 @@ async fn start_wm(
           None,
           &mut config,
         ).map(|_| ())
-      },
-      Some(()) = tray.copy_layout_snapshot_rx.recv() => {
-        copy_layout_snapshot_to_clipboard(&wm.state)
       },
       Some(()) = tray.save_layout_snapshot_rx.recv() => {
         save_layout_snapshot_with_dialog(&wm.state, dispatcher)

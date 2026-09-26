@@ -108,7 +108,7 @@ pub enum AppCommand {
   /// (CLI-local).
   ///
   /// Requires an already running instance of the window manager.
-  /// Same JSON as tray "Copy layout snapshot" / `save-layout`.
+  /// Same durable JSON as `save-layout`.
   #[clap(name = "copy-layout")]
   CopyLayout,
 }
