@@ -14,7 +14,7 @@ Scope: multi-day feature work (WM move semantics + global direction state + Zeba
 - [x] Step 4 - Change `move --direction` to insert using global stack direction
 - [x] Step 5 - Add opposite-direction move command + Super+Shift+Ctrl bindings
 - [x] Step 6 - Unit tests for move matrices (H/V global × arrow × layouts)
-- [ ] Step 7 - Zebar: show + toggle global tiling direction
+- [x] Step 7 - Zebar: show + toggle global tiling direction
 - [x] Step 8 - Make live `config.yaml` the spotcobuild sample default
 - [ ] Step 9 - Manual smoke on Asus + build/deploy readiness
 
@@ -235,18 +235,18 @@ Upstream is MIT (Copyright y4m3); keep LICENSE + NOTICE and credit in README.
 Built-in pack pattern already exists: `resources/starter` +
 `STARTER_PACK_ID = "glzr-io.starter"` in `marketplace_installer.rs`.
 
-- [ ] Copy pack into `resources/tokyo-silence` (or `resources/spotcobuild-bar`)
+- [x] Copy pack into `resources/tokyo-silence` (or `resources/spotcobuild-bar`)
       under `F:\dev\zebar`.
-- [ ] Pack id **`spotco.tokyo-silence`** (LOCKED) so a
+- [x] Pack id **`spotco.tokyo-silence`** (LOCKED) so a
       marketplace update of `y4m3.tokyo-silence` cannot overwrite your edits.
-- [ ] Wire embed/install like starter: embed resource, install on first run,
+- [x] Wire embed/install like starter: embed resource, install on first run,
       change default `startupConfigs` / `STARTER_PACK_ID` (or parallel
       spotcobuild constant) to the new pack + `bar` / `default`.
-- [ ] Provider: surface `globalTilingDirection` (and events).
-- [ ] In the **vendored** pack: chip shows global H/V; click runs global toggle.
-- [ ] Migrate this machine: point `~\.glzr\zebar\settings.json` at the
+- [x] Provider: surface `globalTilingDirection` (and events).
+- [x] In the **vendored** pack: chip shows global H/V; click runs global toggle.
+- [x] Migrate this machine: point `~\.glzr\zebar\settings.json` at the
       vendored pack id (leave marketplace download alone or remove later).
-- [ ] Note in pack README: fork of y4m3/tokyo-silence for spotcobuild.
+- [x] Note in pack README: fork of y4m3/tokyo-silence for spotcobuild.
 
 
 ## Step 8 - Spotcobuild default config
