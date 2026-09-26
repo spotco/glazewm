@@ -1,7 +1,7 @@
 # Global tiling direction + consistent Super+Shift(+Ctrl) move Plan
 
 Date: 2026-09-26
-Status: implementation and automated/runtime verification complete; visual hotkey smoke remains desktop-only
+Status: implementation, CLI smoke, and automated/runtime verification complete; visual tray hover remains desktop-only
 Branch: `glazewm-spotcobuild` (GlazeWM) + `zebar-spotcobuild` (Zebar pack / provider as needed)
 Scope: multi-day feature work (WM move semantics + global direction state + Zebar indicator + default config)
 
@@ -16,8 +16,8 @@ Scope: multi-day feature work (WM move semantics + global direction state + Zeba
 - [x] Step 6 - Unit tests for move matrices (H/V global × arrow × layouts)
 - [x] Step 7 - Zebar: show + toggle global tiling direction
 - [x] Step 8 - Make live `config.yaml` the spotcobuild sample default
-- [x] Step 9 - Automated/runtime verification and build/deploy readiness
-- [ ] Desktop-only physical hotkey and tray-hover follow-up (UI surface unavailable)
+- [x] Step 9 - CLI smoke, automated/runtime verification, and build/deploy readiness
+- [ ] Desktop-only visual tray-hover observation (CLI equivalent verified)
 
 ## Objective
 
@@ -280,6 +280,15 @@ Manual Asus smoke:
 4. Super+Shift+Ctrl+Left uses opposite stack axis without flipping J state.
 5. Soft `wm-exit` still kills Zebar via `shutdown_commands`.
 
+CLI smoke harness:
+
+`scripts\smoke_global_tiling_direction.cmd` runs the equivalent runtime checks
+without physical key injection. Pass `-TestSoftExit` to include the shutdown
+and restart check. The harness records every CLI call/result, structural layout
+hash, and relevant `layout.log` tail in
+`plans/2026-09-26/GLOBAL_TILING_DIRECTION_SMOKE.log`. It snapshots and restores
+the live layout so move checks are non-destructive.
+
 Verification run 2026-09-26:
 
 - [x] `cargo fmt --all -- --check`
@@ -300,9 +309,12 @@ Verification run 2026-09-26:
 - [x] Vendored `spotco.tokyo-silence` bar launched from the deployed Zebar
       build; its cached bundle matches the fork and WM reports the ignored
       `Zebar - spotco.tokyo-silence / bar` window.
-- [ ] Physical Super+J / Super+Shift+Ctrl+Arrow and visual tray-hover checks
-      remain desktop-only observations; the computer-use surface did not expose
-      native windows for those observations.
+- [x] CLI-equivalent Super+J / Super+Shift+Ctrl+Arrow checks passed, including
+      horizontal and vertical normal moves, opposite-axis moves, structural
+      H→V→H preservation, spotco bar detection, and soft-exit Zebar shutdown
+      and restart. See `GLOBAL_TILING_DIRECTION_SMOKE.log`.
+- [ ] Physical key injection and visual tray-hover appearance remain desktop-only
+      observations; the CLI harness verifies the tray bar process/window identity.
 
 ## Decisions (Step 0)
 
