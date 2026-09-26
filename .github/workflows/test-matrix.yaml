@@ -1,4 +1,4 @@
-name: Lint check
+name: Test matrix
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
-  lint-check:
+  test:
     strategy:
       fail-fast: false
       matrix:
@@ -21,17 +21,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17
         with:
-          components: clippy, rustfmt
           targets: ${{ matrix.target }}
           toolchain: nightly
 
       - uses: swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
-          shared-key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          shared-key: test-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Check formatting (rustfmt)
-        run: cargo fmt --check
+      - name: Test wm-common (lib)
+        run: cargo test -p wm-common --lib
 
-      # Clippy itself runs `cargo check`, so this will also check for compilation errors.
-      - name: Check linting (clippy)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test wm-cli (lib)
+        run: cargo test -p wm-cli --lib
+
+      - name: Check wm and wm-cli
+        run: cargo check -p wm -p wm-cli

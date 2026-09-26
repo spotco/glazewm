@@ -656,6 +656,33 @@ impl WmState {
       .cloned()
   }
 
+  /// Best-effort: manage any currently visible top-level windows that are
+  /// not already in the container tree (e.g. after uncloaking orphans).
+  pub fn manage_new_visible_windows(
+    &mut self,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    for native_window in
+      self.dispatcher.visible_windows()?.into_iter().rev()
+    {
+      if self.window_from_native(&native_window).is_some() {
+        continue;
+      }
+      let nearest_workspace = self
+        .nearest_monitor(&native_window)
+        .and_then(|m| m.displayed_workspace());
+      if let Some(workspace) = nearest_workspace {
+        manage_window(
+          native_window,
+          Some(workspace.into()),
+          self,
+          config,
+        )?;
+      }
+    }
+    Ok(())
+  }
+
   /// Cleans up windows that are no longer alive.
   ///
   /// This addresses the "ghost window" issue where applications may
