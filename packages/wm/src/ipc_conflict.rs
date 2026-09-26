@@ -10,7 +10,7 @@
 //! 2. On AddrInUse: prompt Kill vs Quit; kill glazewm + watcher + listener PID.
 //! 3. Poll bind for ~5s (ghost sockets are not freed by taskkill).
 //! 4. Detect ghost (netstat PID absent from process list) and fall back.
-//! 5. Fallback: try preferred+1..+10, then ephemeral `127.0.0.1:0`; write
+//! 5. Fallback: try preferred+1.. (skip 6124 = Zebar asset server), then ephemeral; write
 //!    `~/.glzr/glazewm/ipc.port` so CLI/`ipc_port()` find the new port.
 //!
 //! **Prevention:** soft `wm-exit` must Drop the TcpListener (SO_LINGER=0) via
@@ -215,15 +215,30 @@ async fn finish_bind(
   Ok((listener, addr))
 }
 
+/// Ports reserved by sibling glzr.io tools — never steal these for IPC fallback.
+/// Zebar's localhost asset server is hardcoded to 6124 (`asset_server.rs`).
+const RESERVED_FALLBACK_PORTS: &[u32] = &[6124];
+
+fn is_reserved_fallback_port(port: u32) -> bool {
+  RESERVED_FALLBACK_PORTS.contains(&port)
+}
+
 async fn bind_fallback_ports(
   preferred: u32,
   saw_ghost: bool,
   last_detail: &str,
 ) -> anyhow::Result<(TcpListener, String)> {
   let start = preferred.saturating_add(1);
-  let end = preferred.saturating_add(FALLBACK_PORT_SPAN);
+  // Span further so skipping reserved ports still yields candidates.
+  let end = preferred.saturating_add(FALLBACK_PORT_SPAN + 2);
   for port in start..=end {
     if port == 0 {
+      continue;
+    }
+    if is_reserved_fallback_port(port) {
+      layout_debug_log(format!(
+        "IPC fallback skipping reserved port {port} (Zebar asset server / glzr.io)"
+      ));
       continue;
     }
     match try_bind_port(port).await {
