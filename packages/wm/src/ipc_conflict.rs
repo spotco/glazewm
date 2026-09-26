@@ -6,7 +6,7 @@
 //! `std::io::ErrorKind::AddrInUse` / WSAEADDRINUSE (10048).
 //!
 //! Flow:
-//! 1. Try preferred port (`GLAZEWM_IPC_PORT` / `ipc.port` / 6123).
+//! 1. Try preferred bind port (`GLAZEWM_IPC_PORT` / 6123) - not `ipc.port`.
 //! 2. On AddrInUse: prompt Kill vs Quit; kill glazewm + watcher + listener PID.
 //! 3. Poll bind for ~5s (ghost sockets are not freed by taskkill).
 //! 4. Detect ghost (netstat PID absent from process list) and fall back.
@@ -28,7 +28,7 @@ use anyhow::{bail, Context};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use wm_common::{
-  clear_ipc_port_file, ipc_port, write_ipc_port_file, DEFAULT_IPC_PORT,
+  clear_ipc_port_file, preferred_bind_port, write_ipc_port_file, DEFAULT_IPC_PORT,
 };
 use wm_platform::Dispatcher;
 
@@ -70,7 +70,7 @@ pub fn is_addr_in_use(err: &io::Error) -> bool {
 pub async fn bind_ipc_listener(
   dispatcher: &Dispatcher,
 ) -> anyhow::Result<(TcpListener, String)> {
-  let preferred = ipc_port();
+  let preferred = preferred_bind_port();
   let mut kill_rounds: u32 = 0;
   let mut last_detail = String::new();
   let mut saw_ghost = false;

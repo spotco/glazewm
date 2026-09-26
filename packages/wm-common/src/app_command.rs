@@ -321,6 +321,8 @@ pub enum InvokeCommand {
     name: String,
   },
   WmExit,
+  /// Uncloak DWM-cloaked top-level windows not currently managed (Windows).
+  WmUncloakNonTracked,
   WmRedraw,
   WmReloadConfig,
   WmTogglePause,

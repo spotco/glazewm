@@ -663,6 +663,32 @@ impl WmState {
   /// windows in WM state.
   ///
   /// See: <https://github.com/glzr-io/glazewm/issues/1219>
+
+  /// Best-effort: manage any currently visible top-level windows that are
+  /// not already in the container tree (e.g. after uncloaking orphans).
+  pub fn manage_new_visible_windows(
+    &mut self,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    for native_window in self.dispatcher.visible_windows()?.into_iter().rev() {
+      if self.window_from_native(&native_window).is_some() {
+        continue;
+      }
+      let nearest_workspace = self
+        .nearest_monitor(&native_window)
+        .and_then(|m| m.displayed_workspace());
+      if let Some(workspace) = nearest_workspace {
+        manage_window(
+          native_window,
+          Some(workspace.into()),
+          self,
+          config,
+        )?;
+      }
+    }
+    Ok(())
+  }
+
   pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
     let invalid_windows = self
       .windows()

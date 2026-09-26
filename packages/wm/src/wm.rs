@@ -765,6 +765,36 @@ impl WindowManager {
         enable_binding_mode(name, state, config)
       }
       InvokeCommand::WmExit => state.emit_exit(),
+      InvokeCommand::WmUncloakNonTracked => {
+        #[cfg(target_os = "windows")]
+        {
+          let skip: Vec<isize> = state
+            .windows()
+            .into_iter()
+            .map(|w| w.native().id().0)
+            .collect();
+          match state.dispatcher.unhide_all_cloaked_windows(&skip) {
+            Ok(n) => {
+              let msg = format!(
+                "wm-uncloak-non-tracked: uncloaked {n} orphan window(s)"
+              );
+              tracing::info!("{msg}");
+              crate::commands::general::layout_debug_log(msg);
+            }
+            Err(err) => {
+              let msg = format!(
+                "wm-uncloak-non-tracked: failed: {err:?}"
+              );
+              tracing::warn!("{msg}");
+              crate::commands::general::layout_debug_log(msg);
+            }
+          }
+          if let Err(err) = state.manage_new_visible_windows(config) {
+            tracing::warn!("post-uncloak manage scan failed: {err:?}");
+          }
+        }
+        Ok(())
+      }
       InvokeCommand::WmRedraw => {
         state
           .pending_sync

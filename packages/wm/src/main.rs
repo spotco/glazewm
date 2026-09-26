@@ -49,6 +49,8 @@ mod models;
 mod pending_sync;
 mod sys_tray;
 mod traits;
+
+use crate::traits::WindowGetters;
 mod user_config;
 mod wm;
 mod wm_state;
@@ -283,6 +285,47 @@ async fn start_wm(
       Some(()) = tray.exit_rx.recv() => {
         tracing::info!("Exiting through system tray.");
         break;
+      },
+      Some(()) = tray.uncloak_non_tracked_rx.recv() => {
+        (|| -> anyhow::Result<()> {
+          tracing::info!("Tray: Uncloak all non-tracked windows");
+          #[cfg(target_os = "windows")]
+          {
+            // Skip handles GlazeWM already manages; only orphan cloaked HWNDs.
+            let skip: Vec<isize> = wm
+              .state
+              .windows()
+              .into_iter()
+              .map(|w| w.native().id().0)
+              .collect();
+            match dispatcher.unhide_all_cloaked_windows(&skip) {
+              Ok(n) => {
+                let msg = format!(
+                  "tray uncloak-non-tracked: uncloaked {n} orphan window(s)"
+                );
+                tracing::info!("{msg}");
+                crate::commands::general::layout_debug_log(msg);
+              }
+              Err(err) => {
+                let msg = format!(
+                  "tray uncloak-non-tracked: failed: {err:?}"
+                );
+                tracing::warn!("{msg}");
+                crate::commands::general::layout_debug_log(msg);
+              }
+            }
+            if let Err(err) = wm.state.manage_new_visible_windows(&mut config) {
+              tracing::warn!("post-uncloak manage scan failed: {err:?}");
+              crate::commands::general::layout_debug_log(format!(
+                "tray uncloak-non-tracked: manage scan failed: {err:?}"
+              ));
+            }
+            if wm.state.pending_sync.has_changes() {
+              platform_sync(&mut wm.state, &config)?;
+            }
+          }
+          Ok(())
+        })()
       },
       Some(event) = mouse_listener.next_event() => {
         tracing::debug!("Received mouse event: {:?}", event);

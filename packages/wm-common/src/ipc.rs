@@ -33,7 +33,26 @@ pub fn ipc_port_file_path() -> Option<std::path::PathBuf> {
   glazewm_config_dir().map(|d| d.join(IPC_PORT_FILE_NAME))
 }
 
-/// Resolve IPC port: `GLAZEWM_IPC_PORT` env, else `ipc.port` file, else default.
+/// Port the WM should try first when binding the IPC listener.
+///
+/// Order: `GLAZEWM_IPC_PORT` env, else [`DEFAULT_IPC_PORT`].
+/// Does **not** read `ipc.port` - that file is for clients discovering a
+/// fallback bind. Re-reading it as the server preferred port permanently
+/// stuck the WM on e.g. 6125 after a ghost on 6123, while Zebar/`WmClient`
+/// still defaulted to 6123.
+#[must_use]
+pub fn preferred_bind_port() -> u32 {
+  if let Ok(s) = std::env::var("GLAZEWM_IPC_PORT") {
+    if let Ok(p) = s.parse::<u32>() {
+      if p > 0 {
+        return p;
+      }
+    }
+  }
+  DEFAULT_IPC_PORT
+}
+
+/// Resolve IPC port for **clients**: `GLAZEWM_IPC_PORT` env, else `ipc.port` file, else default.
 #[must_use]
 pub fn ipc_port() -> u32 {
   if let Ok(s) = std::env::var("GLAZEWM_IPC_PORT") {

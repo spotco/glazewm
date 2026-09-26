@@ -288,3 +288,7 @@ Inventory + fixes (feature/layout-snapshot-save-load):
 
 Verify: soft wm-exit → netstat no LISTENING on bound port within ~1s; start via quoted path only; windows remain visible.
 
+## 2026-09-26 - Uncloak non-tracked tray + Zebar IPC port discovery
+
+- **Tray:** `Uncloak all non-tracked windows` in `sys_tray.rs` (above Exit). `EnumWindows` + uncloak/show DWM-cloaked HWNDs **not** in the managed container tree (orphans from prior cloak hide); does **not** exit. Then `manage_new_visible_windows` re-scan. Also `InvokeCommand::WmUncloakNonTracked` / `glazewm command wm-uncloak-non-tracked`.
+- **Zebar workspace blank:** `WmClient` hardcoded 6123 while WM fell back to 6125 and wrote `ipc.port`. Zebar webview stayed on ghost 6123. Fix: Zebar provider reads `%USERPROFILE%\.glzr\glazewm\ipc.port`; GlazeWM bind prefers `GLAZEWM_IPC_PORT`/6123 (`preferred_bind_port`), not the fallback file.

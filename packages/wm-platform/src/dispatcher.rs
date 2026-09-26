@@ -553,6 +553,18 @@ impl Dispatcher {
     platform_impl::visible_windows(self)
   }
 
+  /// Uncloak/show all top-level cloaked windows (Windows DWM cloak).
+  ///
+  /// Enumerates via `EnumWindows` including cloaked HWNDs that
+  /// `visible_windows` filters out. macOS returns 0.
+  pub fn unhide_all_cloaked_windows(
+    &self,
+    skip_handles: &[isize],
+  ) -> crate::Result<usize> {
+    platform_impl::unhide_all_cloaked_windows(skip_handles, self)
+  }
+
+
   /// Gets the currently focused (foreground) window.
   ///
   /// This may be the desktop window if no window has focus.

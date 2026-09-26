@@ -27,6 +27,7 @@ enum TrayMenuId {
   ToggleWindowAnimations,
   RunOnStartup,
   Exit,
+  UncloakNonTracked,
 }
 
 impl Display for TrayMenuId {
@@ -49,6 +50,9 @@ impl Display for TrayMenuId {
       }
       TrayMenuId::RunOnStartup => write!(f, "run_on_startup"),
       TrayMenuId::Exit => write!(f, "exit"),
+      TrayMenuId::UncloakNonTracked => {
+        write!(f, "uncloak_non_tracked")
+      }
     }
   }
 }
@@ -67,6 +71,7 @@ impl FromStr for TrayMenuId {
       "toggle_window_animations" => Ok(Self::ToggleWindowAnimations),
       "run_on_startup" => Ok(Self::RunOnStartup),
       "exit" => Ok(Self::Exit),
+      "uncloak_non_tracked" => Ok(Self::UncloakNonTracked),
       _ => anyhow::bail!("Invalid tray menu event: {}", event),
     }
   }
@@ -78,6 +83,7 @@ pub struct SystemTray {
   pub save_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
   pub load_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
   pub exit_rx: mpsc::UnboundedReceiver<()>,
+  pub uncloak_non_tracked_rx: mpsc::UnboundedReceiver<()>,
   _icon_thread: Option<std::thread::JoinHandle<()>>,
   _tray_icon: ThreadBound<TrayIcon>,
 }
@@ -89,6 +95,8 @@ impl SystemTray {
     dispatcher: Dispatcher,
   ) -> anyhow::Result<Self> {
     let (exit_tx, exit_rx) = mpsc::unbounded_channel();
+    let (uncloak_non_tracked_tx, uncloak_non_tracked_rx) =
+      mpsc::unbounded_channel();
     let (config_reload_tx, config_reload_rx) = mpsc::unbounded_channel();
     let (copy_layout_snapshot_tx, copy_layout_snapshot_rx) =
       mpsc::unbounded_channel();
@@ -141,6 +149,7 @@ impl SystemTray {
             &save_layout_snapshot_tx,
             &load_layout_snapshot_tx,
             &exit_tx,
+            &uncloak_non_tracked_tx,
             &animations_enabled,
             &run_on_startup_enabled,
           ) {
@@ -156,6 +165,7 @@ impl SystemTray {
       save_layout_snapshot_rx,
       load_layout_snapshot_rx,
       exit_rx,
+      uncloak_non_tracked_rx,
       _icon_thread: Some(icon_thread),
       _tray_icon: tray_icon,
     })
@@ -219,6 +229,14 @@ impl SystemTray {
       None,
     );
 
+    #[cfg(target_os = "windows")]
+    let unhide_all_item = MenuItem::with_id(
+      TrayMenuId::UncloakNonTracked,
+      "Uncloak all non-tracked windows",
+      true,
+      None,
+    );
+
     let exit_item =
       MenuItem::with_id(TrayMenuId::Exit, "Exit", true, None);
 
@@ -235,6 +253,8 @@ impl SystemTray {
       &toggle_animations_item,
       &run_on_startup_item,
       &PredefinedMenuItem::separator(),
+      #[cfg(target_os = "windows")]
+      &unhide_all_item,
       &exit_item,
     ])?;
 
@@ -279,6 +299,7 @@ impl SystemTray {
     save_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
     load_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
     exit_tx: &mpsc::UnboundedSender<()>,
+    uncloak_non_tracked_tx: &mpsc::UnboundedSender<()>,
     // LINT: `animations_enabled` is only used on Windows.
     #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     animations_enabled: &Arc<Mutex<bool>>,
@@ -341,6 +362,10 @@ impl SystemTray {
       }
       TrayMenuId::Exit => {
         exit_tx.send(())?;
+        Ok(())
+      }
+      TrayMenuId::UncloakNonTracked => {
+        uncloak_non_tracked_tx.send(())?;
         Ok(())
       }
     }
