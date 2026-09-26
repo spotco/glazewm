@@ -31,9 +31,8 @@ use wm_platform::{
 
 use crate::{
   commands::general::{
-    layout_debug_log_path,
-    layout_snapshot_path, load_layout_snapshot, pick_layout_snapshot_path,
-    platform_sync, read_layout_snapshot_file,
+    layout_debug_log_path, layout_snapshot_path, load_layout_snapshot,
+    pick_layout_snapshot_path, platform_sync, read_layout_snapshot_file,
     save_layout_snapshot_with_dialog, set_layout_debug_log_path,
     try_load_persisted_layout_snapshot, wm_event_affects_layout_snapshot,
     LayoutAutoSave,

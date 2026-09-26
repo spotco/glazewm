@@ -59,6 +59,11 @@ if errorlevel 1 (
   exit /b 1
 )
 
+rem Fresh spotcobuild stamp each run (build.rs re-runs via SPOTCO_BUILD_TRIGGER).
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "Get-Date -Format 'yyyyMMdd-HHmmss'"`) do set "SPOTCO_BUILD_ID=spotcobuild-%%I"
+set "SPOTCO_BUILD_TRIGGER=%SPOTCO_BUILD_ID%_%RANDOM%"
+echo Spotco build id: %SPOTCO_BUILD_ID%
+echo Spotco build id: %SPOTCO_BUILD_ID%>> "%LOG%"
 echo.
 echo [1/2] cargo build --release
 echo -----

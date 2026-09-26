@@ -246,7 +246,7 @@ impl SystemTray {
 
     let tray_icon = TrayIconBuilder::new()
       .with_menu(Box::new(tray_menu))
-      .with_tooltip(format!("GlazeWM v{}", env!("VERSION_NUMBER")))
+      .with_tooltip(format!("GlazeWM {}", env!("SPOTCO_BUILD_ID")))
       .with_icon(icon)
       .build()?;
 
