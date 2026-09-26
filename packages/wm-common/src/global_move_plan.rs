@@ -559,11 +559,7 @@ mod tests {
   #[test]
   fn deep_fixture_inner_focus_covers_all_arrows() {
     let cases = [
-      (
-        TilingDirection::Horizontal,
-        Direction::Left,
-        None,
-      ),
+      (TilingDirection::Horizontal, Direction::Left, None),
       (
         TilingDirection::Horizontal,
         Direction::Right,
