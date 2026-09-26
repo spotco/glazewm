@@ -4,7 +4,9 @@ use anyhow::Context;
 use tokio::sync::mpsc::{self};
 use tracing::warn;
 use uuid::Uuid;
-use wm_common::{BindingModeConfig, HideCorner, TilingDirection, WindowState, WmEvent};
+use wm_common::{
+  BindingModeConfig, HideCorner, TilingDirection, WindowState, WmEvent,
+};
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
 };
@@ -738,4 +740,3 @@ impl Drop for WmState {
     }
   }
 }
-

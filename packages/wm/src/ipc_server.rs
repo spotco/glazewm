@@ -15,10 +15,10 @@ use wm_common::{
   format_system_time_rfc3339, AppCommand, AppMetadataData,
   BindingModesData, ClientResponseData, ClientResponseMessage,
   CommandData, EventSubscribeData, EventSubscriptionMessage, FocusedData,
-  IgnoredWindowsData, LayoutSnapshot, LoadLayoutData, MonitorsData,
-  QueryCommand, ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
-  SubscribableEvent, GlobalTilingDirectionData, TilingDirectionData, WindowsData, WmEvent,
-  WorkspacesData,
+  GlobalTilingDirectionData, IgnoredWindowsData, LayoutSnapshot,
+  LoadLayoutData, MonitorsData, QueryCommand, ServerMessage,
+  SnapshotWindow, SnapshotWindowIdentity, SubscribableEvent,
+  TilingDirectionData, WindowsData, WmEvent, WorkspacesData,
 };
 use wm_platform::Dispatcher;
 

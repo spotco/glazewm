@@ -1,7 +1,7 @@
 # Global tiling direction + consistent Super+Shift(+Ctrl) move Plan
 
 Date: 2026-09-26
-Status: Ready for implementation (all Step 0 questions locked 2026-09-26)
+Status: Paused mid Step 9 (impl Steps 0–8 committed; rustfmt/clippy WIP saved 2026-09-26)
 Branch: `glazewm-spotcobuild` (GlazeWM) + `zebar-spotcobuild` (Zebar pack / provider as needed)
 Scope: multi-day feature work (WM move semantics + global direction state + Zebar indicator + default config)
 

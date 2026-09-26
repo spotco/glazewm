@@ -1,15 +1,14 @@
 use wm_common::{TilingDirection, WmEvent};
 
 use crate::{
-  models::Container,
-  traits::CommonGetters,
-  user_config::UserConfig,
+  models::Container, traits::CommonGetters, user_config::UserConfig,
   wm_state::WmState,
 };
 
 /// Spotcobuild: flip the WM-wide `global_tiling_direction` only.
 ///
-/// Does not wrap/flatten the focused window or mutate per-split directions.
+/// Does not wrap/flatten the focused window or mutate per-split
+/// directions.
 pub fn toggle_tiling_direction(
   _container: Container,
   state: &mut WmState,

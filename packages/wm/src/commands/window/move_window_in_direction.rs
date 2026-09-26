@@ -190,6 +190,7 @@ fn move_orthogonal(
   )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn join_with_neighbor_on_stack(
   window_to_move: TilingWindow,
   neighbor: TilingContainer,
@@ -258,6 +259,7 @@ fn join_with_neighbor_on_stack(
   Ok(())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn restructure_workspace_to_stack(
   window_to_move: TilingWindow,
   direction: &Direction,
@@ -319,10 +321,15 @@ fn workspace_child_containing(
   })
 }
 
-fn split_contains_window(split: &SplitContainer, window_id: uuid::Uuid) -> bool {
+fn split_contains_window(
+  split: &SplitContainer,
+  window_id: uuid::Uuid,
+) -> bool {
   split.tiling_children().any(|child| match child {
     TilingContainer::TilingWindow(w) => w.id() == window_id,
-    TilingContainer::Split(inner) => split_contains_window(&inner, window_id),
+    TilingContainer::Split(inner) => {
+      split_contains_window(&inner, window_id)
+    }
   })
 }
 

@@ -38,7 +38,8 @@ pub enum WmEvent {
     direction_container: ContainerDto,
     new_tiling_direction: TilingDirection,
   },
-  /// Spotcobuild: WM-wide stack axis changed (Super+J / set-tiling-direction).
+  /// Spotcobuild: WM-wide stack axis changed (Super+J /
+  /// set-tiling-direction).
   GlobalTilingDirectionChanged {
     new_tiling_direction: TilingDirection,
   },
@@ -68,4 +69,3 @@ pub enum WmEvent {
     is_paused: bool,
   },
 }
-

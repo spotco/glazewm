@@ -440,7 +440,8 @@ pub struct InvokeMoveCommand {
   pub direction: Option<Direction>,
 
   /// Use the inverse of the WM global stack direction for this move only
-  /// (does not flip the stored global flag). Spotcobuild Super+Shift+Ctrl.
+  /// (does not flip the stored global flag). Spotcobuild
+  /// Super+Shift+Ctrl.
   #[clap(long, group = "opposite_tiling_direction_flag")]
   pub opposite_tiling_direction: bool,
 
@@ -588,6 +589,3 @@ mod shell_exec_ipc_tests {
     assert_eq!(again, command);
   }
 }
-
-
-

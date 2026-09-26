@@ -174,7 +174,8 @@ pub struct MonitorsData {
 pub struct TilingDirectionData {
   pub tiling_direction: TilingDirection,
   pub direction_container: ContainerDto,
-  /// Spotcobuild WM-wide stack axis (also available via `query global-tiling-direction`).
+  /// Spotcobuild WM-wide stack axis (also available via `query
+  /// global-tiling-direction`).
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub global_tiling_direction: Option<TilingDirection>,
 }
@@ -216,4 +217,3 @@ pub struct EventSubscriptionMessage {
   pub subscription_id: Uuid,
   pub success: bool,
 }
-

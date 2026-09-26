@@ -1,6 +1,6 @@
 //! Pure tree planner for spotcobuild global-stack-direction moves.
 //!
-//! Reference algorithm for live move_window_in_direction and unit tests.
+//! Reference algorithm for live `move_window_in_direction` and unit tests.
 
 use wm_platform::Direction;
 
@@ -126,7 +126,8 @@ fn flatten_single_child_at(children: &mut Vec<MoveNode>, index: usize) {
   }
   match children.remove(index) {
     MoveNode::Split {
-      children: mut inner, ..
+      children: mut inner,
+      ..
     } if !inner.is_empty() => {
       children.insert(index, inner.remove(0));
     }
@@ -172,7 +173,8 @@ fn normalize_children(
     );
     if collapse {
       if let MoveNode::Split {
-        children: mut inner, ..
+        children: mut inner,
+        ..
       } = children.remove(i)
       {
         children.insert(i, inner.remove(0));
@@ -201,7 +203,7 @@ fn normalize_children(
   }
 }
 
-/// Plan a directional move using stack_direction as the insertion axis.
+/// Plan a directional move using `stack_direction` as the insertion axis.
 ///
 /// Returns None when the focused window is at the workspace edge on the
 /// stack axis with no sibling (live code may cross monitors).
@@ -261,9 +263,7 @@ fn plan_parallel(
     _ => None,
   };
 
-  let Some(neighbor_idx) = neighbor_idx else {
-    return None;
-  };
+  let neighbor_idx = neighbor_idx?;
 
   let neighbor_node = tree.children[neighbor_idx].clone();
   let window = extract_from_children(&mut tree.children, focus_id)?;
@@ -279,7 +279,9 @@ fn plan_parallel(
     Direction::Right | Direction::Down => new_neighbor_idx + 1,
   };
 
-  tree.children.insert(insert_at.min(tree.children.len()), window);
+  tree
+    .children
+    .insert(insert_at.min(tree.children.len()), window);
   Some(())
 }
 

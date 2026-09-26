@@ -73,7 +73,8 @@ pub fn load_layout_snapshot(
     anyhow::bail!("{msg}");
   }
 
-  // Spotcobuild: restore WM-wide stack axis (default Horizontal if absent).
+  // Spotcobuild: restore WM-wide stack axis (default Horizontal if
+  // absent).
   let global_dir = snapshot
     .global_tiling_direction
     .clone()
