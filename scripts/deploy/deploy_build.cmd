@@ -20,12 +20,12 @@ echo Soft-exiting GlazeWM (wm-exit) so IPC listen socket is Dropped...
 REM Prefer soft exit over taskkill /F — hard kill leaves ghost LISTENING ports.
 if exist "%INSTALL%\glazewm.exe" (
   "%INSTALL%\glazewm.exe" command wm-exit >nul 2>&1
-  timeout /t 2 /nobreak >nul
+  ping -n 3 127.0.0.1 >nul
 )
 echo Stopping any remaining GlazeWM processes...
 taskkill /IM glazewm.exe /F >nul 2>&1
 taskkill /IM glazewm-watcher.exe /F >nul 2>&1
-timeout /t 1 /nobreak >nul
+ping -n 2 127.0.0.1 >nul
 
 echo Copying artifacts -^> "%INSTALL%"
 copy /Y "%REL%\glazewm.exe" "%INSTALL%\glazewm.exe"
