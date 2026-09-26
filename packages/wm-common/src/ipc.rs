@@ -74,7 +74,8 @@ pub fn ipc_port() -> u32 {
   DEFAULT_IPC_PORT
 }
 
-/// Persist the active IPC port so CLI clients find a fallback bind.
+/// Persist the active IPC port so CLI/Zebar clients discover the bind.
+/// Always written after a successful bind (including preferred 6123).
 pub fn write_ipc_port_file(port: u32) -> std::io::Result<()> {
   let path = ipc_port_file_path().ok_or_else(|| {
     std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory")

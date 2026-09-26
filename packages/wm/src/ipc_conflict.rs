@@ -28,7 +28,7 @@ use anyhow::{bail, Context};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use wm_common::{
-  clear_ipc_port_file, preferred_bind_port, write_ipc_port_file, DEFAULT_IPC_PORT,
+  preferred_bind_port, write_ipc_port_file,
 };
 use wm_platform::Dispatcher;
 
@@ -38,7 +38,7 @@ use crate::commands::general::layout_debug_log;
 const MAX_KILL_RETRY_ROUNDS: u32 = 2;
 
 /// After each kill round, keep trying to bind for this long before giving up.
-const POST_KILL_POLL: Duration = Duration::from_secs(5);
+const POST_KILL_POLL: Duration = Duration::from_millis(1500);
 const POST_KILL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Alternate ports to try after preferred is a ghost / still busy.
@@ -71,6 +71,10 @@ pub async fn bind_ipc_listener(
   dispatcher: &Dispatcher,
 ) -> anyhow::Result<(TcpListener, String)> {
   let preferred = preferred_bind_port();
+  let bind_started = Instant::now();
+  layout_debug_log(format!(
+    "IPC bind attempt preferred=127.0.0.1:{preferred}"
+  ));
   let mut kill_rounds: u32 = 0;
   let mut last_detail = String::new();
   let mut saw_ghost = false;
@@ -78,6 +82,10 @@ pub async fn bind_ipc_listener(
   loop {
     match try_bind_port(preferred).await {
       Ok(listener) => {
+        layout_debug_log(format!(
+          "IPC preferred bind ok on {preferred} in {}ms",
+          bind_started.elapsed().as_millis()
+        ));
         return finish_bind(listener, preferred, preferred, kill_rounds).await;
       }
       Err(err) if is_addr_in_use(&err) => {
@@ -102,7 +110,7 @@ pub async fn bind_ipc_listener(
           layout_debug_log(format!("IPC ghost cleanup: {report}"));
           // Quick poll in case it was not actually a ghost.
           if let Some(listener) =
-            poll_bind_port(preferred, Duration::from_secs(1), POST_KILL_POLL_INTERVAL)
+            poll_bind_port(preferred, Duration::from_millis(250), POST_KILL_POLL_INTERVAL)
               .await
           {
             return finish_bind(listener, preferred, preferred, kill_rounds).await;
@@ -183,7 +191,8 @@ pub async fn bind_ipc_listener(
 
   // Fallback: alternate ports, then ephemeral.
   layout_debug_log(format!(
-    "IPC falling back from {preferred} (ghost={saw_ghost}, kill_rounds={kill_rounds}, last={last_detail})"
+    "IPC falling back from {preferred} (ghost={saw_ghost}, kill_rounds={kill_rounds}, elapsed={}ms, last={last_detail})",
+    bind_started.elapsed().as_millis()
   ));
   bind_fallback_ports(preferred, saw_ghost, &last_detail).await
 }
@@ -195,23 +204,24 @@ async fn finish_bind(
   kill_rounds: u32,
 ) -> anyhow::Result<(TcpListener, String)> {
   let addr = format!("127.0.0.1:{bound_port}");
-  if bound_port == DEFAULT_IPC_PORT {
-    clear_ipc_port_file();
-  } else if let Err(err) = write_ipc_port_file(bound_port) {
-    warn!("Failed to write ipc.port file: {err}");
-    layout_debug_log(format!("Failed to write ipc.port: {err}"));
-  } else {
-    layout_debug_log(format!(
-      "Wrote ipc.port -> {bound_port} (CLI will use this port)"
-    ));
+  // Always write ipc.port so Zebar/CLI have a single authoritative port
+  // (including when bound to preferred 6123). Do not clear on default.
+  match write_ipc_port_file(bound_port) {
+    Ok(()) => {
+      layout_debug_log(format!(
+        "IPC ipc.port write -> {bound_port} (preferred={preferred}, kill_rounds={kill_rounds})"
+      ));
+    }
+    Err(err) => {
+      warn!("Failed to write ipc.port file: {err}");
+      layout_debug_log(format!("IPC ipc.port write FAILED: {err}"));
+    }
   }
-  if kill_rounds > 0 || bound_port != preferred {
-    let msg = format!(
-      "IPC bind succeeded on {addr} (preferred={preferred}, kill_rounds={kill_rounds})"
-    );
-    info!("{msg}");
-    layout_debug_log(&msg);
-  }
+  let msg = format!(
+    "IPC bind succeeded on {addr} (preferred={preferred}, kill_rounds={kill_rounds})"
+  );
+  info!("{msg}");
+  layout_debug_log(&msg);
   Ok((listener, addr))
 }
 
@@ -362,10 +372,21 @@ pub fn port_has_ghost_listener(port: u32) -> bool {
   }
 }
 
+
+#[cfg(target_os = "windows")]
+fn hidden_command(program: &str) -> Command {
+  use std::os::windows::process::CommandExt;
+  // CREATE_NO_WINDOW: prevent blank console flashes for tasklist/netstat/taskkill.
+  const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+  let mut cmd = Command::new(program);
+  cmd.creation_flags(CREATE_NO_WINDOW);
+  cmd
+}
+
 #[cfg(target_os = "windows")]
 fn process_exists(pid: u32) -> bool {
   // tasklist /FI "PID eq N" — avoid depending on OpenProcess privileges.
-  let output = Command::new("tasklist")
+  let output = hidden_command("tasklist")
     .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
     .output();
   let Ok(output) = output else {
@@ -516,7 +537,7 @@ fn kill_named_others(self_pid: u32, names: &[&str]) -> String {
 
 #[cfg(target_os = "windows")]
 fn pids_for_image_name(image_name: &str) -> anyhow::Result<Vec<u32>> {
-  let output = Command::new("tasklist")
+  let output = hidden_command("tasklist")
     .args([
       "/FI",
       &format!("IMAGENAME eq {image_name}"),
@@ -552,7 +573,7 @@ fn parse_csv_line(line: &str) -> Vec<&str> {
 
 #[cfg(target_os = "windows")]
 fn taskkill_pid(pid: u32) -> anyhow::Result<bool> {
-  let output = Command::new("taskkill")
+  let output = hidden_command("taskkill")
     .args(["/PID", &pid.to_string(), "/F", "/T"])
     .output()
     .context("failed to run taskkill")?;
@@ -585,7 +606,7 @@ fn taskkill_pid(pid: u32) -> anyhow::Result<bool> {
 /// PIDs shown by `netstat -ano` as LISTENING on 127.0.0.1:`port` (or 0.0.0.0).
 #[cfg(target_os = "windows")]
 fn listener_pids_on_port(port: u32) -> anyhow::Result<Vec<u32>> {
-  let output = Command::new("netstat")
+  let output = hidden_command("netstat")
     .args(["-ano", "-p", "tcp"])
     .output()
     .context("failed to run netstat")?;

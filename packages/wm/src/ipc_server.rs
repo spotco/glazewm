@@ -540,8 +540,16 @@ impl IpcServer {
   /// closed can leave a ghost LISTENING entry (netstat PID with no process).
   /// Soft wm-exit must always take this path; taskkill /F cannot free ghosts.
   pub async fn stop_and_wait(&mut self) {
+    let started = std::time::Instant::now();
+    crate::commands::general::layout_debug_log(
+      "wm-exit: IPC listener drop start",
+    );
     self.stop();
     let Some(handle) = self.join_handle.take() else {
+      crate::commands::general::layout_debug_log(format!(
+        "wm-exit: IPC listener already stopped ({}ms)",
+        started.elapsed().as_millis()
+      ));
       return;
     };
     let abort = handle.abort_handle();
@@ -550,9 +558,17 @@ impl IpcServer {
     {
       Ok(Ok(())) => {
         info!("IPC accept loop joined; TcpListener dropped.");
+        crate::commands::general::layout_debug_log(format!(
+          "wm-exit: IPC listener drop done (joined, {}ms)",
+          started.elapsed().as_millis()
+        ));
       }
       Ok(Err(err)) => {
         warn!("IPC accept loop join error: {err}");
+        crate::commands::general::layout_debug_log(format!(
+          "wm-exit: IPC listener join error: {err} ({}ms)",
+          started.elapsed().as_millis()
+        ));
       }
       Err(_) => {
         warn!(
@@ -561,6 +577,10 @@ impl IpcServer {
         abort.abort();
         // Give the abort a moment to drop the listener future locals.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::commands::general::layout_debug_log(format!(
+          "wm-exit: IPC listener drop done (aborted after timeout, {}ms)",
+          started.elapsed().as_millis()
+        ));
       }
     }
   }
