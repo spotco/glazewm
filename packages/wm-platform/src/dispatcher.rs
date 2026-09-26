@@ -37,9 +37,9 @@ use windows::{
       },
       WindowsAndMessaging::{
         GetCursorPos, MessageBoxW, SetCursorPos, SystemParametersInfoW,
-        ANIMATIONINFO, MB_ICONERROR, MB_OK, MB_SYSTEMMODAL,
-        SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SPI_GETANIMATION,
-        SPI_SETANIMATION, SW_HIDE, SW_NORMAL,
+        ANIMATIONINFO, IDYES, MB_ICONERROR, MB_ICONWARNING, MB_OK,
+        MB_SYSTEMMODAL, MB_YESNO, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
+        SPI_GETANIMATION, SPI_SETANIMATION, SW_HIDE, SW_NORMAL,
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
       },
     },
@@ -279,6 +279,16 @@ impl DispatcherExtWindows for Dispatcher {
     directory: &Path,
     hide_window: bool,
   ) -> crate::Result<()> {
+    let trimmed = program.trim();
+    if trimmed.is_empty()
+      || trimmed.contains('"')
+      || trimmed.chars().all(|c| c == '\\' || c == '/' || c.is_whitespace())
+    {
+      return Err(crate::Error::Platform(format!(
+        "Refusing ShellExecuteEx for malformed program {program:?} (args={args:?})."
+      )));
+    }
+
     let program_wide =
       program.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
     let args_wide = args.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
@@ -543,6 +553,18 @@ impl Dispatcher {
     platform_impl::visible_windows(self)
   }
 
+  /// Uncloak/show all top-level cloaked windows (Windows DWM cloak).
+  ///
+  /// Enumerates via `EnumWindows` including cloaked HWNDs that
+  /// `visible_windows` filters out. macOS returns 0.
+  pub fn unhide_all_cloaked_windows(
+    &self,
+    skip_handles: &[isize],
+  ) -> crate::Result<usize> {
+    platform_impl::unhide_all_cloaked_windows(skip_handles, self)
+  }
+
+
   /// Gets the currently focused (foreground) window.
   ///
   /// This may be the desktop window if no window has focus.
@@ -668,6 +690,54 @@ impl Dispatcher {
   ///
   /// Blocks the current thread until the user dismisses the dialog.
   #[allow(clippy::missing_panics_doc)]
+  /// Shows a modal Yes/No dialog. Returns `true` if the user chose Yes.
+  ///
+  /// Blocks the current thread until the user dismisses the dialog.
+  #[must_use]
+  #[allow(clippy::missing_panics_doc)]
+  pub fn show_yes_no_dialog(&self, title: &str, message: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+      let title_wide =
+        title.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+      let message_wide =
+        message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+
+      let result = unsafe {
+        MessageBoxW(
+          None,
+          PCWSTR(message_wide.as_ptr()),
+          PCWSTR(title_wide.as_ptr()),
+          MB_ICONWARNING | MB_YESNO | MB_SYSTEMMODAL,
+        )
+      };
+      return result == IDYES;
+    }
+    #[cfg(target_os = "macos")]
+    {
+      self
+        .dispatch_sync(|| {
+          let mtm = MainThreadMarker::new().unwrap();
+
+          let alert = NSAlert::new(mtm);
+          alert.setMessageText(&NSString::from_str(title));
+          alert.setInformativeText(&NSString::from_str(message));
+          alert.setAlertStyle(NSAlertStyle::Warning);
+          // First button is the default / primary action (Yes).
+          alert.addButtonWithTitle(&NSString::from_str("Yes"));
+          alert.addButtonWithTitle(&NSString::from_str("No"));
+          // NSAlertFirstButtonReturn == 1000
+          alert.runModal().0 == 1000
+        })
+        .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+      let _ = (title, message);
+      false
+    }
+  }
+
   pub fn show_error_dialog(&self, title: &str, message: &str) {
     #[cfg(target_os = "windows")]
     {

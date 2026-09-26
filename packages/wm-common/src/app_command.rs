@@ -1,4 +1,4 @@
-use std::{iter, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{error::KindFormatter, Args, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -64,6 +64,49 @@ pub enum AppCommand {
     #[clap(long = "id")]
     subscription_id: Uuid,
   },
+
+  /// Save a durable layout snapshot JSON to `path` (CLI-local write).
+  ///
+  /// Requires an already running instance of the window manager.
+  /// Equivalent to `query layout -o <path>`.
+  #[clap(name = "save-layout")]
+  SaveLayout {
+    /// Destination path for durable snapshot JSON.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
+
+  /// Load a layout snapshot JSON into the running WM (best-effort restore).
+  ///
+  /// Requires an already running instance of the window manager.
+  /// Use `--clipboard` to load JSON previously copied via `copy-layout` / tray.
+  #[clap(name = "load-layout")]
+  LoadLayout {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath, required_unless_present = "clipboard")]
+    path: Option<PathBuf>,
+
+    /// Load durable snapshot JSON from the system clipboard instead of a file.
+    #[clap(long = "clipboard", conflicts_with = "path")]
+    clipboard: bool,
+  },
+
+  /// Dry-run match a layout snapshot against live windows (no mutation).
+  ///
+  /// Alias of `query layout-match`. Requires a running WM.
+  #[clap(name = "inspect-layout")]
+  InspectLayout {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
+
+  /// Copy a durable layout snapshot JSON to the system clipboard (CLI-local).
+  ///
+  /// Requires an already running instance of the window manager.
+  /// Same JSON as tray "Copy layout snapshot" / `save-layout`.
+  #[clap(name = "copy-layout")]
+  CopyLayout,
 }
 
 impl AppCommand {
@@ -140,6 +183,17 @@ pub enum QueryCommand {
   },
   /// Outputs windows currently ignored by the WM.
   Ignored,
+
+  /// Dry-run match a layout snapshot file against live managed windows.
+  ///
+  /// Returns matched pairs (with scores), unmatched snapshot/live windows,
+  /// and optional planned workspace moves. Does not mutate WM state.
+  #[clap(name = "layout-match")]
+  LayoutMatch {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
 }
 
 #[derive(Clone, Debug, PartialEq, ValueEnum)]
@@ -267,9 +321,18 @@ pub enum InvokeCommand {
     name: String,
   },
   WmExit,
+  /// Uncloak DWM-cloaked top-level windows not currently managed (Windows).
+  WmUncloakNonTracked,
   WmRedraw,
   WmReloadConfig,
   WmTogglePause,
+
+  /// Load a layout snapshot JSON (best-effort restore; no app launch).
+  LoadLayout {
+    /// Path to a durable layout snapshot JSON file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: PathBuf,
+  },
 }
 
 impl<'de> Deserialize<'de> for InvokeCommand {
@@ -281,7 +344,11 @@ impl<'de> Deserialize<'de> for InvokeCommand {
     // the binary name/path. When deserializing commands from the user
     // config, we therefore have to prepend an additional empty argument.
     let unparsed = String::deserialize(deserializer)?;
-    let unparsed_split = iter::once("").chain(unparsed.split_whitespace());
+    // Quote-aware split so `load-layout "C:\path with spaces\a.json"` works
+    // in config bindings and IPC `command load-layout ...`.
+    let unparsed_split = crate::ipc_argv_from_message(&unparsed).map_err(|err| {
+      serde::de::Error::custom(err.to_string())
+    })?;
 
     InvokeCommand::try_parse_from(unparsed_split).map_err(|err| {
       // Format the error message and remove the "error: " prefix.
@@ -441,4 +508,68 @@ pub struct InvokeUpdateWorkspaceConfig {
 
   #[clap(long)]
   pub keep_alive: Option<bool>,
+}
+
+#[cfg(test)]
+mod shell_exec_ipc_tests {
+  use super::*;
+  use crate::{ipc_argv_from_message, join_ipc_args};
+
+  fn parse_shell_exec(message: &str) -> Vec<String> {
+    let argv = ipc_argv_from_message(message).expect("tokenize");
+    match InvokeCommand::try_parse_from(argv).expect("parse") {
+      InvokeCommand::ShellExec { command, .. } => command,
+      other => panic!("expected ShellExec, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn invoke_shell_exec_preserves_powershell_file_path_with_spaces() {
+    let msg = r#"shell-exec powershell -File "C:\My Scripts\foo.ps1""#;
+    let command = parse_shell_exec(msg);
+    assert_eq!(
+      command,
+      vec![
+        "powershell".to_string(),
+        "-File".to_string(),
+        r"C:\My Scripts\foo.ps1".to_string(),
+      ]
+    );
+    assert_eq!(
+      join_ipc_args(&command),
+      r#"powershell -File "C:\My Scripts\foo.ps1""#
+    );
+  }
+
+  #[test]
+  fn invoke_shell_exec_preserves_code_project_path() {
+    let command = parse_shell_exec(r#"shell-exec code "C:\My Project""#);
+    assert_eq!(join_ipc_args(&command), r#"code "C:\My Project""#);
+  }
+
+  #[test]
+  fn invoke_shell_exec_multiple_quoted_args_and_empty() {
+    let command = parse_shell_exec(r#"shell-exec tool "arg one" "" --flag"#);
+    assert_eq!(
+      command,
+      vec![
+        "tool".to_string(),
+        "arg one".to_string(),
+        String::new(),
+        "--flag".to_string(),
+      ]
+    );
+    assert_eq!(join_ipc_args(&command), r#"tool "arg one" "" --flag"#);
+  }
+
+  #[test]
+  fn invoke_shell_exec_unc_path_round_trip() {
+    let unc = r"\\server\share\My Folder\file.ps1";
+    let msg = format!("shell-exec powershell -File {}", crate::quote_ipc_arg(unc));
+    let command = parse_shell_exec(&msg);
+    assert_eq!(command.last().map(String::as_str), Some(unc));
+    let joined = join_ipc_args(&command);
+    let again = parse_shell_exec(&format!("shell-exec {joined}"));
+    assert_eq!(again, command);
+  }
 }

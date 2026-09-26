@@ -1,11 +1,11 @@
-use std::{iter, net::SocketAddr};
+use std::net::SocketAddr;
 
 use anyhow::{bail, Context};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
-  net::{TcpListener, TcpStream},
-  sync::{broadcast, mpsc},
+  net::TcpStream,
+  sync::{broadcast, mpsc, oneshot},
   task,
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -15,20 +15,30 @@ use wm_common::{
   AppCommand, AppMetadataData, BindingModesData, ClientResponseData,
   ClientResponseMessage, CommandData, EventSubscribeData,
   EventSubscriptionMessage, FocusedData, IgnoredWindowsData,
-  LayoutSnapshot, MonitorsData, QueryCommand, ServerMessage,
-  SnapshotWindow, SnapshotWindowIdentity, SubscribableEvent,
-  TilingDirectionData, WindowsData, WmEvent, WorkspacesData,
-  DEFAULT_IPC_PORT, format_system_time_rfc3339,
+  LayoutSnapshot, LoadLayoutData, MonitorsData, QueryCommand,
+  ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
+  SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
+  WorkspacesData, format_system_time_rfc3339,
 };
+use wm_platform::Dispatcher;
 
 use crate::{
+  commands::general::{
+    inspect_layout_snapshot, load_layout_snapshot,
+    read_layout_snapshot_file,
+  },
   traits::{CommonGetters, TilingDirectionGetters},
   user_config::UserConfig,
   wm::WindowManager,
 };
 
 pub struct IpcServer {
-  abort_handle: task::AbortHandle,
+  /// Accept-loop task. Prefer joining on shutdown so TcpListener Drop runs
+  /// synchronously before process exit (abort races Drop and can ghost ports).
+  join_handle: Option<task::JoinHandle<()>>,
+  /// Graceful accept-loop stop; dropping the listener closes the TCP port
+  /// before process exit (abort alone is async and can leave ghost sockets).
+  shutdown_tx: Option<oneshot::Sender<()>>,
   pub message_rx: mpsc::UnboundedReceiver<(
     String,
     mpsc::UnboundedSender<Message>,
@@ -41,31 +51,51 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-  pub async fn start() -> anyhow::Result<Self> {
+  pub async fn start(dispatcher: &Dispatcher) -> anyhow::Result<Self> {
     let (message_tx, message_rx) = mpsc::unbounded_channel();
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (unsubscribe_tx, _unsubscribe_rx) = broadcast::channel(16);
 
-    let server_addr = format!("127.0.0.1:{DEFAULT_IPC_PORT}");
-    let server = TcpListener::bind(server_addr.clone()).await?;
+    let (server, server_addr) =
+      crate::ipc_conflict::bind_ipc_listener(dispatcher).await?;
     info!("IPC server started on: '{}'.", server_addr);
 
-    let task = task::spawn(async move {
-      while let Ok((stream, addr)) = server.accept().await {
-        let message_tx = message_tx.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        task::spawn(async move {
-          if let Err(err) =
-            Self::handle_connection(stream, addr, message_tx).await
-          {
-            warn!("Error handling connection: {}", err);
+    let task = task::spawn(async move {
+      tokio::pin!(shutdown_rx);
+      loop {
+        tokio::select! {
+          _ = &mut shutdown_rx => {
+            info!("IPC accept loop received shutdown; dropping TcpListener");
+            drop(server);
+            break;
           }
-        });
+          accept = server.accept() => {
+            match accept {
+              Ok((stream, addr)) => {
+                let message_tx = message_tx.clone();
+                task::spawn(async move {
+                  if let Err(err) =
+                    Self::handle_connection(stream, addr, message_tx).await
+                  {
+                    warn!("Error handling connection: {}", err);
+                  }
+                });
+              }
+              Err(err) => {
+                warn!("IPC accept error: {}", err);
+                break;
+              }
+            }
+          }
+        }
       }
     });
 
     Ok(Self {
-      abort_handle: task.abort_handle(),
+      join_handle: Some(task),
+      shutdown_tx: Some(shutdown_tx),
       #[allow(clippy::used_underscore_binding)]
       _event_rx,
       event_tx,
@@ -141,9 +171,10 @@ impl IpcServer {
     wm: &mut WindowManager,
     config: &mut UserConfig,
   ) -> anyhow::Result<()> {
-    let app_command = AppCommand::try_parse_from(
-      iter::once("").chain(message.split_whitespace()),
-    );
+    // Quote-aware argv split so path-bearing commands survive spaces
+    // (e.g. load-layout / inspect-layout / query layout-match).
+    let argv = wm_common::ipc_argv_from_message(&message)?;
+    let app_command = AppCommand::try_parse_from(argv);
 
     let response_data =
       app_command
@@ -287,7 +318,58 @@ impl IpcServer {
               .collect(),
           })
         }
+        QueryCommand::LayoutMatch { path } => {
+          let snapshot = read_layout_snapshot_file(&path)?;
+          let report = inspect_layout_snapshot(&snapshot, &wm.state)?;
+          ClientResponseData::LayoutMatch(report)
+        }
       },
+      AppCommand::LoadLayout { path, clipboard } => {
+        if clipboard || path.is_none() {
+          bail!("load-layout --clipboard is handled by glazewm-cli locally.");
+        }
+        let path = path.expect("path required without --clipboard");
+        let snapshot = read_layout_snapshot_file(&path)?;
+        let summary =
+          load_layout_snapshot(&snapshot, &mut wm.state, config)?;
+        if wm.state.pending_sync.has_changes() {
+          crate::commands::general::platform_sync(&mut wm.state, config)?;
+        }
+        ClientResponseData::LoadLayout(LoadLayoutData {
+          matched: summary.matched,
+          unmatched_snapshot: summary.unmatched_snapshot,
+          unmatched_live: summary.unmatched_live,
+          workspace_moves: summary.workspace_moves,
+          state_updates: summary.state_updates,
+        })
+      }
+      AppCommand::Command {
+        command: wm_common::InvokeCommand::LoadLayout { path },
+        ..
+      } => {
+        let snapshot = read_layout_snapshot_file(&path)?;
+        let summary =
+          load_layout_snapshot(&snapshot, &mut wm.state, config)?;
+        if wm.state.pending_sync.has_changes() {
+          crate::commands::general::platform_sync(&mut wm.state, config)?;
+        }
+        ClientResponseData::LoadLayout(LoadLayoutData {
+          matched: summary.matched,
+          unmatched_snapshot: summary.unmatched_snapshot,
+          unmatched_live: summary.unmatched_live,
+          workspace_moves: summary.workspace_moves,
+          state_updates: summary.state_updates,
+        })
+      }
+      AppCommand::InspectLayout { path } => {
+        let snapshot = read_layout_snapshot_file(&path)?;
+        let report = inspect_layout_snapshot(&snapshot, &wm.state)?;
+        ClientResponseData::LayoutMatch(report)
+      }
+      AppCommand::SaveLayout { .. } | AppCommand::CopyLayout => {
+        // CLI handles durable write / clipboard after `query layout`.
+        bail!("save-layout/copy-layout are handled by glazewm-cli locally.")
+      }
       AppCommand::Command {
         subject_container_id,
         command,
@@ -442,9 +524,65 @@ impl IpcServer {
     Ok(())
   }
 
-  pub fn stop(&self) {
+  pub fn stop(&mut self) {
     info!("Shutting down IPC server.");
-    self.abort_handle.abort();
+    // Signal accept loop to drop TcpListener. Do NOT abort here — aborting
+    // can race Drop on Windows and leave a ghost LISTENING socket. Callers
+    // on the tokio runtime should prefer `stop_and_wait` which joins.
+    if let Some(tx) = self.shutdown_tx.take() {
+      let _ = tx.send(());
+    }
+  }
+
+  /// Stop the accept loop and wait until the TcpListener is dropped.
+  ///
+  /// On Windows, process exit / TerminateProcess before the listen socket is
+  /// closed can leave a ghost LISTENING entry (netstat PID with no process).
+  /// Soft wm-exit must always take this path; taskkill /F cannot free ghosts.
+  pub async fn stop_and_wait(&mut self) {
+    let started = std::time::Instant::now();
+    crate::commands::general::layout_debug_log(
+      "wm-exit: IPC listener drop start",
+    );
+    self.stop();
+    let Some(handle) = self.join_handle.take() else {
+      crate::commands::general::layout_debug_log(format!(
+        "wm-exit: IPC listener already stopped ({}ms)",
+        started.elapsed().as_millis()
+      ));
+      return;
+    };
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(std::time::Duration::from_millis(750), handle)
+      .await
+    {
+      Ok(Ok(())) => {
+        info!("IPC accept loop joined; TcpListener dropped.");
+        crate::commands::general::layout_debug_log(format!(
+          "wm-exit: IPC listener drop done (joined, {}ms)",
+          started.elapsed().as_millis()
+        ));
+      }
+      Ok(Err(err)) => {
+        warn!("IPC accept loop join error: {err}");
+        crate::commands::general::layout_debug_log(format!(
+          "wm-exit: IPC listener join error: {err} ({}ms)",
+          started.elapsed().as_millis()
+        ));
+      }
+      Err(_) => {
+        warn!(
+          "IPC accept loop did not finish within 750ms; aborting as last resort"
+        );
+        abort.abort();
+        // Give the abort a moment to drop the listener future locals.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        crate::commands::general::layout_debug_log(format!(
+          "wm-exit: IPC listener drop done (aborted after timeout, {}ms)",
+          started.elapsed().as_millis()
+        ));
+      }
+    }
   }
 }
 
@@ -473,7 +611,9 @@ fn snapshot_from_native_window(
     state: wm_common::WindowState::Floating(
       wm_common::FloatingStateConfig::default(),
     ),
+    prev_state: None,
     floating_placement: native.frame().ok(),
+    floating_placement_relative: None,
     id: None,
     handle: Some(handle),
   }

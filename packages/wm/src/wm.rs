@@ -5,8 +5,8 @@ use uuid::Uuid;
 #[cfg(target_os = "windows")]
 use wm_common::TitleBarVisibility;
 use wm_common::{
-  FloatingStateConfig, FullscreenStateConfig, InvokeCommand, WindowState,
-  WmEvent,
+  FloatingStateConfig, FullscreenStateConfig, HideMethod, InvokeCommand,
+  WindowState, WmEvent,
 };
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
@@ -629,7 +629,8 @@ impl WindowManager {
       InvokeCommand::ShellExec {
         hide_window,
         command,
-      } => shell_exec(&command.join(" "), *hide_window, state),
+      } => // Re-quote after split_ipc_args so paths with spaces stay one arg for ShellExec.
+        shell_exec(&wm_common::join_ipc_args(command), *hide_window, state),
       InvokeCommand::Size(args) => {
         match subject_container.as_window_container() {
           Ok(window) => set_window_size(
@@ -764,6 +765,36 @@ impl WindowManager {
         enable_binding_mode(name, state, config)
       }
       InvokeCommand::WmExit => state.emit_exit(),
+      InvokeCommand::WmUncloakNonTracked => {
+        #[cfg(target_os = "windows")]
+        {
+          let skip: Vec<isize> = state
+            .windows()
+            .into_iter()
+            .map(|w| w.native().id().0)
+            .collect();
+          match state.dispatcher.unhide_all_cloaked_windows(&skip) {
+            Ok(n) => {
+              let msg = format!(
+                "wm-uncloak-non-tracked: uncloaked {n} orphan window(s)"
+              );
+              tracing::info!("{msg}");
+              crate::commands::general::layout_debug_log(msg);
+            }
+            Err(err) => {
+              let msg = format!(
+                "wm-uncloak-non-tracked: failed: {err:?}"
+              );
+              tracing::warn!("{msg}");
+              crate::commands::general::layout_debug_log(msg);
+            }
+          }
+          if let Err(err) = state.manage_new_visible_windows(config) {
+            tracing::warn!("post-uncloak manage scan failed: {err:?}");
+          }
+        }
+        Ok(())
+      }
       InvokeCommand::WmRedraw => {
         state
           .pending_sync
@@ -774,6 +805,15 @@ impl WindowManager {
       InvokeCommand::WmReloadConfig => reload_config(state, config),
       InvokeCommand::WmTogglePause => {
         toggle_pause(state);
+        Ok(())
+      }
+      InvokeCommand::LoadLayout { path } => {
+        let snapshot = crate::commands::general::read_layout_snapshot_file(path)?;
+        let _summary = crate::commands::general::load_layout_snapshot(
+          &snapshot,
+          state,
+          config,
+        )?;
         Ok(())
       }
     }
@@ -800,6 +840,13 @@ impl WindowManager {
       tracing::warn!("Failed to run shutdown commands: {:?}", err);
     }
 
+    // Uncloak / show every managed window BEFORE exit.
+    // With hide_method=cloak, inactive-workspace windows stay DWM-cloaked.
+    // Watcher skips restore on clean ApplicationExiting, so without this
+    // those windows vanish from visible_windows() on next start and layout
+    // restore cannot match them (Terminal/Code "disappeared" bug).
+    self.restore_visibility_on_exit(config);
+
     // Emit remaining WM events before exiting.
     while let Ok(wm_event) = self.event_rx.try_recv() {
       tracing::info!(
@@ -811,5 +858,42 @@ impl WindowManager {
         tracing::warn!("{:?}", err);
       }
     }
+
+    // Drop the IPC TcpListener before process exit so Windows does not leave
+    // a ghost LISTENING socket. Also stop the watcher so it does not restart us.
+    // Prefer stop_and_wait from main; this sync stop is a safety net for Drop.
+    ipc_server.stop();
+    let watcher_report = crate::ipc_conflict::kill_watcher_on_exit();
+    tracing::info!("Exit watcher cleanup: {watcher_report}");
+    crate::commands::general::layout_debug_log(format!(
+      "wm-exit: IPC stopped; watcher cleanup: {watcher_report}"
+    ));
+  }
+
+  /// Best-effort uncloak/show of all managed windows (Windows cloak hide_method).
+  fn restore_visibility_on_exit(&self, config: &UserConfig) {
+    let cloak = config.value.general.hide_method == HideMethod::Cloak;
+    let mut restored = 0usize;
+    for window in self.state.windows() {
+      let native = window.native();
+      #[cfg(target_os = "windows")]
+      if cloak {
+        if let Err(err) = native.set_cloaked(false) {
+          tracing::warn!("Exit uncloak failed: {err:?}");
+          continue;
+        }
+      }
+      if let Err(err) = native.show() {
+        tracing::warn!("Exit show failed: {err:?}");
+        continue;
+      }
+      let _ = native.set_taskbar_visibility(true);
+      restored += 1;
+    }
+    let msg = format!(
+      "wm-exit: restored visibility on {restored} window(s) (cloak={cloak})"
+    );
+    tracing::info!("{msg}");
+    crate::commands::general::layout_debug_log(msg);
   }
 }

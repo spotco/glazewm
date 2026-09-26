@@ -1,0 +1,41 @@
+name: Test matrix
+
+on:
+  push:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows (x64)
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+          # macOS (Apple Silicon) — important for cfg(target_os) paths
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17
+        with:
+          targets: ${{ matrix.target }}
+          toolchain: nightly
+
+      - uses: swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
+        with:
+          shared-key: test-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Test wm-common (lib)
+        run: cargo test -p wm-common --lib
+
+      - name: Test wm-cli (lib)
+        run: cargo test -p wm-cli --lib
+
+      - name: Check wm and wm-cli
+        run: cargo check -p wm -p wm-cli

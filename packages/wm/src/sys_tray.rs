@@ -20,10 +20,14 @@ use wm_platform::{Dispatcher, ThreadBound};
 enum TrayMenuId {
   ReloadConfig,
   ShowConfigFolder,
+  CopyLayoutSnapshot,
+  SaveLayoutSnapshot,
+  LoadLayoutSnapshot,
   #[cfg(target_os = "windows")]
   ToggleWindowAnimations,
   RunOnStartup,
   Exit,
+  UncloakNonTracked,
 }
 
 impl Display for TrayMenuId {
@@ -31,12 +35,24 @@ impl Display for TrayMenuId {
     match self {
       TrayMenuId::ReloadConfig => write!(f, "reload_config"),
       TrayMenuId::ShowConfigFolder => write!(f, "show_config_folder"),
+      TrayMenuId::CopyLayoutSnapshot => {
+        write!(f, "copy_layout_snapshot")
+      }
+      TrayMenuId::SaveLayoutSnapshot => {
+        write!(f, "save_layout_snapshot")
+      }
+      TrayMenuId::LoadLayoutSnapshot => {
+        write!(f, "load_layout_snapshot")
+      }
       #[cfg(target_os = "windows")]
       TrayMenuId::ToggleWindowAnimations => {
         write!(f, "toggle_window_animations")
       }
       TrayMenuId::RunOnStartup => write!(f, "run_on_startup"),
       TrayMenuId::Exit => write!(f, "exit"),
+      TrayMenuId::UncloakNonTracked => {
+        write!(f, "uncloak_non_tracked")
+      }
     }
   }
 }
@@ -48,10 +64,14 @@ impl FromStr for TrayMenuId {
     match event {
       "show_config_folder" => Ok(Self::ShowConfigFolder),
       "reload_config" => Ok(Self::ReloadConfig),
+      "copy_layout_snapshot" => Ok(Self::CopyLayoutSnapshot),
+      "save_layout_snapshot" => Ok(Self::SaveLayoutSnapshot),
+      "load_layout_snapshot" => Ok(Self::LoadLayoutSnapshot),
       #[cfg(target_os = "windows")]
       "toggle_window_animations" => Ok(Self::ToggleWindowAnimations),
       "run_on_startup" => Ok(Self::RunOnStartup),
       "exit" => Ok(Self::Exit),
+      "uncloak_non_tracked" => Ok(Self::UncloakNonTracked),
       _ => anyhow::bail!("Invalid tray menu event: {}", event),
     }
   }
@@ -59,7 +79,11 @@ impl FromStr for TrayMenuId {
 
 pub struct SystemTray {
   pub config_reload_rx: mpsc::UnboundedReceiver<()>,
+  pub copy_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
+  pub save_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
+  pub load_layout_snapshot_rx: mpsc::UnboundedReceiver<()>,
   pub exit_rx: mpsc::UnboundedReceiver<()>,
+  pub uncloak_non_tracked_rx: mpsc::UnboundedReceiver<()>,
   _icon_thread: Option<std::thread::JoinHandle<()>>,
   _tray_icon: ThreadBound<TrayIcon>,
 }
@@ -71,7 +95,15 @@ impl SystemTray {
     dispatcher: Dispatcher,
   ) -> anyhow::Result<Self> {
     let (exit_tx, exit_rx) = mpsc::unbounded_channel();
+    let (uncloak_non_tracked_tx, uncloak_non_tracked_rx) =
+      mpsc::unbounded_channel();
     let (config_reload_tx, config_reload_rx) = mpsc::unbounded_channel();
+    let (copy_layout_snapshot_tx, copy_layout_snapshot_rx) =
+      mpsc::unbounded_channel();
+    let (save_layout_snapshot_tx, save_layout_snapshot_rx) =
+      mpsc::unbounded_channel();
+    let (load_layout_snapshot_tx, load_layout_snapshot_rx) =
+      mpsc::unbounded_channel();
 
     let animations_enabled = Arc::new(Mutex::new({
       #[cfg(target_os = "windows")]
@@ -113,7 +145,11 @@ impl SystemTray {
             &dispatcher,
             &config_path,
             &config_reload_tx,
+            &copy_layout_snapshot_tx,
+            &save_layout_snapshot_tx,
+            &load_layout_snapshot_tx,
             &exit_tx,
+            &uncloak_non_tracked_tx,
             &animations_enabled,
             &run_on_startup_enabled,
           ) {
@@ -125,7 +161,11 @@ impl SystemTray {
 
     Ok(Self {
       config_reload_rx,
+      copy_layout_snapshot_rx,
+      save_layout_snapshot_rx,
+      load_layout_snapshot_rx,
       exit_rx,
+      uncloak_non_tracked_rx,
       _icon_thread: Some(icon_thread),
       _tray_icon: tray_icon,
     })
@@ -151,6 +191,27 @@ impl SystemTray {
       None,
     );
 
+    let copy_layout_item = MenuItem::with_id(
+      TrayMenuId::CopyLayoutSnapshot,
+      "Copy layout snapshot",
+      true,
+      None,
+    );
+
+    let save_layout_item = MenuItem::with_id(
+      TrayMenuId::SaveLayoutSnapshot,
+      "Save layout snapshot…",
+      true,
+      None,
+    );
+
+    let load_layout_item = MenuItem::with_id(
+      TrayMenuId::LoadLayoutSnapshot,
+      "Load layout snapshot…",
+      true,
+      None,
+    );
+
     #[cfg(target_os = "windows")]
     let toggle_animations_item = CheckMenuItem::with_id(
       TrayMenuId::ToggleWindowAnimations,
@@ -168,6 +229,14 @@ impl SystemTray {
       None,
     );
 
+    #[cfg(target_os = "windows")]
+    let unhide_all_item = MenuItem::with_id(
+      TrayMenuId::UncloakNonTracked,
+      "Uncloak all non-tracked windows",
+      true,
+      None,
+    );
+
     let exit_item =
       MenuItem::with_id(TrayMenuId::Exit, "Exit", true, None);
 
@@ -175,10 +244,17 @@ impl SystemTray {
     tray_menu.append_items(&[
       &reload_config_item,
       &config_dir_item,
+      &PredefinedMenuItem::separator(),
+      &copy_layout_item,
+      &save_layout_item,
+      &load_layout_item,
+      &PredefinedMenuItem::separator(),
       #[cfg(target_os = "windows")]
       &toggle_animations_item,
       &run_on_startup_item,
       &PredefinedMenuItem::separator(),
+      #[cfg(target_os = "windows")]
+      &unhide_all_item,
       &exit_item,
     ])?;
 
@@ -213,12 +289,17 @@ impl SystemTray {
     )?)
   }
 
+  #[allow(clippy::too_many_arguments)]
   fn handle_menu_event(
     menu_id: &TrayMenuId,
     dispatcher: &Dispatcher,
     config_path: &Path,
     config_reload_tx: &mpsc::UnboundedSender<()>,
+    copy_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
+    save_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
+    load_layout_snapshot_tx: &mpsc::UnboundedSender<()>,
     exit_tx: &mpsc::UnboundedSender<()>,
+    uncloak_non_tracked_tx: &mpsc::UnboundedSender<()>,
     // LINT: `animations_enabled` is only used on Windows.
     #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     animations_enabled: &Arc<Mutex<bool>>,
@@ -247,6 +328,18 @@ impl SystemTray {
         config_reload_tx.send(())?;
         Ok(())
       }
+      TrayMenuId::CopyLayoutSnapshot => {
+        copy_layout_snapshot_tx.send(())?;
+        Ok(())
+      }
+      TrayMenuId::SaveLayoutSnapshot => {
+        save_layout_snapshot_tx.send(())?;
+        Ok(())
+      }
+      TrayMenuId::LoadLayoutSnapshot => {
+        load_layout_snapshot_tx.send(())?;
+        Ok(())
+      }
       #[cfg(target_os = "windows")]
       TrayMenuId::ToggleWindowAnimations => {
         let mut animations_enabled = animations_enabled.lock().unwrap();
@@ -269,6 +362,10 @@ impl SystemTray {
       }
       TrayMenuId::Exit => {
         exit_tx.send(())?;
+        Ok(())
+      }
+      TrayMenuId::UncloakNonTracked => {
+        uncloak_non_tracked_tx.send(())?;
         Ok(())
       }
     }

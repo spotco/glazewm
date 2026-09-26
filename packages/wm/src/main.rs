@@ -30,17 +30,27 @@ use wm_platform::{
 };
 
 use crate::{
+  commands::general::{
+    copy_layout_snapshot_to_clipboard, layout_debug_log_path,
+    layout_snapshot_path, load_layout_snapshot, pick_layout_snapshot_path,
+    platform_sync, read_layout_snapshot_file, save_layout_snapshot_with_dialog,
+    set_layout_debug_log_path, try_load_persisted_layout_snapshot,
+    wm_event_affects_layout_snapshot, LayoutAutoSave,
+  },
   ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
   wm::WindowManager,
 };
 
 mod commands;
 mod events;
+mod ipc_conflict;
 mod ipc_server;
 mod models;
 mod pending_sync;
 mod sys_tray;
 mod traits;
+
+use crate::traits::WindowGetters;
 mod user_config;
 mod wm;
 mod wm_state;
@@ -120,12 +130,26 @@ async fn start_wm(
   // Parse and validate user config.
   let mut config = UserConfig::new(config_path)?;
 
+  // Debug trail: layout.log beside config.yaml / layout.json.
+  // Set early so IPC AddrInUse recovery can log before the listener binds.
+  let layout_path = layout_snapshot_path(&config);
+  let layout_log_path = layout_debug_log_path(&config);
+  set_layout_debug_log_path(layout_log_path.clone());
+  tracing::info!(
+    "Layout persistence debug log -> {}",
+    layout_log_path.display()
+  );
+  crate::commands::general::layout_debug_log(format!(
+    "layout persistence debug log ready -> {}",
+    layout_log_path.display()
+  ));
+
   // Add application icon to system tray.
   let mut tray = SystemTray::new(&config.path, dispatcher.clone())?;
 
   let mut wm = WindowManager::new(&mut config, dispatcher.clone())?;
 
-  let mut ipc_server = IpcServer::start().await?;
+  let mut ipc_server = IpcServer::start(dispatcher).await?;
 
   // On Windows, start watcher process for restoring hidden windows on
   // crash. macOS' hidden windows are always accessible.
@@ -176,6 +200,75 @@ async fn start_wm(
     dispatcher.show_error_dialog("Non-fatal error", &err.to_string());
   }
 
+  // Best-effort restore of persisted layout.json (beside config.yaml).
+  // Runs after initial populate + startup commands so windows/workspaces exist.
+  // Windows still cloaked / not yet in visible_windows() at populate() are
+  // absent from the first pass — schedule deferred retries after the event
+  // loop can manage late arrivals (WindowManaged), plus timed retries.
+  let first_load =
+    try_load_persisted_layout_snapshot(&layout_path, &mut wm.state, &config);
+  let mut startup_layout_retries_left: u32 =
+    if first_load.as_ref().is_some_and(|s| s.unmatched_snapshot > 0) {
+      4
+    } else {
+      0
+    };
+  if startup_layout_retries_left > 0 {
+    crate::commands::general::layout_debug_log(format!(
+      "startup load left unmatched_snapshot={}; scheduling up to {startup_layout_retries_left} retries (2s / WindowManaged)",
+      first_load.as_ref().map(|s| s.unmatched_snapshot).unwrap_or(0)
+    ));
+  }
+  let startup_layout_retry_delay = tokio::time::sleep(Duration::from_secs(2));
+  tokio::pin!(startup_layout_retry_delay);
+
+  // Drain events emitted by startup restore so IPC clients see them, but do
+  // not arm auto-save yet (avoids thrashing a rewrite of the file we just loaded).
+  while let Ok(wm_event) = wm.event_rx.try_recv() {
+    if let WmEvent::PauseChanged { is_paused } = wm_event {
+      let _ = mouse_listener.enable(!is_paused);
+    }
+    if matches!(
+      wm_event,
+      WmEvent::UserConfigChanged { .. }
+        | WmEvent::BindingModesChanged { .. }
+        | WmEvent::PauseChanged { .. }
+    ) {
+      keybinding_listener.update(
+        &config
+          .active_keybinding_configs(&wm.state.binding_modes, false)
+          .flat_map(|kb| kb.bindings)
+          .collect::<Vec<_>>(),
+      );
+      let _ = mouse_listener.set_enabled_events(
+        if config.value.general.focus_follows_cursor {
+          &[MouseEventKind::Move, MouseEventKind::LeftButtonUp]
+        } else {
+          &[MouseEventKind::LeftButtonUp]
+        },
+      );
+    }
+    if let Err(err) = ipc_server.process_event(wm_event) {
+      tracing::error!("{:?}", err);
+    }
+  }
+
+  // Startup event drain finished; allow layout auto-save scheduling.
+  // Keep auto-save off until pending startup layout retries finish so we
+  // do not persist the incomplete pre-retry arrangement over layout.json.
+  crate::commands::general::layout_debug_log(
+    "startup event drain complete; enabling layout auto-save",
+  );
+  let layout_path_for_retry = layout_path.clone();
+  let mut layout_auto_save = LayoutAutoSave::new(layout_path);
+  if startup_layout_retries_left == 0 {
+    layout_auto_save.enable();
+  } else {
+    crate::commands::general::layout_debug_log(
+      "auto-save deferred until startup layout retries complete",
+    );
+  }
+
   // Create an interval for periodically cleaning up invalid windows.
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
 
@@ -192,6 +285,47 @@ async fn start_wm(
       Some(()) = tray.exit_rx.recv() => {
         tracing::info!("Exiting through system tray.");
         break;
+      },
+      Some(()) = tray.uncloak_non_tracked_rx.recv() => {
+        (|| -> anyhow::Result<()> {
+          tracing::info!("Tray: Uncloak all non-tracked windows");
+          #[cfg(target_os = "windows")]
+          {
+            // Skip handles GlazeWM already manages; only orphan cloaked HWNDs.
+            let skip: Vec<isize> = wm
+              .state
+              .windows()
+              .into_iter()
+              .map(|w| w.native().id().0)
+              .collect();
+            match dispatcher.unhide_all_cloaked_windows(&skip) {
+              Ok(n) => {
+                let msg = format!(
+                  "tray uncloak-non-tracked: uncloaked {n} orphan window(s)"
+                );
+                tracing::info!("{msg}");
+                crate::commands::general::layout_debug_log(msg);
+              }
+              Err(err) => {
+                let msg = format!(
+                  "tray uncloak-non-tracked: failed: {err:?}"
+                );
+                tracing::warn!("{msg}");
+                crate::commands::general::layout_debug_log(msg);
+              }
+            }
+            if let Err(err) = wm.state.manage_new_visible_windows(&mut config) {
+              tracing::warn!("post-uncloak manage scan failed: {err:?}");
+              crate::commands::general::layout_debug_log(format!(
+                "tray uncloak-non-tracked: manage scan failed: {err:?}"
+              ));
+            }
+            if wm.state.pending_sync.has_changes() {
+              platform_sync(&mut wm.state, &config)?;
+            }
+          }
+          Ok(())
+        })()
       },
       Some(event) = mouse_listener.next_event() => {
         tracing::debug!("Received mouse event: {:?}", event);
@@ -215,6 +349,33 @@ async fn start_wm(
         } else {
           wm.state.cleanup_invalid_windows()
         }
+      },
+      () = &mut startup_layout_retry_delay, if startup_layout_retries_left > 0 => {
+        crate::commands::general::layout_debug_log(format!(
+          "startup layout timed retry firing ({startup_layout_retries_left} left)",
+        ));
+        let summary = try_load_persisted_layout_snapshot(
+          &layout_path_for_retry,
+          &mut wm.state,
+          &config,
+        );
+        let still = summary.as_ref().is_some_and(|s| s.unmatched_snapshot > 0);
+        if still && startup_layout_retries_left > 1 {
+          startup_layout_retries_left -= 1;
+          startup_layout_retry_delay
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(2));
+          crate::commands::general::layout_debug_log(format!(
+            "startup layout still unmatched; next timed retry in 2s ({startup_layout_retries_left} left)",
+          ));
+        } else {
+          startup_layout_retries_left = 0;
+          layout_auto_save.enable();
+          crate::commands::general::layout_debug_log(
+            "startup layout retries done; auto-save enabled",
+          );
+        }
+        Ok(())
       },
       Some((
         message,
@@ -266,11 +427,46 @@ async fn start_wm(
           )?;
         }
 
+        // Event-driven layout retry: when a late window is managed during the
+        // startup retry window, re-run load immediately (debounced by resetting
+        // the timer after a successful settle).
+        if startup_layout_retries_left > 0
+          && matches!(wm_event, WmEvent::WindowManaged { .. })
+        {
+          crate::commands::general::layout_debug_log(
+            "startup layout WindowManaged-driven retry",
+          );
+          let summary = try_load_persisted_layout_snapshot(
+            &layout_path_for_retry,
+            &mut wm.state,
+            &config,
+          );
+          if summary.as_ref().is_some_and(|s| s.unmatched_snapshot == 0) {
+            startup_layout_retries_left = 0;
+            layout_auto_save.enable();
+            crate::commands::general::layout_debug_log(
+              "startup layout fully matched after WindowManaged; auto-save enabled",
+            );
+          } else {
+            // Nudge the timed retry so we keep trying briefly.
+            startup_layout_retry_delay.as_mut().reset(
+              tokio::time::Instant::now() + Duration::from_secs(2),
+            );
+          }
+        }
+
+        if wm_event_affects_layout_snapshot(&wm_event) {
+          layout_auto_save.schedule(&wm_event);
+        }
+
         if let Err(err) = ipc_server.process_event(wm_event) {
           tracing::error!("{:?}", err);
         }
 
         Ok(())
+      },
+      () = layout_auto_save.sleep_mut(), if layout_auto_save.is_armed() => {
+        layout_auto_save.flush(&wm.state)
       },
       Some(()) = tray.config_reload_rx.recv() => {
         wm.process_commands(
@@ -278,6 +474,32 @@ async fn start_wm(
           None,
           &mut config,
         ).map(|_| ())
+      },
+      Some(()) = tray.copy_layout_snapshot_rx.recv() => {
+        copy_layout_snapshot_to_clipboard(&wm.state)
+      },
+      Some(()) = tray.save_layout_snapshot_rx.recv() => {
+        save_layout_snapshot_with_dialog(&wm.state, dispatcher)
+      },
+      Some(()) = tray.load_layout_snapshot_rx.recv() => {
+        (|| -> anyhow::Result<()> {
+          let Some(path) = pick_layout_snapshot_path(dispatcher)? else {
+            tracing::info!("Load layout snapshot cancelled.");
+            return Ok(());
+          };
+          let snapshot = read_layout_snapshot_file(&path)?;
+          let summary =
+            load_layout_snapshot(&snapshot, &mut wm.state, &config)?;
+          if wm.state.pending_sync.has_changes() {
+            platform_sync(&mut wm.state, &config)?;
+          }
+          tracing::info!(
+            "Loaded layout snapshot from {}: matched={}",
+            path.display(),
+            summary.matched
+          );
+          Ok(())
+        })()
       },
     };
 
@@ -288,6 +510,8 @@ async fn start_wm(
   }
 
   tracing::info!("Window manager shutting down.");
+  // Close IPC listener first (sync signal + short wait) before other teardown.
+  ipc_server.stop_and_wait().await;
   wm.cleanup(&mut config, &mut ipc_server);
 
   Ok(())

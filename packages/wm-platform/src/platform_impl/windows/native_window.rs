@@ -8,7 +8,7 @@ use windows::{
     Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
     Graphics::Dwm::{
       DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-      DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
+      DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
       DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
       DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
     },
@@ -786,6 +786,78 @@ pub(crate) fn visible_windows(
       .map(Into::into)
       .collect(),
   )
+}
+
+
+/// Uncloak + show top-level DWM-cloaked windows, skipping `skip_handles`
+/// (typically currently managed GlazeWM window handles).
+///
+/// Unlike `visible_windows` / managed-container restore, this uses raw
+/// `EnumWindows` and does **not** filter out cloaked HWNDs - so orphaned
+/// windows left cloaked by a prior GlazeWM session (Brave/Edge/Terminal)
+/// are included.
+///
+/// Returns how many windows were successfully unhidden.
+pub(crate) fn unhide_all_cloaked_windows(
+  skip_handles: &[isize],
+  _: &Dispatcher,
+) -> crate::Result<usize> {
+  let mut handles: Vec<isize> = Vec::new();
+
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn enum_proc(handle: HWND, data: LPARAM) -> BOOL {
+    let handles = data.0 as *mut Vec<isize>;
+    unsafe { (*handles).push(handle.0) };
+    true.into()
+  }
+
+  unsafe {
+    EnumWindows(
+      Some(enum_proc),
+      LPARAM(std::ptr::from_mut(&mut handles) as _),
+    )
+  }?;
+
+  let mut unhidden = 0usize;
+  for handle in handles {
+    let window = NativeWindow::new(handle);
+    if !window.is_valid() {
+      continue;
+    }
+    if skip_handles.contains(&handle) {
+      continue;
+    }
+    let cloaked = match window.is_cloaked() {
+      Ok(true) => true,
+      Ok(false) => false,
+      Err(_) => continue,
+    };
+    if !cloaked {
+      continue;
+    }
+
+    // Primary path: same ApplicationView cloak API GlazeWM uses to hide.
+    let uncloak_ok = window.set_cloaked(false).is_ok();
+    if !uncloak_ok {
+      // Fallback: DWMWA_CLOAK = FALSE (attribute 13).
+      let mut cloak_flag: i32 = 0;
+      let _ = unsafe {
+        #[allow(clippy::cast_possible_truncation)]
+        DwmSetWindowAttribute(
+          window.hwnd(),
+          DWMWA_CLOAK,
+          std::ptr::from_mut(&mut cloak_flag).cast(),
+          std::mem::size_of::<i32>() as u32,
+        )
+      };
+    }
+
+    let _ = window.show();
+    let _ = window.set_taskbar_visibility(true);
+    unhidden += 1;
+  }
+
+  Ok(unhidden)
 }
 
 /// Implements [`Dispatcher::focused_window`].
