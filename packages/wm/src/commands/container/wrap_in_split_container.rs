@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use anyhow::{bail, Context};
 
-use super::{attach_container, detach_container};
 use crate::{
   models::{Container, SplitContainer, TilingContainer},
   traits::{CommonGetters, TilingSizeGetters},
@@ -13,17 +12,11 @@ pub fn wrap_in_split_container(
   target_parent: &Container,
   target_children: &[TilingContainer],
 ) -> anyhow::Result<()> {
-  // Callers normally pass direct children, but an orthogonal move can pair
-  // a workspace child with a window nested below a different split. Detach
-  // those mixed-parent children through the normal tree helper before
-  // rewriting parent pointers below. Otherwise the old parent keeps the
-  // child while the new split also claims it.
+  // This helper only rewrites direct children. Callers that need to move a
+  // nested child must first use the state-aware tree-move helper so focus,
+  // sizing, and move events retain their normal semantics.
   for target_child in target_children {
     let target_child_container: Container = target_child.clone().into();
-    if target_child_container.parent() != Some(target_parent.clone()) {
-      detach_container(target_child_container.clone())?;
-      attach_container(&target_child_container, target_parent, None)?;
-    }
     if target_child_container.parent() != Some(target_parent.clone()) {
       bail!("Target child is not attached to target parent.");
     }
@@ -166,7 +159,7 @@ mod tests {
   }
 
   #[test]
-  fn mixed_parent_wrap_detaches_nested_window_once() {
+  fn mixed_parent_wrap_rejects_nested_window_without_mutating_tree() {
     let workspace = Workspace::new(
       WorkspaceConfig {
         name: "test".into(),
@@ -211,16 +204,17 @@ mod tests {
       TilingDirection::Vertical,
       GapsConfig::default(),
     );
-    wrap_in_split_container(
+    let result = wrap_in_split_container(
       &new_split,
       &workspace_container,
       &[neighbor.clone().into(), window_one.clone().into()],
-    )
-    .expect("wrap mixed-parent children");
+    );
+
+    assert!(result.is_err());
 
     assert_eq!(
       window_one.parent().map(|parent| parent.id()),
-      Some(new_split.id())
+      Some(old_split.id())
     );
     assert_eq!(window_two.parent(), Some(old_split.clone().into()));
     assert_tree_integrity(&workspace_container);

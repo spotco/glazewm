@@ -308,13 +308,21 @@ Verification run 2026-09-26:
 - [x] `cargo test -p wm --bin glazewm` (43 passed, including a live
       nested-move fixture compared directly with `global_move_plan`)
 - [x] `build.bat` (release WM, CLI, and watcher artifacts)
-- [x] Zebar provider tests (18 passed), Zebar Rust tests (13 passed), and the
+- [x] Zebar provider tests (18 passed), Zebar Rust tests (15 passed), and the
       vendored bundle reproducibility check passed.
 - [x] Zebar changed Rust files are formatted. The repository-wide formatter
       still reports pre-existing changes in `crates/systray-util` and
       `packages/desktop/build.rs` outside this review diff.
 - [x] Existing embedded-pack installs now refresh on version/build-revision
       changes; matching installs are left untouched, with regression coverage.
+- [x] Embedded-pack refresh now stages beside the destination, validates the
+      staged manifest before swapping, restores the prior install on failure,
+      and ignores malformed/stale metadata with a warning. `build.bat` also
+      verifies a content-derived pack revision so resource changes cannot be
+      shipped with a stale revision.
+- [x] The low-level split-wrapper helper rejects children from a different
+      parent without mutating the tree; the live nested-move caller performs
+      the explicit state-aware reparenting first.
 - [x] Provider event handlers guard the second IPC read after the first async
       read, preventing stale reconnect generations from publishing mixed
       state; regression coverage exercises that race.
