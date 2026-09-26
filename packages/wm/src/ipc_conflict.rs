@@ -87,12 +87,21 @@ pub async fn bind_ipc_listener(
         warn!("{log_line}");
         layout_debug_log(&log_line);
 
-        // Ghost sockets cannot be freed by taskkill — skip further kill
-        // rounds once detected (still offer one kill attempt if we have not).
-        if ghost && kill_rounds >= 1 {
+        // Ghost sockets cannot be freed by taskkill — still best-effort kill
+        // watcher/glazewm once, then auto-fallback without blocking on dialog.
+        if ghost {
           layout_debug_log(format!(
-            "IPC ghost listener on {preferred}; skipping further kill rounds, falling back"
+            "IPC ghost listener on {preferred}; best-effort kill then auto-fallback (no dialog)"
           ));
+          let report = kill_existing_glazewm_and_free_port(preferred);
+          layout_debug_log(format!("IPC ghost cleanup: {report}"));
+          // Quick poll in case it was not actually a ghost.
+          if let Some(listener) =
+            poll_bind_port(preferred, Duration::from_secs(1), POST_KILL_POLL_INTERVAL)
+              .await
+          {
+            return finish_bind(listener, preferred, preferred, kill_rounds).await;
+          }
           break;
         }
 
