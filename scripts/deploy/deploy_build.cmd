@@ -6,6 +6,8 @@ set "REPO=F:\dev\glazewm"
 
 if /I "%~1"=="--help" goto :usage
 if /I "%~1"=="-h" goto :usage
+set "START_AFTER=0"
+if /I "%~1"=="--start" set "START_AFTER=1"
 
 if not exist "%REL%\glazewm.exe" (
   echo ERROR: Missing "%REL%\glazewm.exe" - run build.bat first.
@@ -53,6 +55,10 @@ echo Tip: start GlazeWM ONLY with a quoted path (or start_glazewm.cmd):
 echo   "%INSTALL%\glazewm.exe"
 echo   "%REPO%\scripts\deploy\start_glazewm.cmd"
 echo Never: start C:\Program Files\...  (unquoted -^> C:\Program popup)
+if "%START_AFTER%"=="1" (
+  echo Starting GlazeWM...
+  start "" "%INSTALL%\glazewm.exe"
+)
 exit /b 0
 
 :copyfail
@@ -63,7 +69,8 @@ echo Then re-run deploy_build.cmd
 exit /b 1
 
 :usage
-echo Usage: deploy_build.cmd
+echo Usage: deploy_build.cmd [--start]
 echo Copies release binaries from %REL% into %INSTALL%
+echo --start also launches GlazeWM after deployment.
 echo Requires prior backup_install.cmd and one-time grant_install_write_access.cmd
 exit /b 0

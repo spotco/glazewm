@@ -318,6 +318,14 @@ Verification run 2026-09-26:
 - [x] Vendored `spotco.tokyo-silence` bar launched from the deployed Zebar
       build; its cached bundle matches the fork and WM reports the ignored
       `Zebar - spotco.tokyo-silence / bar` window.
+- [x] Zebar runtime diagnostics now go to bounded `%USERPROFILE%\\.glzr\\zebar\\zebar.log`
+      and `errors.log` files (2 MiB each, with one `.1` rotation) instead of
+      stdout; the rotation unit test passed and the deployed bar wrote its
+      startup/provider setup diagnostics to `zebar.log`.
+- [x] `scripts\\deploy\\deploy_build.cmd --start` was exercised for Zebar;
+      it stopped the prior process, swapped the release binary/resources,
+      and restarted the vendored spotco bar. The GlazeWM deploy script has
+      the matching `--start` path for the next WM swap.
 - [x] CLI-equivalent Super+J / Super+Shift+Ctrl+Arrow checks passed, including
       horizontal and vertical normal moves, opposite-axis moves, structural
       H→V→H preservation, spotco bar detection, and soft-exit Zebar shutdown
