@@ -1,7 +1,7 @@
 # Global tiling direction + consistent Super+Shift(+Ctrl) move Plan
 
 Date: 2026-09-26
-Status: Paused mid Step 9 (impl Steps 0–8 committed; rustfmt/clippy WIP saved 2026-09-26)
+Status: Step 9 automated/runtime verification complete; visual hotkey smoke remains
 Branch: `glazewm-spotcobuild` (GlazeWM) + `zebar-spotcobuild` (Zebar pack / provider as needed)
 Scope: multi-day feature work (WM move semantics + global direction state + Zebar indicator + default config)
 
@@ -16,7 +16,7 @@ Scope: multi-day feature work (WM move semantics + global direction state + Zeba
 - [x] Step 6 - Unit tests for move matrices (H/V global × arrow × layouts)
 - [x] Step 7 - Zebar: show + toggle global tiling direction
 - [x] Step 8 - Make live `config.yaml` the spotcobuild sample default
-- [ ] Step 9 - Manual smoke on Asus + build/deploy readiness
+- [ ] Step 9 - Manual smoke on Asus + build/deploy readiness (interactive checks pending)
 
 ## Objective
 
@@ -263,7 +263,8 @@ Built-in pack pattern already exists: `resources/starter` +
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test -p wm-common --lib
-cargo test -p wm --lib
+# `wm` is a bin-only package; run its unit tests through the binary target.
+cargo test -p wm --bin glazewm
 build.bat
 ```
 
@@ -275,6 +276,25 @@ Manual Asus smoke:
 3. Reproduce `13/23` focus-3 Super+Shift+Left under H vs V global.
 4. Super+Shift+Ctrl+Left uses opposite stack axis without flipping J state.
 5. Soft `wm-exit` still kills Zebar via `shutdown_commands`.
+
+Verification run 2026-09-26:
+
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --all-targets --all-features -- -D warnings`
+- [x] `cargo test -p wm-common --lib` (70 passed)
+- [x] `cargo test -p wm --bin glazewm` (38 passed)
+- [x] `build.bat` (release WM, CLI, and watcher artifacts)
+- [x] Deployed with the existing backup/deploy scripts; current WM starts and
+      `query global-tiling-direction` returns successfully.
+- [x] Opposite-move config command parses and the live config starts without
+      the previous `keybindings[8].commands` fatal error.
+- [x] CLI toggle changed global horizontal → vertical while the layout tree
+      stayed unchanged, then restored horizontal.
+- [x] Vendored `spotco.tokyo-silence` bar launched and is visible to WM as the
+      ignored `Zebar - spotco.tokyo-silence / bar` window.
+- [ ] Physical Super+J / Super+Shift+Ctrl+Arrow and visual tray-hover checks
+      still need a human desktop pass; the computer-use surface did not expose
+      native windows for those observations.
 
 ## Decisions (Step 0)
 

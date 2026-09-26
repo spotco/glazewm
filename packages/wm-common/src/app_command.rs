@@ -432,46 +432,45 @@ pub struct InvokeFocusCommand {
 }
 
 #[derive(Args, Clone, Debug, PartialEq, Serialize)]
-#[group(required = true, multiple = false)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct InvokeMoveCommand {
   /// Direction to move the window.
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub direction: Option<Direction>,
 
   /// Use the inverse of the WM global stack direction for this move only
   /// (does not flip the stored global flag). Spotcobuild
   /// Super+Shift+Ctrl.
-  #[clap(long, group = "opposite_tiling_direction_flag")]
+  #[clap(long, requires = "direction")]
   pub opposite_tiling_direction: bool,
 
   /// Move window to workspace in specified direction.
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub workspace_in_direction: Option<Direction>,
 
   /// Name of workspace to move the window.
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub workspace: Option<String>,
 
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub next_active_workspace: bool,
 
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub prev_active_workspace: bool,
 
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub next_workspace: bool,
 
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub prev_workspace: bool,
 
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub next_active_workspace_on_monitor: bool,
 
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub prev_active_workspace_on_monitor: bool,
 
-  #[clap(long)]
+  #[clap(long, group = "move_target")]
   pub recent_workspace: bool,
 }
 
@@ -534,6 +533,26 @@ mod shell_exec_ipc_tests {
     match InvokeCommand::try_parse_from(argv).expect("parse") {
       InvokeCommand::ShellExec { command, .. } => command,
       other => panic!("expected ShellExec, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn opposite_move_binding_parses_with_direction() {
+    let command = InvokeCommand::try_parse_from([
+      "glazewm",
+      "move",
+      "--direction",
+      "left",
+      "--opposite-tiling-direction",
+    ])
+    .expect("opposite move binding should parse");
+
+    match command {
+      InvokeCommand::Move(move_command) => {
+        assert_eq!(move_command.direction, Some(Direction::Left));
+        assert!(move_command.opposite_tiling_direction);
+      }
+      other => panic!("expected Move, got {other:?}"),
     }
   }
 
