@@ -85,9 +85,11 @@ Plus:
   `TilingDirectionChanged` / `query tiling-direction` — extend or add a
   parallel **global** field rather than silently changing meaning without a
   Zebar update in the same change set.
-- Keep the legacy `TilingDirectionChanged` compatibility emission during the
-  migration window. New clients must consume `GlobalTilingDirectionChanged`
-  / `globalTilingDirection`; the two events are intentionally not equivalent.
+- Keep the legacy `TilingDirectionChanged` contract for actual local
+  direction mutations during the migration window. Global toggles emit only
+  `GlobalTilingDirectionChanged`; new clients consume that event and
+  `globalTilingDirection`, so a global toggle cannot clobber the focused
+  container's legacy field.
 - Prefer config bindings for Super+Shift+Ctrl chords; only add a new invoke
   command if “move with explicit stack direction” cannot be expressed as
   `set-tiling-direction` + `move` without races.
@@ -248,9 +250,10 @@ Built-in pack pattern already exists: `resources/starter` +
       under `F:\dev\zebar`.
 - [x] Pack id **`spotco.tokyo-silence`** (LOCKED) so a
       marketplace update of `y4m3.tokyo-silence` cannot overwrite your edits.
-- [x] Wire embed/install like starter: embed resource, install on first run,
-      change default `startupConfigs` / `STARTER_PACK_ID` (or parallel
-      spotcobuild constant) to the new pack + `bar` / `default`.
+- [x] Wire embed/install like starter: embed resource, install or refresh the
+      embedded pack when its version/build revision changes, and change the
+      default `startupConfigs` / `STARTER_PACK_ID` (or parallel spotcobuild
+      constant) to the new pack + `bar` / `default`.
 - [x] Provider: surface `globalTilingDirection` (and events).
 - [x] In the **vendored** pack: chip shows global H/V; click runs global toggle.
 - [x] Migrate this machine: point `~\.glzr\zebar\settings.json` at the
@@ -299,11 +302,17 @@ Verification run 2026-09-26:
 
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --all-targets --all-features -- -D warnings`
-- [x] `cargo test -p wm-common --lib` (72 passed)
-- [x] `cargo test -p wm --bin glazewm` (41 passed)
+- [x] `cargo test -p wm-common --lib` (74 passed)
+- [x] `cargo test -p wm --bin glazewm` (43 passed, including a live
+      nested-move fixture compared directly with `global_move_plan`)
 - [x] `build.bat` (release WM, CLI, and watcher artifacts)
-- [x] Zebar provider tests (17 passed), full Zebar `build.bat`, and release
-      deployment completed.
+- [x] Zebar provider tests (18 passed), Zebar Rust tests (13 passed), and the
+      vendored bundle reproducibility check passed.
+- [x] Existing embedded-pack installs now refresh on version/build-revision
+      changes; matching installs are left untouched, with regression coverage.
+- [x] Provider event handlers guard the second IPC read after the first async
+      read, preventing stale reconnect generations from publishing mixed
+      state; regression coverage exercises that race.
 - [x] Added explicit provider-state coverage proving legacy
       `tilingDirection` remains local while `globalTilingDirection` remains
       WM-wide, with fallback behavior for older WM responses.
@@ -330,6 +339,12 @@ Verification run 2026-09-26:
       horizontal and vertical normal moves, opposite-axis moves, structural
       H→V→H preservation, spotco bar detection, and soft-exit Zebar shutdown
       and restart. See `GLOBAL_TILING_DIRECTION_SMOKE.log`.
+- [x] Runtime compatibility review completed: `tilingDirection` remains the
+      focused-container legacy field, `globalTilingDirection` is independent,
+      and the WM no longer synthesizes a legacy local-direction event for a
+      global toggle.
+- [x] Zebar runtime diagnostics remain file-backed and bounded; the deploy
+      README documents that only interactive CLI query results use stdout.
 - [ ] Physical key injection and visual tray-hover appearance remain desktop-only
       observations; the CLI harness verifies the tray bar process/window identity.
 

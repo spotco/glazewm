@@ -217,6 +217,25 @@ fn join_with_neighbor_on_stack(
       )?;
     }
     TilingContainer::TilingWindow(neighbor_window) => {
+      let workspace_container: crate::models::Container =
+        workspace.clone().into();
+
+      // The focused window can be nested below the workspace child that
+      // contains it. Promote it to the workspace beside the neighbor first
+      // so wrapping it cannot reorder the surviving sibling subtree.
+      if window_to_move.parent() != Some(workspace_container.clone()) {
+        let target_index = match direction {
+          Direction::Left | Direction::Up => neighbor_window.index() + 1,
+          Direction::Right | Direction::Down => neighbor_window.index(),
+        };
+        move_container_within_tree(
+          &window_to_move.clone().into(),
+          &workspace_container,
+          target_index,
+          state,
+        )?;
+      }
+
       let split = SplitContainer::new(
         stack_direction.clone(),
         config.value.gaps.clone(),
@@ -229,11 +248,7 @@ fn join_with_neighbor_on_stack(
           vec![window_to_move.clone().into(), neighbor_window.into()]
         }
       };
-      wrap_in_split_container(
-        &split,
-        &workspace.clone().into(),
-        &wrap_kids,
-      )?;
+      wrap_in_split_container(&split, &workspace_container, &wrap_kids)?;
     }
   }
 
@@ -257,6 +272,208 @@ fn join_with_neighbor_on_stack(
     .queue_containers_to_redraw(workspace.tiling_children());
 
   Ok(())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+  use std::collections::HashMap;
+
+  use uuid::Uuid;
+  use wm_common::{
+    plan_global_move, GapsConfig, MoveNode, MoveTree, TilingDirection,
+    WorkspaceConfig,
+  };
+  use wm_platform::{
+    EventLoop, NativeWindow, NativeWindowWindowsExt, Rect, RectDelta,
+  };
+
+  use super::*;
+  use crate::{
+    commands::{container::attach_container, monitor::add_monitor},
+    models::{Container, NativeMonitorProperties, NativeWindowProperties},
+    traits::CommonGetters,
+  };
+
+  fn test_window(id: u128) -> TilingWindow {
+    TilingWindow::new(
+      Some(Uuid::from_u128(id)),
+      NativeWindow::from_handle(0),
+      NativeWindowProperties {
+        title: format!("window-{id}"),
+        class_name: "test".into(),
+        process_name: "test".into(),
+        process_path: None,
+        frame: Rect::from_xy(0, 0, 100, 100),
+        is_minimized: false,
+        is_maximized: false,
+        is_resizable: true,
+        shadow_borders: RectDelta::zero(),
+      },
+      None,
+      RectDelta::zero(),
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      GapsConfig::default(),
+      Vec::new(),
+      None,
+    )
+  }
+
+  fn test_config() -> UserConfig {
+    let path = std::env::temp_dir()
+      .join(format!("glazewm-global-move-test-{}.yaml", Uuid::new_v4()));
+    UserConfig::new(Some(path)).expect("test config")
+  }
+
+  fn live_node(container: &TilingContainer) -> MoveNode {
+    match container {
+      TilingContainer::TilingWindow(window) => MoveNode::window(
+        window
+          .native_properties()
+          .title
+          .strip_prefix("window-")
+          .expect("test window title")
+          .to_string(),
+      ),
+      TilingContainer::Split(split) => MoveNode::split(
+        split.tiling_direction(),
+        split
+          .tiling_children()
+          .map(|child| live_node(&child))
+          .collect(),
+      ),
+    }
+  }
+
+  fn live_tree(workspace: &Workspace) -> MoveTree {
+    MoveTree {
+      direction: workspace.tiling_direction(),
+      children: workspace
+        .tiling_children()
+        .map(|child| live_node(&child))
+        .collect(),
+    }
+  }
+
+  fn assert_tree_integrity(root: &Container) {
+    fn visit(node: &Container, counts: &mut HashMap<Uuid, usize>) {
+      *counts.entry(node.id()).or_default() += 1;
+      if let Some(parent) = node.parent() {
+        assert!(parent
+          .children()
+          .iter()
+          .any(|child| child.id() == node.id()));
+      }
+      for child in node.children() {
+        assert_eq!(child.parent(), Some(node.clone()));
+        visit(&child, counts);
+      }
+    }
+
+    let mut counts = HashMap::new();
+    visit(root, &mut counts);
+    assert!(counts.values().all(|count| *count == 1));
+  }
+
+  #[test]
+  fn nested_orthogonal_move_matches_global_move_planner() {
+    let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut state = WmState::new(dispatcher, event_tx, exit_tx);
+    let config = test_config();
+
+    let display = state
+      .dispatcher
+      .sorted_displays()
+      .expect("test display")
+      .into_iter()
+      .next()
+      .expect("at least one display");
+    let monitor_properties = NativeMonitorProperties::try_from(&display)
+      .expect("monitor properties");
+    let monitor = add_monitor(display, monitor_properties, &mut state)
+      .expect("attach test monitor");
+
+    let workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "test".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let workspace_container: Container = workspace.clone().into();
+    attach_container(&workspace_container, &monitor.clone().into(), None)
+      .expect("attach workspace");
+    let old_split = SplitContainer::new(
+      TilingDirection::Vertical,
+      GapsConfig::default(),
+    );
+    let window_one = test_window(1);
+    let window_two = test_window(2);
+    let neighbor = test_window(3);
+
+    attach_container(
+      &old_split.clone().into(),
+      &workspace_container,
+      Some(0),
+    )
+    .expect("attach old split");
+    attach_container(&neighbor.clone().into(), &workspace_container, None)
+      .expect("attach neighbor");
+    attach_container(
+      &window_one.clone().into(),
+      &old_split.clone().into(),
+      None,
+    )
+    .expect("attach focused window");
+    attach_container(
+      &window_two.clone().into(),
+      &old_split.clone().into(),
+      None,
+    )
+    .expect("attach sibling window");
+    old_split
+      .borrow_child_focus_order_mut()
+      .make_contiguous()
+      .reverse();
+
+    let planner_input = MoveTree {
+      direction: TilingDirection::Horizontal,
+      children: vec![
+        MoveNode::split(
+          TilingDirection::Vertical,
+          vec![MoveNode::window("1"), MoveNode::window("2")],
+        ),
+        MoveNode::window("3"),
+      ],
+    };
+    let expected = plan_global_move(
+      &planner_input,
+      "1",
+      &Direction::Right,
+      &TilingDirection::Vertical,
+    )
+    .expect("planner move");
+
+    join_with_neighbor_on_stack(
+      window_one,
+      neighbor.into(),
+      &Direction::Right,
+      &TilingDirection::Vertical,
+      &workspace,
+      &mut state,
+      &config,
+    )
+    .expect("live move");
+
+    assert_eq!(live_tree(&workspace), expected);
+    assert_eq!(live_tree(&workspace).format_compact(), "V[2 1 3]");
+    assert_tree_integrity(&workspace_container);
+  }
 }
 
 #[allow(clippy::needless_pass_by_value)]

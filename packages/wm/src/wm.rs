@@ -339,7 +339,7 @@ impl WindowManager {
       InvokeCommand::Move(args) => {
         match subject_container.as_window_container() {
           Ok(window) => {
-            if let Some(direction) = &args.direction {
+            if let Some(direction) = &args.target.direction {
               let stack_direction = if args.opposite_tiling_direction {
                 state.global_tiling_direction.inverse()
               } else {
@@ -354,7 +354,7 @@ impl WindowManager {
               )?;
             }
 
-            if let Some(direction) = &args.workspace_in_direction {
+            if let Some(direction) = &args.target.workspace_in_direction {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Direction(direction.clone()),
@@ -363,7 +363,7 @@ impl WindowManager {
               )?;
             }
 
-            if let Some(name) = &args.workspace {
+            if let Some(name) = &args.target.workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Name(name.clone()),
@@ -372,7 +372,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.next_active_workspace {
+            if args.target.next_active_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::NextActive,
@@ -381,7 +381,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.prev_active_workspace {
+            if args.target.prev_active_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::PreviousActive,
@@ -390,7 +390,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.next_workspace {
+            if args.target.next_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Next,
@@ -399,7 +399,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.prev_workspace {
+            if args.target.prev_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Previous,
@@ -408,7 +408,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.recent_workspace {
+            if args.target.recent_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Recent,
@@ -417,7 +417,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.next_active_workspace_on_monitor {
+            if args.target.next_active_workspace_on_monitor {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::NextActiveInMonitor,
@@ -426,7 +426,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.prev_active_workspace_on_monitor {
+            if args.target.prev_active_workspace_on_monitor {
               move_window_to_workspace(
                 window,
                 WorkspaceTarget::PreviousActiveInMonitor,

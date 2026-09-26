@@ -434,43 +434,52 @@ pub struct InvokeFocusCommand {
 #[derive(Args, Clone, Debug, PartialEq, Serialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct InvokeMoveCommand {
-  /// Direction to move the window.
-  #[clap(long, group = "move_target")]
-  pub direction: Option<Direction>,
+  #[clap(flatten)]
+  #[serde(flatten)]
+  pub target: InvokeMoveTarget,
 
   /// Use the inverse of the WM global stack direction for this move only
   /// (does not flip the stored global flag). Spotcobuild
   /// Super+Shift+Ctrl.
   #[clap(long, requires = "direction")]
   pub opposite_tiling_direction: bool,
+}
+
+#[derive(Args, Clone, Debug, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+#[group(id = "move_target", required = true, multiple = false)]
+pub struct InvokeMoveTarget {
+  /// Direction to move the window.
+  #[clap(long)]
+  pub direction: Option<Direction>,
 
   /// Move window to workspace in specified direction.
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub workspace_in_direction: Option<Direction>,
 
   /// Name of workspace to move the window.
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub workspace: Option<String>,
 
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub next_active_workspace: bool,
 
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub prev_active_workspace: bool,
 
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub next_workspace: bool,
 
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub prev_workspace: bool,
 
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub next_active_workspace_on_monitor: bool,
 
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub prev_active_workspace_on_monitor: bool,
 
-  #[clap(long, group = "move_target")]
+  #[clap(long)]
   pub recent_workspace: bool,
 }
 
@@ -549,11 +558,29 @@ mod shell_exec_ipc_tests {
 
     match command {
       InvokeCommand::Move(move_command) => {
-        assert_eq!(move_command.direction, Some(Direction::Left));
+        assert_eq!(move_command.target.direction, Some(Direction::Left));
         assert!(move_command.opposite_tiling_direction);
       }
       other => panic!("expected Move, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn bare_move_is_rejected() {
+    assert!(InvokeCommand::try_parse_from(["glazewm", "move"]).is_err());
+  }
+
+  #[test]
+  fn move_targets_are_mutually_exclusive() {
+    assert!(InvokeCommand::try_parse_from([
+      "glazewm",
+      "move",
+      "--direction",
+      "left",
+      "--workspace",
+      "other",
+    ])
+    .is_err());
   }
 
   #[test]
