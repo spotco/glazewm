@@ -47,7 +47,10 @@ fn set_global_tiling_direction(
     new_tiling_direction.clone(),
   ));
 
-  // Compat: existing Zebar chips listen for TilingDirectionChanged.
+  // Compatibility: keep the legacy focused-container event for existing
+  // clients during the migration window. New clients must use
+  // GlobalTilingDirectionChanged for the WM-wide insertion axis; emitting
+  // both must not make the legacy field authoritative for global state.
   if let Some(direction_container) = state
     .focused_container()
     .and_then(|focused| focused.direction_container())

@@ -419,6 +419,20 @@ mod tests {
     ])
   }
 
+  /// Deeper two-stack fixture with focus on an inner window (`2`).
+  fn fixture_deep_12_34() -> MoveTree {
+    h(vec![
+      MoveNode::split(
+        TilingDirection::Vertical,
+        vec![MoveNode::window("1"), MoveNode::window("2")],
+      ),
+      MoveNode::split(
+        TilingDirection::Vertical,
+        vec![MoveNode::window("3"), MoveNode::window("4")],
+      ),
+    ])
+  }
+
   #[test]
   fn fixture_formats_as_expected() {
     assert_eq!(fixture_13_23().format_compact(), "H[V[1 2] 3]");
@@ -531,16 +545,7 @@ mod tests {
   #[test]
   fn deeper_nest_parallel_extracts_window_beside_neighbor() {
     // H[V[1 2] V[3 4]] focus 3 Left stack=H → H[3 V[1 2] 4]
-    let tree = h(vec![
-      MoveNode::split(
-        TilingDirection::Vertical,
-        vec![MoveNode::window("1"), MoveNode::window("2")],
-      ),
-      MoveNode::split(
-        TilingDirection::Vertical,
-        vec![MoveNode::window("3"), MoveNode::window("4")],
-      ),
-    ]);
+    let tree = fixture_deep_12_34();
     let out = plan_global_move(
       &tree,
       "3",
@@ -549,6 +554,75 @@ mod tests {
     )
     .expect("move");
     assert_eq!(out.format_compact(), "H[3 V[1 2] 4]");
+  }
+
+  #[test]
+  fn deep_fixture_inner_focus_covers_all_arrows() {
+    let cases = [
+      (
+        TilingDirection::Horizontal,
+        Direction::Left,
+        None,
+      ),
+      (
+        TilingDirection::Horizontal,
+        Direction::Right,
+        Some("H[1 V[3 4] 2]"),
+      ),
+      (
+        TilingDirection::Horizontal,
+        Direction::Up,
+        Some("H[2 1 V[3 4]]"),
+      ),
+      (
+        TilingDirection::Horizontal,
+        Direction::Down,
+        Some("H[1 2 3 4]"),
+      ),
+      (
+        TilingDirection::Vertical,
+        Direction::Left,
+        Some("V[2 H[1 V[3 4]]]"),
+      ),
+      (
+        TilingDirection::Vertical,
+        Direction::Right,
+        Some("V[1 2 3 4]"),
+      ),
+      (
+        TilingDirection::Vertical,
+        Direction::Up,
+        Some("V[2 H[1 V[3 4]]]"),
+      ),
+      (
+        TilingDirection::Vertical,
+        Direction::Down,
+        Some("V[H[1 V[3 4]] 2]"),
+      ),
+    ];
+
+    for (stack_direction, direction, expected) in cases {
+      let result = plan_global_move(
+        &fixture_deep_12_34(),
+        "2",
+        &direction,
+        &stack_direction,
+      );
+
+      match expected {
+        Some(expected) => assert_eq!(
+          result
+            .expect("deep fixture move should succeed")
+            .format_compact(),
+          expected,
+          "stack={stack_direction:?}, direction={direction:?}"
+        ),
+        None => assert!(
+          result.is_none(),
+          "stack={stack_direction:?}, direction={direction:?}"
+        ),
+      }
+    }
   }
 
   #[test]

@@ -85,6 +85,9 @@ Plus:
   `TilingDirectionChanged` / `query tiling-direction` — extend or add a
   parallel **global** field rather than silently changing meaning without a
   Zebar update in the same change set.
+- Keep the legacy `TilingDirectionChanged` compatibility emission during the
+  migration window. New clients must consume `GlobalTilingDirectionChanged`
+  / `globalTilingDirection`; the two events are intentionally not equivalent.
 - Prefer config bindings for Super+Shift+Ctrl chords; only add a new invoke
   command if “move with explicit stack direction” cannot be expressed as
   `set-tiling-direction` + `move` without races.
@@ -150,9 +153,10 @@ Horizontal, or from config — see open questions).
 
 - Add `query global-tiling-direction` (and/or extend existing tiling-direction
   response with `globalTilingDirection`).
-- Zebar provider exposes `globalTilingDirection` (keep legacy
-  `tilingDirection` as focused-container for one release, or alias both to
-  global once J no longer mutates locals — decide in Step 2).
+- Zebar provider exposes `globalTilingDirection` while keeping legacy
+  `tilingDirection` as the focused-container direction. Older WM responses
+  without the global field fall back to the legacy value; newer responses and
+  events keep the two fields independent.
 - tokyo-silence pack chip: bind icon + click to global toggle
   (`toggle-tiling-direction` after retarget, or explicit
   `toggle-global-tiling-direction`).
@@ -220,6 +224,8 @@ Horizontal, or from config — see open questions).
 
 - [x] Table-driven tests for:
       - global H/V × move L/R/U/D on the `13/23` fixture
+      - inner-window focus across all four arrows on the deeper
+        `H[V[1 2] V[3 4]]` fixture
       - deeper nested splits (3+ levels)
       - only-child / single-window workspace
       - opposite-flag moves do not mutate stored global
@@ -293,11 +299,14 @@ Verification run 2026-09-26:
 
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --all-targets --all-features -- -D warnings`
-- [x] `cargo test -p wm-common --lib` (71 passed)
+- [x] `cargo test -p wm-common --lib` (72 passed)
 - [x] `cargo test -p wm --bin glazewm` (41 passed)
 - [x] `build.bat` (release WM, CLI, and watcher artifacts)
-- [x] Zebar provider tests (15 passed), full Zebar `build.bat`, and release
+- [x] Zebar provider tests (17 passed), full Zebar `build.bat`, and release
       deployment completed.
+- [x] Added explicit provider-state coverage proving legacy
+      `tilingDirection` remains local while `globalTilingDirection` remains
+      WM-wide, with fallback behavior for older WM responses.
 - [x] Deployed with the existing backup/deploy scripts; current WM starts and
       `query global-tiling-direction` returns successfully.
 - [x] Opposite-move config command parses and the live config starts without
