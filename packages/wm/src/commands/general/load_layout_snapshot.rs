@@ -6,10 +6,10 @@ use tracing::info;
 use super::layout_debug_log;
 use uuid::Uuid;
 use wm_common::{
-  match_windows, plan_workspace_tiling_layout, LayoutPlanNode,
-  LayoutSnapshot, MatchableIdentity, MatchableWindow, SkipReason,
-  SnapshotBounds, SnapshotMonitor, SnapshotNode, SnapshotNodeKind,
-  SnapshotWindow, WindowState, WorkspaceLayoutPlan,
+  match_windows, plan_workspace_tiling_layout, resolve_floating_placement,
+  LayoutPlanNode, LayoutSnapshot, MatchableIdentity, MatchableWindow,
+  SkipReason, SnapshotBounds, SnapshotMonitor, SnapshotNode,
+  SnapshotNodeKind, SnapshotWindow, WindowState, WorkspaceLayoutPlan,
 };
 
 use crate::{
@@ -26,7 +26,10 @@ use crate::{
     Container, Monitor, SplitContainer, TilingContainer, WindowContainer,
     WorkspaceTarget,
   },
-  traits::{CommonGetters, TilingDirectionGetters, TilingSizeGetters, WindowGetters},
+  traits::{
+    CommonGetters, PositionGetters, TilingDirectionGetters, TilingSizeGetters,
+    WindowGetters,
+  },
   user_config::UserConfig,
   wm_state::WmState,
 };
@@ -52,6 +55,8 @@ struct SnapshotLeaf {
   workspace_name: String,
   /// DFS order among window leaves in the workspace.
   order_index: usize,
+  /// Live monitor bounds for relative floating restore (when matched).
+  live_monitor_bounds: Option<SnapshotBounds>,
 }
 
 /// Best-effort restore of `snapshot` onto the current desktop.
@@ -296,10 +301,15 @@ fn restore_window(
   };
 
   if matches!(target_state, WindowState::Floating(_)) {
-    if let Some(placement) = &leaf.window.floating_placement {
-      // Full Rect restore (X/Y/W/H). set_window_position alone preserves
-      // live width/height and cannot round-trip a resized float.
-      window.set_floating_placement(placement.clone());
+    if let Some(placement) = resolve_floating_placement(
+      &leaf.window,
+      leaf.live_monitor_bounds.as_ref(),
+    ) {
+      // Full Rect restore (X/Y/W/H). Prefer floatingPlacementRelative *
+      // live monitor bounds when present; else absolute floatingPlacement.
+      // set_window_position alone preserves live width/height and cannot
+      // round-trip a resized float.
+      window.set_floating_placement(placement);
       window.set_has_custom_floating_placement(true);
       state.pending_sync.queue_container_to_redraw(window);
     }
@@ -841,7 +851,8 @@ fn collect_snapshot_leaves(
   let mut leaves = Vec::new();
   let mut seen_workspace_keys: HashSet<String> = HashSet::new();
 
-  for (snap_mon, _live_mon) in monitor_map {
+  for (snap_mon, live_mon) in monitor_map {
+    let live_bounds = live_monitor_bounds(live_mon);
     for workspace in &snap_mon.workspaces {
       let ws_key = format!("{}::{}", snap_mon.device_name, workspace.name);
       if !seen_workspace_keys.insert(ws_key) {
@@ -851,6 +862,7 @@ fn collect_snapshot_leaves(
       collect_node_windows(
         &workspace.root,
         &workspace.name,
+        live_bounds.clone(),
         &mut order,
         &mut leaves,
       );
@@ -869,6 +881,7 @@ fn collect_snapshot_leaves(
       collect_node_windows(
         &workspace.root,
         &workspace.name,
+        None,
         &mut order,
         &mut leaves,
       );
@@ -876,6 +889,16 @@ fn collect_snapshot_leaves(
   }
 
   leaves
+}
+
+fn live_monitor_bounds(monitor: &Monitor) -> Option<SnapshotBounds> {
+  let rect = monitor.to_rect().ok()?;
+  Some(SnapshotBounds {
+    x: rect.x(),
+    y: rect.y(),
+    width: rect.width(),
+    height: rect.height(),
+  })
 }
 
 /// Ensure each snapshot workspace lands on its matched live monitor.
@@ -944,6 +967,7 @@ fn ensure_workspaces_on_matched_monitors(
 fn collect_node_windows(
   node: &SnapshotNode,
   workspace_name: &str,
+  live_monitor_bounds: Option<SnapshotBounds>,
   order: &mut usize,
   out: &mut Vec<SnapshotLeaf>,
 ) {
@@ -958,6 +982,7 @@ fn collect_node_windows(
           window: window.clone(),
           workspace_name: workspace_name.to_string(),
           order_index: *order,
+          live_monitor_bounds: live_monitor_bounds.clone(),
         });
         *order += 1;
       }
@@ -965,7 +990,13 @@ fn collect_node_windows(
     SnapshotNodeKind::Split => {
       if let Some(children) = &node.children {
         for child in children {
-          collect_node_windows(child, workspace_name, order, out);
+          collect_node_windows(
+            child,
+            workspace_name,
+            live_monitor_bounds.clone(),
+            order,
+            out,
+          );
         }
       }
     }

@@ -532,6 +532,7 @@ fn snapshot_from_native_window(
     ),
     prev_state: None,
     floating_placement: native.frame().ok(),
+    floating_placement_relative: None,
     id: None,
     handle: Some(handle),
   }

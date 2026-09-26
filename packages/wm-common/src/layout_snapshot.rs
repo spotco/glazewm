@@ -58,6 +58,19 @@ pub struct SnapshotBounds {
   pub height: i32,
 }
 
+/// Floating window placement as fractions of the snapshot monitor bounds.
+///
+/// Durable source of truth going forward (`floatingPlacementRelative`). Values
+/// are typically in 0..1 but slight out-of-range is allowed (partially off-monitor).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRelativeRect {
+  pub x: f32,
+  pub y: f32,
+  pub width: f32,
+  pub height: f32,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotWorkspace {
@@ -108,6 +121,10 @@ pub struct SnapshotWindow {
   pub prev_state: Option<WindowState>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub floating_placement: Option<Rect>,
+  /// Placement as fractions of the owning snapshot monitor bounds.
+  /// Preferred over `floating_placement` when present at restore time.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub floating_placement_relative: Option<SnapshotRelativeRect>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub id: Option<Uuid>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,7 +218,14 @@ impl SnapshotMonitor {
         })
       });
 
-    let workspaces = monitor
+    let bounds = SnapshotBounds {
+      x: monitor.x,
+      y: monitor.y,
+      width: monitor.width,
+      height: monitor.height,
+    };
+
+    let mut workspaces: Vec<SnapshotWorkspace> = monitor
       .children
       .iter()
       .filter_map(|child| match child {
@@ -212,16 +236,15 @@ impl SnapshotMonitor {
       })
       .collect();
 
+    for workspace in &mut workspaces {
+      attach_floating_placement_relative(&mut workspace.root, &bounds);
+    }
+
     Self {
       hardware_id: monitor.hardware_id.clone(),
       device_path: monitor.device_path.clone(),
       device_name: monitor.device_name.clone(),
-      bounds: SnapshotBounds {
-        x: monitor.x,
-        y: monitor.y,
-        width: monitor.width,
-        height: monitor.height,
-      },
+      bounds,
       focused_workspace_name,
       workspaces,
       id: Some(monitor.id),
@@ -234,13 +257,19 @@ impl SnapshotWorkspace {
     let mut id_map = HashMap::new();
     let mut next_id = 0u32;
 
-    let children: Vec<SnapshotNode> = workspace
+    let mut children: Vec<SnapshotNode> = workspace
       .children
       .iter()
       .filter_map(|child| {
         convert_node(child, &mut id_map, &mut next_id)
       })
       .collect();
+
+    apply_sibling_tiling_sizes(
+      &mut children,
+      &workspace.children,
+      &workspace.tiling_direction,
+    );
 
     let child_focus_order = workspace
       .child_focus_order
@@ -281,11 +310,17 @@ fn convert_node(
       let local_id = next_local_id(next_id);
       id_map.insert(split.id, local_id.clone());
 
-      let children: Vec<SnapshotNode> = split
+      let mut children: Vec<SnapshotNode> = split
         .children
         .iter()
         .filter_map(|child| convert_node(child, id_map, next_id))
         .collect();
+
+      apply_sibling_tiling_sizes(
+        &mut children,
+        &split.children,
+        &split.tiling_direction,
+      );
 
       let child_focus_order: Vec<String> = split
         .child_focus_order
@@ -362,6 +397,8 @@ impl SnapshotWindow {
       state: window.state.clone(),
       prev_state: window.prev_state.clone(),
       floating_placement: Some(window.floating_placement.clone()),
+      // Filled later from monitor bounds in `attach_floating_placement_relative`.
+      floating_placement_relative: None,
       id: Some(window.id),
       handle: Some(window.handle),
     }
@@ -417,6 +454,208 @@ fn civil_from_days(unix_secs: u64) -> (i32, u32, u32, u32, u32, u32) {
   )
 }
 
+
+
+fn dto_is_tiling_sibling(dto: &ContainerDto) -> bool {
+  match dto {
+    ContainerDto::Split(_) => true,
+    ContainerDto::Window(window) => matches!(window.state, WindowState::Tiling),
+    _ => false,
+  }
+}
+
+fn dto_extent(dto: &ContainerDto, direction: &TilingDirection) -> Option<i32> {
+  let (width, height) = match dto {
+    ContainerDto::Window(window) => (window.width, window.height),
+    ContainerDto::Split(split) => (split.width, split.height),
+    _ => return None,
+  };
+  Some(match direction {
+    TilingDirection::Horizontal => width,
+    TilingDirection::Vertical => height,
+  })
+}
+
+/// Among tiling-only siblings, set `tiling_size` from on-screen geometry ratios
+/// (horizontal→width, vertical→height). Floaters are excluded. Falls back to
+/// renormalizing existing `tiling_size` when geometry is missing/zero.
+fn apply_sibling_tiling_sizes(
+  nodes: &mut [SnapshotNode],
+  source_dtos: &[ContainerDto],
+  direction: &TilingDirection,
+) {
+  if nodes.is_empty() {
+    return;
+  }
+
+  // Convert keeps Split|Window 1:1 under workspace/split; if lengths diverge,
+  // fall back to size-only renormalize on nodes that look tiling.
+  if nodes.len() != source_dtos.len() {
+    renormalize_node_tiling_sizes(nodes);
+    return;
+  }
+
+  let tiling_indices: Vec<usize> = source_dtos
+    .iter()
+    .enumerate()
+    .filter(|(_, dto)| dto_is_tiling_sibling(dto))
+    .map(|(index, _)| index)
+    .collect();
+
+  if tiling_indices.is_empty() {
+    return;
+  }
+
+  let extents: Vec<Option<i32>> = tiling_indices
+    .iter()
+    .map(|&index| dto_extent(&source_dtos[index], direction))
+    .collect();
+
+  let geometry_ok = extents.iter().all(|extent| matches!(extent, Some(v) if *v > 0));
+  if geometry_ok {
+    let total: f32 = extents
+      .iter()
+      .map(|extent| extent.unwrap() as f32)
+      .sum();
+    if total > f32::EPSILON {
+      for (j, &index) in tiling_indices.iter().enumerate() {
+        let size = extents[j].unwrap() as f32 / total;
+        nodes[index].tiling_size = Some(size);
+      }
+      return;
+    }
+  }
+
+  // Fallback: renormalize existing tiling_size among tiling-only children.
+  let raw: Vec<f32> = tiling_indices
+    .iter()
+    .map(|&index| nodes[index].tiling_size.unwrap_or(0.0))
+    .collect();
+  let total: f32 = raw.iter().copied().sum();
+  if total > f32::EPSILON {
+    for (j, &index) in tiling_indices.iter().enumerate() {
+      nodes[index].tiling_size = Some(raw[j] / total);
+    }
+  } else {
+    #[allow(clippy::cast_precision_loss)]
+    let equal = 1.0 / tiling_indices.len() as f32;
+    for &index in &tiling_indices {
+      nodes[index].tiling_size = Some(equal);
+    }
+  }
+}
+
+fn renormalize_node_tiling_sizes(nodes: &mut [SnapshotNode]) {
+  let tiling_indices: Vec<usize> = nodes
+    .iter()
+    .enumerate()
+    .filter(|(_, node)| {
+      match node.kind {
+        SnapshotNodeKind::Split => true,
+        SnapshotNodeKind::Window => node
+          .window
+          .as_ref()
+          .is_some_and(|w| matches!(w.state, WindowState::Tiling)),
+      }
+    })
+    .map(|(index, _)| index)
+    .collect();
+
+  if tiling_indices.is_empty() {
+    return;
+  }
+
+  let raw: Vec<f32> = tiling_indices
+    .iter()
+    .map(|&index| nodes[index].tiling_size.unwrap_or(0.0))
+    .collect();
+  let total: f32 = raw.iter().copied().sum();
+  if total > f32::EPSILON {
+    for (j, &index) in tiling_indices.iter().enumerate() {
+      nodes[index].tiling_size = Some(raw[j] / total);
+    }
+  } else {
+    #[allow(clippy::cast_precision_loss)]
+    let equal = 1.0 / tiling_indices.len() as f32;
+    for &index in &tiling_indices {
+      nodes[index].tiling_size = Some(equal);
+    }
+  }
+}
+
+fn attach_floating_placement_relative(
+  node: &mut SnapshotNode,
+  monitor_bounds: &SnapshotBounds,
+) {
+  if let Some(window) = node.window.as_mut() {
+    if matches!(window.state, WindowState::Floating(_)) {
+      if let Some(absolute) = window.floating_placement.as_ref() {
+        window.floating_placement_relative =
+          relative_rect_from_absolute(absolute, monitor_bounds);
+      }
+    }
+  }
+
+  if let Some(children) = node.children.as_mut() {
+    for child in children {
+      attach_floating_placement_relative(child, monitor_bounds);
+    }
+  }
+}
+
+/// Convert an absolute window rect into fractions of `monitor_bounds`.
+///
+/// Returns `None` when monitor width or height is zero.
+#[must_use]
+pub fn relative_rect_from_absolute(
+  absolute: &Rect,
+  monitor_bounds: &SnapshotBounds,
+) -> Option<SnapshotRelativeRect> {
+  if monitor_bounds.width == 0 || monitor_bounds.height == 0 {
+    return None;
+  }
+
+  #[allow(clippy::cast_precision_loss)]
+  Some(SnapshotRelativeRect {
+    x: (absolute.x() - monitor_bounds.x) as f32
+      / monitor_bounds.width as f32,
+    y: (absolute.y() - monitor_bounds.y) as f32
+      / monitor_bounds.height as f32,
+    width: absolute.width() as f32 / monitor_bounds.width as f32,
+    height: absolute.height() as f32 / monitor_bounds.height as f32,
+  })
+}
+
+/// Convert monitor-relative fractions back into an absolute `Rect`.
+#[must_use]
+pub fn absolute_rect_from_relative(
+  relative: &SnapshotRelativeRect,
+  monitor_bounds: &SnapshotBounds,
+) -> Rect {
+  #[allow(clippy::cast_possible_truncation)]
+  let x = monitor_bounds.x + (relative.x * monitor_bounds.width as f32).round() as i32;
+  #[allow(clippy::cast_possible_truncation)]
+  let y = monitor_bounds.y + (relative.y * monitor_bounds.height as f32).round() as i32;
+  #[allow(clippy::cast_possible_truncation)]
+  let width = (relative.width * monitor_bounds.width as f32).round() as i32;
+  #[allow(clippy::cast_possible_truncation)]
+  let height = (relative.height * monitor_bounds.height as f32).round() as i32;
+  Rect::from_xy(x, y, width.max(1), height.max(1))
+}
+
+/// Prefer relative floating placement when present; else absolute.
+#[must_use]
+pub fn resolve_floating_placement(
+  window: &SnapshotWindow,
+  live_monitor_bounds: Option<&SnapshotBounds>,
+) -> Option<Rect> {
+  if let (Some(relative), Some(bounds)) =
+    (&window.floating_placement_relative, live_monitor_bounds)
+  {
+    return Some(absolute_rect_from_relative(relative, bounds));
+  }
+  window.floating_placement.clone()
+}
 
 /// Validate snapshot schema version before any restore mutation.
 ///
@@ -900,6 +1139,14 @@ mod tests {
     let mut w = sample_window(Uuid::from_u128(id), name, tiling_size);
     w.state = state;
     w.prev_state = prev_state;
+    // Keep on-screen width proportional to tiling_size so geometry-based
+    // save shares match the intentional ratios in round-trip tests.
+    if let Some(size) = tiling_size {
+      #[allow(clippy::cast_possible_truncation)]
+      {
+        w.width = (size * 1000.0).round() as i32;
+      }
+    }
     if let Some((x, y, width, height)) = float_xywh {
       w.floating_placement = Rect::from_xy(x, y, width, height);
     }
@@ -1169,6 +1416,7 @@ mod tests {
             state: WindowState::Tiling,
             prev_state: None,
             floating_placement: None,
+            floating_placement_relative: None,
             id: None,
             handle: None,
           }),
@@ -1197,6 +1445,7 @@ mod tests {
                 state: WindowState::Tiling,
                 prev_state: None,
                 floating_placement: None,
+                floating_placement_relative: None,
                 id: None,
                 handle: None,
               }),
@@ -1219,6 +1468,7 @@ mod tests {
                 state: WindowState::Tiling,
                 prev_state: None,
                 floating_placement: None,
+                floating_placement_relative: None,
                 id: None,
                 handle: None,
               }),
@@ -1315,6 +1565,7 @@ mod tests {
         state: WindowState::Tiling,
         prev_state: None,
         floating_placement: None,
+        floating_placement_relative: None,
         id: None,
         handle: None,
       }),
@@ -1391,4 +1642,352 @@ mod tests {
     assert_eq!(plan1.tiling_direction, TilingDirection::Horizontal);
     assert_eq!(plan2.tiling_direction, TilingDirection::Vertical);
   }
+
+  #[test]
+  fn geometry_tiling_sizes_override_corrupt_raw_shares() {
+    // Verified Asus WS1 bug: raw tiling_size 0.458 + 1.292 while on-screen
+    // widths were 1576 + 1864 (~0.458 / 0.542 of 3440).
+    let win_left = Uuid::from_u128(1);
+    let win_steam = Uuid::from_u128(2);
+    let ws_id = Uuid::from_u128(3);
+    let mon_id = Uuid::from_u128(4);
+
+    let mut left = sample_window(win_left, "left", Some(0.458));
+    left.width = 1576;
+    left.height = 1400;
+    left.x = 0;
+    left.y = 0;
+
+    let mut steam = sample_window(win_steam, "steam", Some(1.292));
+    steam.width = 1864;
+    steam.height = 1400;
+    steam.x = 1576;
+    steam.y = 0;
+
+    let workspace = WorkspaceDto {
+      id: ws_id,
+      name: "1".into(),
+      display_name: None,
+      parent_id: Some(mon_id),
+      children: vec![
+        ContainerDto::Window(left),
+        ContainerDto::Window(steam),
+      ],
+      child_focus_order: vec![win_left, win_steam],
+      has_focus: true,
+      is_displayed: true,
+      width: 3440,
+      height: 1400,
+      x: 0,
+      y: 0,
+      tiling_direction: TilingDirection::Horizontal,
+    };
+
+    let monitor = ContainerDto::Monitor(MonitorDto {
+      id: mon_id,
+      parent_id: None,
+      children: vec![ContainerDto::Workspace(workspace)],
+      child_focus_order: vec![ws_id],
+      has_focus: true,
+      width: 3440,
+      height: 1440,
+      x: 0,
+      y: 0,
+      dpi: 96,
+      scale_factor: 1.0,
+      handle: Some(1),
+      device_name: "DISPLAY1".into(),
+      device_path: Some("\\\\.\\DISPLAY1".into()),
+      hardware_id: Some("HW1".into()),
+      working_rect: Rect::from_xy(0, 0, 3440, 1400),
+    });
+
+    let snapshot = LayoutSnapshot::from_monitor_dtos(
+      &[monitor],
+      vec![],
+      false,
+      vec![],
+      None,
+      "2026-09-25T00:00:00Z".into(),
+    )
+    .into_durable();
+
+    let children = snapshot.monitors[0].workspaces[0]
+      .root
+      .children
+      .as_ref()
+      .unwrap();
+    assert_eq!(children.len(), 2);
+    let left_size = children[0].tiling_size.unwrap();
+    let steam_size = children[1].tiling_size.unwrap();
+    assert!(
+      (left_size - 0.458).abs() < 0.002,
+      "left size {left_size}"
+    );
+    assert!(
+      (steam_size - 0.542).abs() < 0.002,
+      "steam size {steam_size}"
+    );
+    assert!((left_size + steam_size - 1.0).abs() < 0.001);
+
+    // Restore planning must keep ~46/54 when sizes already sum to ~1.
+    let matched = children
+      .iter()
+      .map(|c| c.local_id.clone())
+      .collect();
+    let plan = crate::plan_workspace_tiling_layout(
+      &snapshot.monitors[0].workspaces[0],
+      &matched,
+    );
+    assert_eq!(plan.children.len(), 2);
+    assert!((plan.children[0].tiling_size() - left_size).abs() < 0.001);
+    assert!((plan.children[1].tiling_size() - steam_size).abs() < 0.001);
+  }
+
+  #[test]
+  fn geometry_tiling_excludes_floaters_from_sibling_set() {
+    let win_a = Uuid::from_u128(1);
+    let win_float = Uuid::from_u128(2);
+    let win_b = Uuid::from_u128(3);
+    let ws_id = Uuid::from_u128(4);
+    let mon_id = Uuid::from_u128(5);
+
+    let mut a = sample_window(win_a, "a", Some(0.5));
+    a.width = 1000;
+    a.height = 800;
+
+    let mut floater = sample_window(win_float, "float", None);
+    floater.state = WindowState::Floating(crate::FloatingStateConfig {
+      centered: false,
+      shown_on_top: false,
+    });
+    floater.width = 400;
+    floater.height = 300;
+    floater.tiling_size = None;
+
+    let mut b = sample_window(win_b, "b", Some(0.5));
+    b.width = 1000;
+    b.height = 800;
+
+    let workspace = WorkspaceDto {
+      id: ws_id,
+      name: "1".into(),
+      display_name: None,
+      parent_id: Some(mon_id),
+      children: vec![
+        ContainerDto::Window(a),
+        ContainerDto::Window(floater),
+        ContainerDto::Window(b),
+      ],
+      child_focus_order: vec![win_a, win_float, win_b],
+      has_focus: true,
+      is_displayed: true,
+      width: 2000,
+      height: 800,
+      x: 0,
+      y: 0,
+      tiling_direction: TilingDirection::Horizontal,
+    };
+
+    let monitor = ContainerDto::Monitor(MonitorDto {
+      id: mon_id,
+      parent_id: None,
+      children: vec![ContainerDto::Workspace(workspace)],
+      child_focus_order: vec![ws_id],
+      has_focus: true,
+      width: 2000,
+      height: 1000,
+      x: 0,
+      y: 0,
+      dpi: 96,
+      scale_factor: 1.0,
+      handle: Some(1),
+      device_name: "DISPLAY1".into(),
+      device_path: None,
+      hardware_id: None,
+      working_rect: Rect::from_xy(0, 0, 2000, 960),
+    });
+
+    let snapshot = LayoutSnapshot::from_monitor_dtos(
+      &[monitor],
+      vec![],
+      false,
+      vec![],
+      None,
+      "t".into(),
+    );
+
+    let children = snapshot.monitors[0].workspaces[0]
+      .root
+      .children
+      .as_ref()
+      .unwrap();
+    assert_eq!(children.len(), 3);
+    assert!((children[0].tiling_size.unwrap() - 0.5).abs() < 0.001);
+    assert!(children[1].tiling_size.is_none());
+    assert!((children[2].tiling_size.unwrap() - 0.5).abs() < 0.001);
+  }
+
+  #[test]
+  fn floating_relative_round_trip_and_scale_on_monitor_change() {
+    let mon = SnapshotBounds {
+      x: 100,
+      y: 50,
+      width: 2000,
+      height: 1000,
+    };
+    let absolute = Rect::from_xy(300, 150, 400, 250);
+    let relative = relative_rect_from_absolute(&absolute, &mon).unwrap();
+    assert!((relative.x - 0.1).abs() < 0.0001);
+    assert!((relative.y - 0.1).abs() < 0.0001);
+    assert!((relative.width - 0.2).abs() < 0.0001);
+    assert!((relative.height - 0.25).abs() < 0.0001);
+
+    let restored = absolute_rect_from_relative(&relative, &mon);
+    assert_eq!(restored.x(), absolute.x());
+    assert_eq!(restored.y(), absolute.y());
+    assert_eq!(restored.width(), absolute.width());
+    assert_eq!(restored.height(), absolute.height());
+
+    // Scale when live monitor bounds differ from snapshot monitor.
+    let live = SnapshotBounds {
+      x: 0,
+      y: 0,
+      width: 4000,
+      height: 2000,
+    };
+    let scaled = absolute_rect_from_relative(&relative, &live);
+    assert_eq!(scaled.x(), 400);
+    assert_eq!(scaled.y(), 200);
+    assert_eq!(scaled.width(), 800);
+    assert_eq!(scaled.height(), 500);
+  }
+
+  #[test]
+  fn resolve_floating_prefers_relative_else_absolute() {
+    let live = SnapshotBounds {
+      x: 0,
+      y: 0,
+      width: 1000,
+      height: 1000,
+    };
+    let window = SnapshotWindow {
+      identity: SnapshotWindowIdentity {
+        process_path: None,
+        process_name: "app".into(),
+        class_name: None,
+        title_hint: None,
+      },
+      state: WindowState::Floating(crate::FloatingStateConfig {
+        centered: false,
+        shown_on_top: false,
+      }),
+      prev_state: None,
+      floating_placement: Some(Rect::from_xy(10, 20, 30, 40)),
+      floating_placement_relative: Some(SnapshotRelativeRect {
+        x: 0.25,
+        y: 0.25,
+        width: 0.5,
+        height: 0.5,
+      }),
+      id: None,
+      handle: None,
+    };
+
+    let from_rel = resolve_floating_placement(&window, Some(&live)).unwrap();
+    assert_eq!(from_rel, Rect::from_xy(250, 250, 500, 500));
+
+    let mut absolute_only = window.clone();
+    absolute_only.floating_placement_relative = None;
+    let from_abs =
+      resolve_floating_placement(&absolute_only, Some(&live)).unwrap();
+    assert_eq!(from_abs, Rect::from_xy(10, 20, 30, 40));
+
+    // No live bounds → absolute fallback even if relative present.
+    let no_live = resolve_floating_placement(&window, None).unwrap();
+    assert_eq!(no_live, Rect::from_xy(10, 20, 30, 40));
+  }
+
+  #[test]
+  fn save_attaches_floating_placement_relative_from_monitor_bounds() {
+    let win_id = Uuid::from_u128(1);
+    let ws_id = Uuid::from_u128(2);
+    let mon_id = Uuid::from_u128(3);
+
+    let mut floater = sample_window(win_id, "float", None);
+    floater.state = WindowState::Floating(crate::FloatingStateConfig {
+      centered: false,
+      shown_on_top: false,
+    });
+    floater.tiling_size = None;
+    floater.floating_placement = Rect::from_xy(200, 100, 400, 300);
+    floater.x = 200;
+    floater.y = 100;
+    floater.width = 400;
+    floater.height = 300;
+
+    let workspace = WorkspaceDto {
+      id: ws_id,
+      name: "1".into(),
+      display_name: None,
+      parent_id: Some(mon_id),
+      children: vec![ContainerDto::Window(floater)],
+      child_focus_order: vec![win_id],
+      has_focus: true,
+      is_displayed: true,
+      width: 1920,
+      height: 1080,
+      x: 0,
+      y: 0,
+      tiling_direction: TilingDirection::Horizontal,
+    };
+
+    let monitor = ContainerDto::Monitor(MonitorDto {
+      id: mon_id,
+      parent_id: None,
+      children: vec![ContainerDto::Workspace(workspace)],
+      child_focus_order: vec![ws_id],
+      has_focus: true,
+      width: 1920,
+      height: 1080,
+      x: 0,
+      y: 0,
+      dpi: 96,
+      scale_factor: 1.0,
+      handle: Some(1),
+      device_name: "DISPLAY1".into(),
+      device_path: None,
+      hardware_id: None,
+      working_rect: Rect::from_xy(0, 0, 1920, 1040),
+    });
+
+    let snapshot = LayoutSnapshot::from_monitor_dtos(
+      &[monitor],
+      vec![],
+      false,
+      vec![],
+      None,
+      "t".into(),
+    )
+    .into_durable();
+
+    let win = snapshot.monitors[0].workspaces[0]
+      .root
+      .children
+      .as_ref()
+      .unwrap()[0]
+      .window
+      .as_ref()
+      .unwrap();
+    let rel = win.floating_placement_relative.as_ref().unwrap();
+    assert!((rel.x - (200.0 / 1920.0)).abs() < 0.0001);
+    assert!((rel.y - (100.0 / 1080.0)).abs() < 0.0001);
+    assert!((rel.width - (400.0 / 1920.0)).abs() < 0.0001);
+    assert!((rel.height - (300.0 / 1080.0)).abs() < 0.0001);
+    assert!(win.floating_placement.is_some(), "absolute kept for compat");
+
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(json.contains("floatingPlacementRelative"));
+  }
+
 }

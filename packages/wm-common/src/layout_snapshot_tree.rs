@@ -373,6 +373,7 @@ mod tests {
         state: WindowState::Tiling,
         prev_state: None,
         floating_placement: Some(Rect::from_xy(0, 0, 100, 100)),
+        floating_placement_relative: None,
         id: None,
         handle: None,
       }),

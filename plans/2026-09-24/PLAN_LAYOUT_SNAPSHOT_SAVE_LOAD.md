@@ -1,7 +1,7 @@
 # Layout Snapshot Save/Load Plan
 
 Date: 2026-09-24
-Status: Implemented (tray + CLI + auto layout.json persistence); PR open
+Status: Implemented (tray + CLI + auto layout.json + Step 12 geometry/relative floating); PR open
 Branch: `feature/layout-snapshot-save-load`
 Scope: tray context-menu save/load + CLI save/load/inspect + best-effort restore (no app launch)
 
@@ -19,6 +19,7 @@ Scope: tray context-menu save/load + CLI save/load/inspect + best-effort restore
 - [x] Step 10 - CLI save-layout / load-layout / query layout-match (+ inspect-layout alias)
 - [x] Step 11 - PR review round 2: full WindowState equality + prev_state, floating W+H,
       empty workspace→monitor, IPC path-with-spaces quoting
+- [x] Step 12 - Geometry-based tiling shares on save + screen-relative floating placement
 
 ## Objective
 
@@ -105,6 +106,44 @@ match_windows(snapshot_windows, live_windows) -> Vec<(snapshot_key, live_id)>
 3. Pretty-print `serde_json`.
 4. Clipboard set as UTF-8 text (`arboard`).
 5. Save dialog default name: `glazewm-layout-YYYYMMDD-HHMMSS.json`.
+
+
+### Step 12 — Corrupt tiling_size + screen-relative floating (2026-09-25)
+
+**Bug (verified on Asus WS1):** live left pane ~1576px (0.458) and Steam ~1864px (0.542)
+of a 3440 work area, but durable JSON stored raw `tilingSize` 0.458 + **1.292**. Load
+prune+renorm then produced ~26%/74% — wrong. Floaters in the tree are already skipped
+from the tiling plan (`NonTiling`) — keep that.
+
+**A) Geometry-based tiling shares on save**
+
+- At DTO→`SnapshotNode` build time (`from_monitor_dtos` / `convert_node` /
+  workspace root), among **tiling-only** siblings under each split/workspace:
+  set each child's `tilingSize` from on-screen extent ratios
+  (horizontal→`width`, vertical→`height`) using DTO `x/y/width/height`.
+- Floaters are excluded from the sibling set.
+- Renormalize so tiling siblings sum to 1.
+- Fallback when child pixel sizes are missing/zero: renormalize existing
+  `tiling_size` among tiling-only children (better than persisting corrupt raw).
+- Restore planning already renormalizes; when save writes ~0.458/0.542, restore
+  keeps that ratio.
+
+**B) Screen-relative floating placement**
+
+- Schema stays **version 1**. Add optional camelCase
+  `floatingPlacementRelative: { x, y, width, height }` (`SnapshotRelativeRect`,
+  f32 fractions of **snapshot monitor bounds**, 0–1 allow slight out-of-range).
+- On save: `x_rel = (rect.x - mon.x) / mon.width` (guard divide-by-zero); same for
+  y/width/height. Prefer relative as durable source of truth; still write absolute
+  `floatingPlacement` for backward-compat readers; accept old JSON with only absolute.
+- On load: if relative present + matched live monitor bounds →
+  `abs = relative * live_bounds`; else fall back to absolute. Apply full Rect via
+  `set_floating_placement` + `set_has_custom_floating_placement(true)` (W+H, not
+  just position).
+
+**Tests (`wm-common`):** tiling siblings 0.458+1.292 with widths 1576+1864 →
+saved ≈0.458/0.542; floating abs→rel→abs round-trip; relative scales when monitor
+bounds change; old absolute-only snapshot still resolves.
 
 ## Steps
 
@@ -228,3 +267,13 @@ Status: Implemented on this branch (same PR #2)
 cargo test -p wm layout_persistence
 cargo test -p wm-common --lib
 ```
+
+### Step 12 - Geometry tiling shares + relative floating
+
+- [x] Plan update (this section) + Progress item
+- [x] Save-time geometry `tilingSize` among tiling-only siblings (build from DTOs)
+- [x] `SnapshotRelativeRect` / `floatingPlacementRelative` on save + resolve on load
+- [x] Unit tests in `wm-common` (tiling geometry, relative round-trip, absolute fallback)
+- [x] `cargo test -p wm-common --lib` (59 passed)
+- [ ] Commit + push PR #2 branch; Asus build/deploy (no GlazeWM kill)
+
