@@ -346,8 +346,9 @@ Verification run 2026-09-26:
       startup/provider setup diagnostics to `zebar.log`.
 - [x] `scripts\\deploy\\deploy_build.cmd --start` was exercised for Zebar;
       it stopped the prior process, swapped the release binary/resources,
-      and restarted the vendored spotco bar. The GlazeWM deploy script has
-      the matching `--start` path for the next WM swap.
+      copied the embedded pack into the Tauri resource root, and restarted the
+      vendored spotco bar. The GlazeWM deploy script has the matching `--start`
+      path for the next WM swap.
 - [x] CLI-equivalent Super+J / Super+Shift+Ctrl+Arrow checks passed, including
       horizontal and vertical normal moves, opposite-axis moves, structural
       H→V→H preservation, spotco bar detection, and soft-exit Zebar shutdown
