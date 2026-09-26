@@ -8,7 +8,7 @@ Scope: multi-day feature work (WM move semantics + global direction state + Zeba
 ## Progress
 
 - [x] Step 0 - Resolve open questions (blocking) — locked 2026-09-26
-- [ ] Step 1 - Document current contracts (commands, events, Zebar)
+- [x] Step 1 - Document current contracts (commands, events, Zebar)
 - [ ] Step 2 - Add WM-global tiling direction state + commands/events/query
 - [ ] Step 3 - Retarget `toggle-tiling-direction` / Super+J to the global flag
 - [ ] Step 4 - Change `move --direction` to insert using global stack direction
@@ -171,12 +171,12 @@ Horizontal, or from config — see open questions).
 
 ## Step 1 - Document current contracts
 
-- [ ] Freeze a short “before” matrix of `move` outcomes on fixtures
+- [x] Freeze a short “before” matrix of `move` outcomes on fixtures
       (2–3 window trees) under `plans/2026-09-26/fixtures/` or as unit-test
       snapshots, so we can assert “after” diffs.
-- [ ] Note CLI/IPC: `toggle-tiling-direction`, `set-tiling-direction`,
+- [x] Note CLI/IPC: `toggle-tiling-direction`, `set-tiling-direction`,
       `query tiling-direction`, event `tiling-direction-change`.
-- [ ] Note Zebar: `create-glazewm-provider.ts` + tokyo-silence
+- [x] Note Zebar: `create-glazewm-provider.ts` + tokyo-silence
       `WorkspacesSection` chip (`glazewm.tilingDirection`).
 
 ## Step 2 - Add WM-global tiling direction state + commands/events/query
