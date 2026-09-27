@@ -15,10 +15,11 @@ use wm_common::{
   format_system_time_rfc3339, AppCommand, AppMetadataData,
   BindingModesData, ClientResponseData, ClientResponseMessage,
   CommandData, EventSubscribeData, EventSubscriptionMessage, FocusedData,
-  GlobalTilingDirectionData, IgnoredWindowsData, LayoutSnapshot,
-  LoadLayoutData, MonitorsData, QueryCommand, ServerMessage,
-  SnapshotWindow, SnapshotWindowIdentity, SubscribableEvent,
-  TilingDirectionData, WindowsData, WmEvent, WorkspacesData,
+  GlobalTilingDirectionData, IgnoredWindowsData, LayoutHistoryData,
+  LayoutSnapshot, LoadLayoutData, MonitorsData, QueryCommand,
+  ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
+  SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
+  WorkspacesData,
 };
 use wm_platform::Dispatcher;
 
@@ -286,6 +287,16 @@ impl IpcServer {
                 .clone(),
             },
           )
+        }
+        QueryCommand::LayoutHistory => {
+          ClientResponseData::LayoutHistory(LayoutHistoryData {
+            undo_depth: wm.state.layout_history.undo_depth(),
+            redo_depth: wm.state.layout_history.redo_depth(),
+            last_transaction_id: wm
+              .state
+              .layout_history
+              .last_transaction_id(),
+          })
         }
         QueryCommand::Paused => {
           ClientResponseData::Paused(wm.state.is_paused)

@@ -1,7 +1,7 @@
 # Global tiling direction + consistent Super+Shift(+Ctrl) move Plan
 
 Date: 2026-09-26
-Status: implementation, CLI smoke, and automated/runtime verification complete; visual tray hover remains desktop-only
+Status: Steps 0–10 implementation, CLI smoke, and automated/runtime verification complete; physical key injection and visual tray hover remain desktop-only
 Branch: `glazewm-spotcobuild` (GlazeWM) + `zebar-spotcobuild` (Zebar pack / provider as needed)
 Scope: multi-day feature work (WM move semantics + global direction state + Zebar indicator + default config)
 
@@ -17,6 +17,7 @@ Scope: multi-day feature work (WM move semantics + global direction state + Zeba
 - [x] Step 7 - Zebar: show + toggle global tiling direction
 - [x] Step 8 - Make live `config.yaml` the spotcobuild sample default
 - [x] Step 9 - CLI smoke, automated/runtime verification, and build/deploy readiness
+- [x] Step 10 - Reversible layout-move history, undo/redo, and debug surface
 - [ ] Desktop-only visual tray-hover observation (CLI equivalent verified)
 
 ## Objective
@@ -58,11 +59,20 @@ Starting from a layout like:
 - Super+Shift+Left with **global = vertical** → `1` / `2` / `3`
   (tree restructured so the stack axis is vertical)
 
+For the deeper workspace-2 case `H[1 V[2 3] 4]` (rows `124` / `134`,
+focus on `1`):
+
+- Super+Shift+Right with **global = horizontal** → `H[V[2 3] 1 4]`
+  (`214` / `314`): reorder the focused window among workspace siblings.
+- Super+Shift+Ctrl+Right with **global = horizontal** →
+  `H[V[2 3 1] 4]` (`24` / `34` / `14`): use the opposite vertical stack,
+  append into the adjacent stack, and preserve the workspace axis.
+
 Plus:
 
 1. Global direction toggled by Super+J (not “whatever the focused split is”).
-2. Zebar shows that **global** direction (tokyo-silence chip today shows
-   `glazewm.tilingDirection` from focused-container query).
+2. Zebar shows that **global** direction (`globalTilingDirection`) and uses
+   the same field for the tokyo-silence chip.
 3. New Super+Shift+Ctrl+Arrow = same move algorithm but with the **opposite**
    of the current global direction.
 4. Spotcobuild default sample config = current live
@@ -85,9 +95,11 @@ Plus:
   `TilingDirectionChanged` / `query tiling-direction` — extend or add a
   parallel **global** field rather than silently changing meaning without a
   Zebar update in the same change set.
-- Keep the legacy `TilingDirectionChanged` compatibility emission during the
-  migration window. New clients must consume `GlobalTilingDirectionChanged`
-  / `globalTilingDirection`; the two events are intentionally not equivalent.
+- Keep the legacy `TilingDirectionChanged` contract for actual local
+  direction mutations during the migration window. Global toggles emit only
+  `GlobalTilingDirectionChanged`; new clients consume that event and
+  `globalTilingDirection`, so a global toggle cannot clobber the focused
+  container's legacy field.
 - Prefer config bindings for Super+Shift+Ctrl chords; only add a new invoke
   command if “move with explicit stack direction” cannot be expressed as
   `set-tiling-direction` + `move` without races.
@@ -229,6 +241,9 @@ Horizontal, or from config — see open questions).
       - deeper nested splits (3+ levels)
       - only-child / single-window workspace
       - opposite-flag moves do not mutate stored global
+- [x] Repeated opposite-axis Right moves from flat `123` preserve the
+      append-to-bottom invariant across both leaf-target and split-target
+      joins (`23 / 13` then `23 / 21`).
 - [x] Regression: layout snapshot save/load still round-trips nested
       directions (geometry), independent of global flag.
 
@@ -248,13 +263,18 @@ Built-in pack pattern already exists: `resources/starter` +
       under `F:\dev\zebar`.
 - [x] Pack id **`spotco.tokyo-silence`** (LOCKED) so a
       marketplace update of `y4m3.tokyo-silence` cannot overwrite your edits.
-- [x] Wire embed/install like starter: embed resource, install on first run,
-      change default `startupConfigs` / `STARTER_PACK_ID` (or parallel
-      spotcobuild constant) to the new pack + `bar` / `default`.
+- [x] Wire embed/install like starter: embed resource, install or refresh the
+      embedded pack when its version/build revision changes, and change the
+      default `startupConfigs` / `STARTER_PACK_ID` (or parallel spotcobuild
+      constant) to the new pack + `bar` / `default`.
 - [x] Provider: surface `globalTilingDirection` (and events).
 - [x] In the **vendored** pack: chip shows global H/V; click runs global toggle.
 - [x] Migrate this machine: point `~\.glzr\zebar\settings.json` at the
       vendored pack id (leave marketplace download alone or remove later).
+- [x] Retarget the GlazeWM live and sample `startup_commands` from the
+      marketplace `y4m3.tokyo-silence` pack to `spotco.tokyo-silence`; otherwise
+      a WM restart bypasses the migrated Zebar settings and launches the old
+      non-global chip.
 - [x] Note in pack README: fork of y4m3/tokyo-silence for spotcobuild.
 
 
@@ -297,13 +317,34 @@ the live layout so move checks are non-destructive.
 
 Verification run 2026-09-26:
 
-- [x] `cargo fmt --all -- --check`
-- [x] `cargo clippy --all-targets --all-features -- -D warnings`
-- [x] `cargo test -p wm-common --lib` (72 passed)
-- [x] `cargo test -p wm --bin glazewm` (41 passed)
+- [x] GlazeWM changed-file rustfmt check and targeted
+      `cargo clippy -p wm --bin glazewm --tests --all-features -- -D warnings`
+      pass. The repository-wide all-targets clippy command still reports
+      pre-existing layout-snapshot test lints outside this plan's diff.
+- [x] `cargo test -p wm-common --lib` (80 passed, including both workspace-2
+      direction cases)
+- [x] `cargo test -p wm --bin glazewm` (57 passed, including live tests for
+      both workspace-2 moves and a nested-move fixture compared directly with
+      `global_move_plan`)
 - [x] `build.bat` (release WM, CLI, and watcher artifacts)
-- [x] Zebar provider tests (17 passed), full Zebar `build.bat`, and release
-      deployment completed.
+- [x] Zebar provider tests (18 passed), Zebar Rust tests (15 passed), and the
+      vendored bundle reproducibility check passed.
+- [x] Zebar changed Rust files are formatted. The repository-wide formatter
+      still reports pre-existing changes in `crates/systray-util` and
+      `packages/desktop/build.rs` outside this review diff.
+- [x] Existing embedded-pack installs now refresh on version/build-revision
+      changes; matching installs are left untouched, with regression coverage.
+- [x] Embedded-pack refresh now stages beside the destination, validates the
+      staged manifest before swapping, restores the prior install on failure,
+      and ignores malformed/stale metadata with a warning. `build.bat` also
+      verifies a content-derived pack revision so resource changes cannot be
+      shipped with a stale revision.
+- [x] The low-level split-wrapper helper rejects children from a different
+      parent without mutating the tree; the live nested-move caller performs
+      the explicit state-aware reparenting first.
+- [x] Provider event handlers guard the second IPC read after the first async
+      read, preventing stale reconnect generations from publishing mixed
+      state; regression coverage exercises that race.
 - [x] Added explicit provider-state coverage proving legacy
       `tilingDirection` remains local while `globalTilingDirection` remains
       WM-wide, with fallback behavior for older WM responses.
@@ -318,20 +359,206 @@ Verification run 2026-09-26:
 - [x] Vendored `spotco.tokyo-silence` bar launched from the deployed Zebar
       build; its cached bundle matches the fork and WM reports the ignored
       `Zebar - spotco.tokyo-silence / bar` window.
+- [x] Rebuilt and deployed both release binaries after finding the stale
+      marketplace startup command. The running Zebar command line now uses
+      `spotco.tokyo-silence`, and the live/sample startup configs agree.
+- [x] Subscribed to `global_tiling_direction_changed`; a live CLI toggle
+      delivered the expected `newTilingDirection` payload and the global query
+      round-tripped vertical then horizontal without changing the tree.
 - [x] Zebar runtime diagnostics now go to bounded `%USERPROFILE%\\.glzr\\zebar\\zebar.log`
       and `errors.log` files (2 MiB each, with one `.1` rotation) instead of
       stdout; the rotation unit test passed and the deployed bar wrote its
       startup/provider setup diagnostics to `zebar.log`.
 - [x] `scripts\\deploy\\deploy_build.cmd --start` was exercised for Zebar;
       it stopped the prior process, swapped the release binary/resources,
-      and restarted the vendored spotco bar. The GlazeWM deploy script has
-      the matching `--start` path for the next WM swap.
+      copied the embedded pack into the Tauri resource root, and restarted the
+      vendored spotco bar. The GlazeWM deploy script has the matching `--start`
+      path for the next WM swap.
 - [x] CLI-equivalent Super+J / Super+Shift+Ctrl+Arrow checks passed, including
       horizontal and vertical normal moves, opposite-axis moves, structural
       H→V→H preservation, spotco bar detection, and soft-exit Zebar shutdown
       and restart. See `GLOBAL_TILING_DIRECTION_SMOKE.log`.
+- [x] Runtime compatibility review completed: `tilingDirection` remains the
+      focused-container legacy field, `globalTilingDirection` is independent,
+      and the WM no longer synthesizes a legacy local-direction event for a
+      global toggle.
+- [x] Zebar runtime diagnostics remain file-backed and bounded; the deploy
+      README documents that only interactive CLI query results use stdout.
 - [ ] Physical key injection and visual tray-hover appearance remain desktop-only
-      observations; the CLI harness verifies the tray bar process/window identity.
+  observations; the CLI harness verifies the tray bar process/window identity.
+
+## Step 10 - Reversible layout-move history, undo/redo, and debug surface
+
+### Implemented design direction
+
+The eight user movement cases remain the expected layout semantics. They are
+not changed to force opposite-arrow movement to be a stateless inverse. Exact
+reversal is provided by a bounded, in-memory history of successful layout
+transactions.
+
+The invariant for every recorded transaction is:
+
+1. Apply a successful layout move.
+2. `undo` restores the exact prior tree, including split directions, child
+   order, tiling sizes, workspace, and focused window.
+3. `redo` restores the exact post-move state.
+4. A new successful move after `undo` clears the redo stack.
+5. Failed, rejected, and no-op moves do not create history entries.
+
+Opposite-arrow movement remains an ordinary new movement operation. It is not
+implicitly converted to undo, because the same final tree can be reached by
+different reparenting paths and the final tree alone does not retain the
+original source slot. The explicit history bindings are the unambiguous undo
+mechanism.
+
+### User regression matrix
+
+The following eight cases are permanent expected-tree cases and must each have
+move, undo, and redo coverage. Grid labels represent spans; the canonical
+starting trees are `H[1 V[2 3] 4]` for the workspace-2 cases and
+`H[1 V[2 3 4]]` for the `12 / 13 / 14` cases.
+
+| Starting layout / focus | Effective move | Expected result | Undo result |
+| --- | --- | --- | --- |
+| `124 / 134`, focus `1` | normal Right, global H | `214 / 314` | `124 / 134` |
+| `124 / 134`, focus `1` | opposite Right, effective V | `24 / 34 / 14` | `124 / 134` |
+| `12 / 13 / 14`, focus `4` | normal Up, effective H | `122 / 134` | `12 / 13 / 14` |
+| `12 / 13 / 14`, focus `4` | opposite Up, effective V | `12 / 14 / 13` | `12 / 13 / 14` |
+| `12 / 13 / 14`, focus `4` | normal Right, effective H | `124 / 134` | `12 / 13 / 14` |
+| `12 / 13 / 14`, focus `4` | normal Left, effective H | `142 / 143` | `12 / 13 / 14` |
+| `12 / 13 / 14`, focus `4` | opposite Right, effective V | `124 / 134` | `12 / 13 / 14` |
+| `12 / 13 / 14`, focus `4` | opposite Left, effective V | `12 / 43` | `12 / 13 / 14` |
+
+The earlier `12 / 13 / 14`, focus `3`, opposite-Left → `12 / 34`
+case remains an additional regression fixture and receives the same
+move/undo/redo coverage.
+
+Additional repeated-stack regression:
+
+| Starting layout / focus | Effective move | Expected result |
+| --- | --- | --- |
+| `123`, focus `1` | opposite Right, effective V | `23 / 13` (`H[V[2 1] 3]`) |
+| `23 / 13`, focus `1` | opposite Right, effective V | `23 / 21` (`H[2 V[3 1]]`) |
+
+This is consistent with the existing `H[V[2 3] 4]` →
+`H[V[2 3 1] 4]` case: a Ctrl+Right move appends the moved window to the
+bottom of an existing or newly-created vertical stack.
+
+The movement assertions must verify both the compact tree and the semantic
+rule behind it:
+
+- parallel movement reorders on the effective stack axis;
+- orthogonal movement joins the nearest directional neighbor on the effective
+  stack axis;
+- orthogonal stacking always appends the moved window to the target stack,
+  whether the target was already a split or was a single window wrapped into
+  a new split; repeated opposite-axis moves therefore remain bottom/end
+  stable;
+- edge extraction preserves the surrounding workspace axis;
+- source splits collapse when they become redundant;
+- normal and opposite moves never mutate the stored global direction.
+
+### Commands and bindings
+
+- Add `undo` and `redo` WM commands with the same CLI/IPC command path used by
+  keybindings.
+- Add to both live Asus config and `resources/assets/sample-config.yaml`:
+
+  ```yaml
+  - commands: ['undo']
+    bindings: ['lwin+shift+z']
+  - commands: ['redo']
+    bindings: ['lwin+shift+y']
+  ```
+
+- Current live and sample configurations have no `lwin+shift+z` or
+  `lwin+shift+y` binding, so these chords are presently collision-free.
+- The bindings must be parser-validated and included in CLI smoke coverage.
+- Undo/redo are layout-history operations, not focus-history operations.
+  Plain Super+Arrow focus movement remains outside this history unless a
+  separate focus-history feature is later approved.
+
+### History scope and safety
+
+- First implementation records successful structural tiling moves from
+  `move --direction`, including opposite-stack moves. Floating movement,
+  resize, focus-only commands, and workspace/monitor moves remain separate
+  future history scopes.
+- The history entry must preserve the affected workspace tree, split
+  directions, child order, tiling sizes, focused window, and workspace
+  identity. It must not silently change the global tiling-direction flag.
+- Use one WM-wide bounded in-memory history with a maximum depth of 128
+  entries. Each entry carries workspace identity and exact before/after
+  state, so undo restores the recorded workspace and focus.
+- Clear both
+  stacks, and log the invalidation reason, when the WM topology changes
+  outside the recorded operation (for example, window close, window
+  creation, or an unsupported external tree mutation); never apply a stale
+  entry to a changed tree.
+- Do not persist undo/redo history in `layout.json`.
+- `toggle-tiling-direction` changes the global flag but does not enter or
+  clear move history. Undo/redo restores layout state without changing the
+  current global direction.
+- Cross-monitor/workspace moves, floating pixel nudges, focus-only commands,
+  and manual resize operations remain outside the first history scope unless
+  dedicated snapshot/round-trip tests are added at the same time. The history
+  API should not prevent expanding the scope later.
+- Record only after the live mutation and redraw bookkeeping succeed. A
+  failed mutation must leave both stacks unchanged.
+
+### Debugging and observability
+
+Every layout transaction should write a bounded `layout.log` entry containing:
+
+- transaction ID and operation (`move`, `undo`, or `redo`);
+- workspace and focused-window identity;
+- requested arrow direction and effective global/opposite stack direction;
+- source path and target path in the tree;
+- compact tree before and after;
+- a structural layout hash before and after;
+- undo/redo stack depths;
+- a reason for rejected, no-op, invalidated, or skipped history entries.
+
+Useful diagnostics should include a CLI/IPC query for current undo/redo depth
+and recent transaction summaries. Logs must remain file-backed and bounded;
+normal provider/runtime diagnostics must not return to stdout.
+
+### Step 10 verification matrix
+
+- [x] Pure planner tests for all eight cases plus the earlier focus-3 fixture.
+- [x] Live-tree tests matching every pure planner result.
+- [x] For every case: move → expected tree → undo → exact original → redo →
+  expected tree.
+- [x] History branch test: move → undo → different move; redo must be rejected or
+  empty.
+- [x] No-op and failed-move tests prove history depth does not change.
+- [x] Tests cover preserved focus, split directions, tiling sizes, workspace
+  identity, global-direction state, and tree integrity.
+- [x] CLI smoke records move/undo/redo results and layout-log tails without
+  requiring physical key injection.
+- [x] Pure planner tests cover all eight cases plus the earlier focus-3
+  fixture; the eight-case test also verifies exact before/after history
+  round-trips and redo source preservation.
+- [x] Live-tree tests cover all eight expected layouts (the two workspace-2
+  cases plus six focus-4 cases) and assert tree integrity after each move.
+- [x] Live-tree regression covers the repeated flat-`123` opposite-Right
+  sequence and asserts tree integrity after both moves.
+- [x] WM history tests cover metadata-insensitive snapshot equality, the
+  bounded 128-entry limit, and redo clearing after a new move.
+- [x] CLI/runtime smoke completed on the running WM: real move → query
+  (`undoDepth=1`) → undo (`redoDepth=1`) → redo (`undoDepth=0`) → undo,
+  with the layout restored to its original state. `query layout-history`,
+  `query global-tiling-direction`, and an empty-redo no-op all succeeded.
+- [x] `layout.log` contains transaction IDs, operation/effective direction,
+  stable process/title tree labels, hashes, stack depths, and undo/redo
+  restore summaries; the log remains bounded and file-backed.
+- [x] `cargo fmt --all -- --check`, targeted clippy with `-D warnings`,
+  `cargo test -p wm-common --lib` (80 passed), and
+  `cargo test -p wm --bin glazewm --no-fail-fast` (57 passed).
+- [x] `build.bat` release build completed and
+  `scripts\deploy\deploy_build.cmd --start` stopped, replaced, and
+  restarted GlazeWM and its watcher; the configured Zebar process also
+  restarted with GlazeWM and is healthy.
 
 ## Decisions (Step 0)
 
@@ -341,6 +568,11 @@ Verification run 2026-09-26:
 4. **Size on restructure:** LOCKED — equalize tiling shares (same spirit as today's invert 0.5 path).
 5. **Zebar pack:** LOCKED — vendor tokyo-silence into the Zebar fork as the spotcobuild default; pack id **`spotco.tokyo-silence`**; keep MIT license/attribution to y4m3; chip + future bar tweaks live in that tree.
 6. **Default config:** LOCKED — replace `resources/assets/sample-config.yaml` only (first-run / fresh installs). Do **not** overwrite or auto-merge existing `%USERPROFILE%\.glzr\glazewm\config.yaml`.
+7. **Reversibility:** Exact layout reversal is history-backed. The eight expected move layouts remain unchanged; opposite arrows are not implicitly treated as undo. `Super+Shift+Z` and `Super+Shift+Y` are the explicit undo/redo bindings.
+8. **History scope:** The first pass covers structural tiling directional moves only. Floating, resize, focus-only, and workspace/monitor movement histories are future scopes.
+9. **History lifetime:** Use one WM-wide in-memory history, bounded to 128 entries, with no `layout.json` persistence. Clear undo and redo on external topology changes and never apply stale entries.
+10. **Global direction and history:** `Super+J` changes global direction without entering or clearing move history. Undo/redo restores layouts without changing the current global direction.
+11. **History logging:** Layout transactions use bounded file-backed `layout.log` diagnostics; ordinary useful runtime/provider logs remain file-backed and bounded rather than stdout.
 
 ## Open questions
 

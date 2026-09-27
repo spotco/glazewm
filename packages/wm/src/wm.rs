@@ -21,8 +21,11 @@ use crate::{
       toggle_tiling_direction,
     },
     general::{
-      cycle_focus, disable_binding_mode, enable_binding_mode,
-      platform_sync, reload_config, shell_exec, toggle_pause,
+      build_layout_snapshot, compact_workspace_trees, cycle_focus,
+      disable_binding_mode, enable_binding_mode, layout_debug_log,
+      layout_state_hash, platform_sync, reload_config,
+      restore_history_snapshot, same_layout_state, shell_exec,
+      toggle_pause,
     },
     monitor::focus_monitor,
     window::{
@@ -253,6 +256,7 @@ impl WindowManager {
       InvokeCommand::Close => {
         match subject_container.as_window_container() {
           Ok(window) => {
+            state.layout_history.clear("close command");
             // Window handle might no longer be valid here.
             if let Err(err) = window.native().close() {
               warn!("Failed to close window: {:?}", err);
@@ -337,9 +341,40 @@ impl WindowManager {
         }
       }
       InvokeCommand::Move(args) => {
+        if args.target.direction.is_none() {
+          state.layout_history.clear("workspace move command");
+        }
+        let history_context =
+          args.target.direction.as_ref().and_then(|_| {
+            subject_container
+              .as_window_container()
+              .ok()
+              .filter(|window| window.state() == WindowState::Tiling)
+              .and_then(|window| {
+                window
+                  .workspace()
+                  .map(|workspace| (window.id(), workspace.config().name))
+              })
+          });
+        let history_before = history_context
+          .as_ref()
+          .map(|_| build_layout_snapshot(state))
+          .transpose()?;
+        let history_operation =
+          args.target.direction.as_ref().map(|direction| {
+            let stack_direction = if args.opposite_tiling_direction {
+              state.global_tiling_direction.inverse()
+            } else {
+              state.global_tiling_direction.clone()
+            };
+            format!(
+              "move direction={direction:?} stack={stack_direction:?}"
+            )
+          });
+
         match subject_container.as_window_container() {
           Ok(window) => {
-            if let Some(direction) = &args.direction {
+            if let Some(direction) = &args.target.direction {
               let stack_direction = if args.opposite_tiling_direction {
                 state.global_tiling_direction.inverse()
               } else {
@@ -354,7 +389,7 @@ impl WindowManager {
               )?;
             }
 
-            if let Some(direction) = &args.workspace_in_direction {
+            if let Some(direction) = &args.target.workspace_in_direction {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Direction(direction.clone()),
@@ -363,7 +398,7 @@ impl WindowManager {
               )?;
             }
 
-            if let Some(name) = &args.workspace {
+            if let Some(name) = &args.target.workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Name(name.clone()),
@@ -372,7 +407,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.next_active_workspace {
+            if args.target.next_active_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::NextActive,
@@ -381,7 +416,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.prev_active_workspace {
+            if args.target.prev_active_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::PreviousActive,
@@ -390,7 +425,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.next_workspace {
+            if args.target.next_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Next,
@@ -399,7 +434,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.prev_workspace {
+            if args.target.prev_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Previous,
@@ -408,7 +443,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.recent_workspace {
+            if args.target.recent_workspace {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::Recent,
@@ -417,7 +452,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.next_active_workspace_on_monitor {
+            if args.target.next_active_workspace_on_monitor {
               move_window_to_workspace(
                 window.clone(),
                 WorkspaceTarget::NextActiveInMonitor,
@@ -426,7 +461,7 @@ impl WindowManager {
               )?;
             }
 
-            if args.prev_active_workspace_on_monitor {
+            if args.target.prev_active_workspace_on_monitor {
               move_window_to_workspace(
                 window,
                 WorkspaceTarget::PreviousActiveInMonitor,
@@ -434,13 +469,133 @@ impl WindowManager {
                 config,
               )?;
             }
+
+            if let (
+              Some((window_id, before_workspace)),
+              Some(before),
+              Some(operation),
+            ) = (history_context, history_before, history_operation)
+            {
+              let after = build_layout_snapshot(state)?;
+              let after_workspace = state
+                .container_by_id(window_id)
+                .and_then(|container| {
+                  container
+                    .as_window_container()
+                    .ok()
+                    .and_then(|window| window.workspace())
+                })
+                .map(|workspace| workspace.config().name);
+
+              if after_workspace.as_deref()
+                != Some(before_workspace.as_str())
+              {
+                state
+                  .layout_history
+                  .clear("directional move changed workspace");
+              } else if !same_layout_state(&before, &after) {
+                let entry = state.layout_history.record(
+                  operation,
+                  before_workspace.clone(),
+                  window_id.to_string(),
+                  before.clone(),
+                  after.clone(),
+                );
+                layout_debug_log(format!(
+                  "layout history commit id={} op={:?} workspace={:?} focus={} before_hash={} after_hash={} undo_depth={} redo_depth=0 before_tree={:?} after_tree={:?}",
+                  entry.transaction_id,
+                  entry.operation,
+                  entry.workspace_name,
+                  entry.focused_window_id,
+                  layout_state_hash(&before),
+                  layout_state_hash(&after),
+                  state.layout_history.undo_depth(),
+                  compact_workspace_trees(&before),
+                  compact_workspace_trees(&after),
+                ));
+              } else {
+                layout_debug_log(format!(
+                  "layout history skip op={:?} workspace={:?} focus={} reason=no-op state_hash={} undo_depth={} redo_depth={}",
+                  operation,
+                  before_workspace,
+                  window_id,
+                  layout_state_hash(&before),
+                  state.layout_history.undo_depth(),
+                  state.layout_history.redo_depth(),
+                ));
+              }
+            }
             Ok(())
           }
 
           _ => Ok(()),
         }
       }
+      InvokeCommand::Undo => {
+        let Some(entry) = state.layout_history.pop_undo() else {
+          layout_debug_log("layout history undo no-op: undo stack empty");
+          return Ok(());
+        };
+        let transaction_id = entry.transaction_id;
+        let result =
+          restore_history_snapshot(&entry.before, state, config);
+        match result {
+          Ok(_) => {
+            state.layout_history.push_redo(entry.clone());
+            layout_debug_log(format!(
+              "layout history undo id={} op={:?} workspace={:?} focus={} before_hash={} after_hash={} undo_depth={} redo_depth={} before_tree={:?} after_tree={:?}",
+              transaction_id,
+              entry.operation,
+              entry.workspace_name,
+              entry.focused_window_id,
+              layout_state_hash(&entry.after),
+              layout_state_hash(&entry.before),
+              state.layout_history.undo_depth(),
+              state.layout_history.redo_depth(),
+              compact_workspace_trees(&entry.after),
+              compact_workspace_trees(&entry.before),
+            ));
+            Ok(())
+          }
+          Err(err) => {
+            state.layout_history.push_undo(entry);
+            Err(err)
+          }
+        }
+      }
+      InvokeCommand::Redo => {
+        let Some(entry) = state.layout_history.pop_redo() else {
+          layout_debug_log("layout history redo no-op: redo stack empty");
+          return Ok(());
+        };
+        let transaction_id = entry.transaction_id;
+        let result = restore_history_snapshot(&entry.after, state, config);
+        match result {
+          Ok(_) => {
+            state.layout_history.push_undo(entry.clone());
+            layout_debug_log(format!(
+              "layout history redo id={} op={:?} workspace={:?} focus={} before_hash={} after_hash={} undo_depth={} redo_depth={} before_tree={:?} after_tree={:?}",
+              transaction_id,
+              entry.operation,
+              entry.workspace_name,
+              entry.focused_window_id,
+              layout_state_hash(&entry.before),
+              layout_state_hash(&entry.after),
+              state.layout_history.undo_depth(),
+              state.layout_history.redo_depth(),
+              compact_workspace_trees(&entry.before),
+              compact_workspace_trees(&entry.after),
+            ));
+            Ok(())
+          }
+          Err(err) => {
+            state.layout_history.push_redo(entry);
+            Err(err)
+          }
+        }
+      }
       InvokeCommand::MoveWorkspace { direction } => {
+        state.layout_history.clear("workspace move command");
         let workspace =
           subject_container.workspace().context("No workspace.")?;
 
@@ -480,6 +635,7 @@ impl WindowManager {
         update_workspace_config(&workspace, state, config, new_config)
       }
       InvokeCommand::Resize(args) => {
+        state.layout_history.clear("resize command");
         match subject_container.as_window_container() {
           Ok(window) => resize_window(
             &window,
@@ -499,6 +655,7 @@ impl WindowManager {
         height,
       } => match subject_container.as_window_container() {
         Ok(window) => {
+          state.layout_history.clear("set floating command");
           let floating_defaults =
             &config.value.window_behavior.state_defaults.floating;
           let centered = centered.unwrap_or(floating_defaults.centered);
@@ -550,6 +707,7 @@ impl WindowManager {
         shown_on_top,
       } => match subject_container.as_window_container() {
         Ok(window) => {
+          state.layout_history.clear("set fullscreen command");
           let fullscreen_defaults =
             &config.value.window_behavior.state_defaults.fullscreen;
 
@@ -572,6 +730,7 @@ impl WindowManager {
       InvokeCommand::SetMinimized => {
         match subject_container.as_window_container() {
           Ok(window) => {
+            state.layout_history.clear("set minimized command");
             update_window_state(
               window.clone(),
               WindowState::Minimized,
@@ -587,6 +746,7 @@ impl WindowManager {
       InvokeCommand::SetTiling => {
         match subject_container.as_window_container() {
           Ok(window) => {
+            state.layout_history.clear("set tiling command");
             update_window_state(
               window,
               WindowState::Tiling,
@@ -657,6 +817,7 @@ impl WindowManager {
         shown_on_top,
       } => match subject_container.as_window_container() {
         Ok(window) => {
+          state.layout_history.clear("toggle floating command");
           let floating_defaults =
             &config.value.window_behavior.state_defaults.floating;
 
@@ -691,6 +852,7 @@ impl WindowManager {
         shown_on_top,
       } => match subject_container.as_window_container() {
         Ok(window) => {
+          state.layout_history.clear("toggle fullscreen command");
           let fullscreen_defaults =
             &config.value.window_behavior.state_defaults.fullscreen;
 
@@ -716,6 +878,7 @@ impl WindowManager {
       InvokeCommand::ToggleMinimized => {
         match subject_container.as_window_container() {
           Ok(window) => {
+            state.layout_history.clear("toggle minimized command");
             update_window_state(
               window.clone(),
               window.toggled_state(WindowState::Minimized, config),
@@ -731,6 +894,7 @@ impl WindowManager {
       InvokeCommand::ToggleTiling => {
         match subject_container.as_window_container() {
           Ok(window) => {
+            state.layout_history.clear("toggle tiling command");
             update_window_state(
               window.clone(),
               window.toggled_state(WindowState::Tiling, config),
@@ -821,6 +985,7 @@ impl WindowManager {
         let _summary = crate::commands::general::load_layout_snapshot(
           &snapshot, state, config,
         )?;
+        state.layout_history.clear("load layout command");
         Ok(())
       }
     }

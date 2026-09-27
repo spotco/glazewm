@@ -52,6 +52,7 @@ pub fn manage_window(
   )?;
 
   if let Some(window) = updated_window {
+    state.layout_history.clear("window managed");
     info!("New window managed: {window}");
 
     state.emit_event(WmEvent::WindowManaged {

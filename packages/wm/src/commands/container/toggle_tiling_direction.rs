@@ -1,14 +1,14 @@
 use wm_common::{TilingDirection, WmEvent};
 
 use crate::{
-  models::Container, traits::CommonGetters, user_config::UserConfig,
-  wm_state::WmState,
+  models::Container, user_config::UserConfig, wm_state::WmState,
 };
 
 /// Spotcobuild: flip the WM-wide `global_tiling_direction` only.
 ///
 /// Does not wrap/flatten the focused window or mutate per-split
 /// directions.
+#[allow(clippy::unnecessary_wraps)]
 pub fn toggle_tiling_direction(
   _container: Container,
   state: &mut WmState,
@@ -16,10 +16,12 @@ pub fn toggle_tiling_direction(
 ) -> anyhow::Result<()> {
   let new_dir =
     toggle_global_tiling_direction(&state.global_tiling_direction);
-  set_global_tiling_direction(state, new_dir)
+  set_global_tiling_direction(state, &new_dir);
+  Ok(())
 }
 
 /// Spotcobuild: set the WM-wide `global_tiling_direction` only.
+#[allow(clippy::unnecessary_wraps)]
 pub fn set_tiling_direction(
   _container: Container,
   state: &mut WmState,
@@ -27,41 +29,25 @@ pub fn set_tiling_direction(
   tiling_direction: &TilingDirection,
 ) -> anyhow::Result<()> {
   if state.global_tiling_direction != *tiling_direction {
-    set_global_tiling_direction(state, tiling_direction.clone())?;
+    set_global_tiling_direction(state, tiling_direction);
   }
   Ok(())
 }
 
 fn set_global_tiling_direction(
   state: &mut WmState,
-  new_tiling_direction: TilingDirection,
-) -> anyhow::Result<()> {
+  new_tiling_direction: &TilingDirection,
+) {
   if !apply_global_tiling_direction(
     &mut state.global_tiling_direction,
-    new_tiling_direction.clone(),
+    new_tiling_direction,
   ) {
-    return Ok(());
+    return;
   }
 
   state.emit_event(global_tiling_direction_changed_event(
     new_tiling_direction.clone(),
   ));
-
-  // Compatibility: keep the legacy focused-container event for existing
-  // clients during the migration window. New clients must use
-  // GlobalTilingDirectionChanged for the WM-wide insertion axis; emitting
-  // both must not make the legacy field authoritative for global state.
-  if let Some(direction_container) = state
-    .focused_container()
-    .and_then(|focused| focused.direction_container())
-  {
-    state.emit_event(WmEvent::TilingDirectionChanged {
-      direction_container: direction_container.to_dto()?,
-      new_tiling_direction,
-    });
-  }
-
-  Ok(())
 }
 
 fn toggle_global_tiling_direction(
@@ -72,12 +58,12 @@ fn toggle_global_tiling_direction(
 
 fn apply_global_tiling_direction(
   current: &mut TilingDirection,
-  requested: TilingDirection,
+  requested: &TilingDirection,
 ) -> bool {
-  if *current == requested {
+  if *current == *requested {
     return false;
   }
-  *current = requested;
+  *current = requested.clone();
   true
 }
 
@@ -119,12 +105,12 @@ mod tests {
     let mut current = TilingDirection::Horizontal;
     assert!(apply_global_tiling_direction(
       &mut current,
-      TilingDirection::Vertical,
+      &TilingDirection::Vertical,
     ));
     assert_eq!(current, TilingDirection::Vertical);
     assert!(!apply_global_tiling_direction(
       &mut current,
-      TilingDirection::Vertical,
+      &TilingDirection::Vertical,
     ));
   }
 

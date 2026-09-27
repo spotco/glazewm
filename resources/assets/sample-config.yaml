@@ -2,9 +2,9 @@ general:
   # Commands to run when the WM has started. This is useful for running a
   # script or launching another application.
   # Example: The below command launches Zebar.
-  # Launch default Zebar starter bar
+  # Launch the spotcobuild bar with the global tiling-direction chip
   startup_commands:
-    - 'shell-exec zebar start-widget-preset --pack y4m3.tokyo-silence --widget-name bar --preset default'
+    - 'shell-exec zebar start-widget-preset --pack spotco.tokyo-silence --widget-name bar --preset default'
 
 
   # Kill Zebar on WM exit so restart leaves a clean bar process.
@@ -218,6 +218,12 @@ keybindings:
     bindings: ['lwin+shift+control+k', 'lwin+shift+control+up']
   - commands: ['move --direction right --opposite-tiling-direction']
     bindings: ['lwin+shift+control+l', 'lwin+shift+control+right']
+
+  # Mod + Shift + Z/Y - undo/redo the last structural tiling move
+  - commands: ['undo']
+    bindings: ['lwin+shift+z']
+  - commands: ['redo']
+    bindings: ['lwin+shift+y']
 
   # Mod + F — fullscreen (true fullscreen)
   - commands: ['toggle-fullscreen']

@@ -16,7 +16,7 @@ use wm_platform::{NativeWindowWindowsExt, OpacityValue};
 use crate::{
   commands::{
     container::set_focused_descendant,
-    general::platform_sync,
+    general::{platform_sync, LayoutHistory},
     monitor::{add_monitor, move_bounded_workspaces_to_new_monitor},
     window::{manage_window, unmanage_window},
   },
@@ -69,6 +69,9 @@ pub struct WmState {
   /// WM-wide insertion / stack axis for directional moves (spotcobuild).
   pub global_tiling_direction: TilingDirection,
 
+  /// Exact, bounded undo/redo history for structural tiling moves.
+  pub layout_history: LayoutHistory,
+
   /// Whether the WM is paused.
   pub is_paused: bool,
 
@@ -101,6 +104,7 @@ impl WmState {
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
+      layout_history: LayoutHistory::default(),
       is_paused: false,
       is_focus_synced: false,
       has_initialized: false,
