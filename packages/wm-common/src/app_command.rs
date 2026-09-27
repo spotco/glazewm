@@ -171,6 +171,8 @@ pub enum QueryCommand {
   TilingDirection,
   /// Outputs the WM-wide global tiling / stack direction (spotcobuild).
   GlobalTilingDirection,
+  /// Outputs the current layout undo/redo history depths.
+  LayoutHistory,
   /// Outputs all monitors.
   Monitors,
   /// Outputs all windows.
@@ -307,6 +309,10 @@ pub enum InvokeCommand {
     #[clap(required = true)]
     tiling_direction: TilingDirection,
   },
+  /// Undo the most recent structural tiling move.
+  Undo,
+  /// Redo the most recently undone structural tiling move.
+  Redo,
   WmCycleFocus {
     #[clap(long, default_value_t = false)]
     omit_floating: bool,
@@ -568,6 +574,24 @@ mod shell_exec_ipc_tests {
   #[test]
   fn bare_move_is_rejected() {
     assert!(InvokeCommand::try_parse_from(["glazewm", "move"]).is_err());
+  }
+
+  #[test]
+  fn undo_and_redo_commands_parse() {
+    assert_eq!(
+      InvokeCommand::try_parse_from(["glazewm", "undo"])
+        .expect("undo should parse"),
+      InvokeCommand::Undo,
+    );
+    assert_eq!(
+      InvokeCommand::try_parse_from(["glazewm", "redo"])
+        .expect("redo should parse"),
+      InvokeCommand::Redo,
+    );
+    assert!(matches!(
+      QueryCommand::try_parse_from(["glazewm", "layout-history"]),
+      Ok(QueryCommand::LayoutHistory)
+    ));
   }
 
   #[test]

@@ -127,6 +127,7 @@ pub enum ClientResponseData {
   Monitors(MonitorsData),
   TilingDirection(TilingDirectionData),
   GlobalTilingDirection(GlobalTilingDirectionData),
+  LayoutHistory(LayoutHistoryData),
   Windows(WindowsData),
   Workspaces(WorkspacesData),
   Paused(bool),
@@ -184,6 +185,14 @@ pub struct TilingDirectionData {
 #[serde(rename_all = "camelCase")]
 pub struct GlobalTilingDirectionData {
   pub global_tiling_direction: TilingDirection,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutHistoryData {
+  pub undo_depth: usize,
+  pub redo_depth: usize,
+  pub last_transaction_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
