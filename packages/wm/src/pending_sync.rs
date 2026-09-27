@@ -17,6 +17,14 @@ pub struct PendingSync {
   /// focused window's state should be brought to the front.
   workspaces_to_reorder: Vec<Workspace>,
 
+  /// Windows that received native focus and should be promoted
+  /// individually instead of applying the workspace-wide state z-order
+  /// policy.
+  ///
+  /// The key is the workspace ID so that a burst of native focus events
+  /// can retain only the latest focused window for each workspace.
+  focused_windows_to_bring_to_front: HashMap<Uuid, Uuid>,
+
   /// Whether native focus should be reassigned to the WM's focused
   /// container.
   needs_focus_update: bool,
@@ -36,6 +44,7 @@ impl PendingSync {
   pub fn has_changes(&self) -> bool {
     !self.containers_to_redraw.is_empty()
       || !self.workspaces_to_reorder.is_empty()
+      || !self.focused_windows_to_bring_to_front.is_empty()
       || self.needs_focus_update
       || self.needs_focused_effect_update
       || self.needs_all_effects_update
@@ -45,6 +54,7 @@ impl PendingSync {
   pub fn clear(&mut self) -> &mut Self {
     self.containers_to_redraw.clear();
     self.workspaces_to_reorder.clear();
+    self.focused_windows_to_bring_to_front.clear();
     self.needs_focus_update = false;
     self.needs_focused_effect_update = false;
     self.needs_all_effects_update = false;
@@ -96,6 +106,18 @@ impl PendingSync {
     self
   }
 
+  /// Queues a native-focused window for an individual z-order promotion.
+  pub fn queue_focused_window_to_bring_to_front(
+    &mut self,
+    workspace: &Workspace,
+    window_id: Uuid,
+  ) -> &mut Self {
+    self
+      .focused_windows_to_bring_to_front
+      .insert(workspace.id(), window_id);
+    self
+  }
+
   pub fn queue_focus_change(&mut self) -> &mut Self {
     self.needs_focus_update = true;
     self
@@ -138,5 +160,19 @@ impl PendingSync {
 
   pub fn workspaces_to_reorder(&self) -> &Vec<Workspace> {
     &self.workspaces_to_reorder
+  }
+
+  pub fn focused_window_to_bring_to_front(
+    &self,
+    workspace: &Workspace,
+  ) -> Option<Uuid> {
+    self
+      .focused_windows_to_bring_to_front
+      .get(&workspace.id())
+      .copied()
+  }
+
+  pub fn focused_windows_to_bring_to_front(&self) -> &HashMap<Uuid, Uuid> {
+    &self.focused_windows_to_bring_to_front
   }
 }

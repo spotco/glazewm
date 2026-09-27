@@ -1,10 +1,14 @@
 use anyhow::Context;
 #[cfg(target_os = "windows")]
+use uuid::Uuid;
+#[cfg(target_os = "windows")]
 use wm_common::WindowEffectConfig;
 use wm_common::{
   CursorJumpTrigger, DisplayState, HideCorner, HideMethod, UniqueExt,
   WindowState, WmEvent,
 };
+#[cfg(target_os = "windows")]
+use wm_platform::reorder_z_order;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
 #[cfg(target_os = "windows")]
@@ -12,7 +16,7 @@ use wm_platform::{CornerStyle, OpacityValue};
 use wm_platform::{Rect, WindowZOrder};
 
 use crate::{
-  models::{Container, WindowContainer},
+  models::{Container, WindowContainer, Workspace},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
@@ -148,6 +152,27 @@ fn windows_to_bring_to_front(
         .and_then(|container| container.as_window_container().ok());
 
       match focused_descendant {
+        Some(focused_descendant)
+          if state
+            .pending_sync
+            .focused_window_to_bring_to_front(workspace)
+            .is_some_and(|window_id| {
+              window_id == focused_descendant.id()
+                && matches!(
+                  focused_descendant.state(),
+                  WindowState::Floating(config) if !config.shown_on_top
+                )
+            }) =>
+        {
+          // A native focus event for a normal floating window should only
+          // promote the selected window. The workspace-wide state policy
+          // is intentionally bypassed for this case.
+          workspace
+            .descendants()
+            .filter_map(|descendant| descendant.as_window_container().ok())
+            .filter(|window| window.id() == focused_descendant.id())
+            .collect()
+        }
         Some(focused_descendant) => workspace
           .descendants()
           .filter_map(|descendant| descendant.as_window_container().ok())
@@ -253,10 +278,17 @@ fn redraw_containers(
     // of a window. See `NativeWindow::raise` for more details.
     #[cfg(target_os = "windows")]
     if should_bring_to_front && !windows_to_redraw.contains(window) {
-      tracing::info!("Updating window z-order: {window}");
+      let has_targeted_floating_focus = state
+        .pending_sync
+        .focused_window_to_bring_to_front(&workspace)
+        .is_some_and(|window_id| window_id == window.id());
 
-      if let Err(err) = window.native().set_z_order(&z_order) {
-        tracing::warn!("Failed to set window z-order: {}", err);
+      if !has_targeted_floating_focus {
+        tracing::info!("Updating window z-order: {window}");
+
+        if let Err(err) = window.native().set_z_order(&z_order) {
+          tracing::warn!("Failed to set window z-order: {}", err);
+        }
       }
     }
 
@@ -332,7 +364,108 @@ fn redraw_containers(
     }
   }
 
+  #[cfg(target_os = "windows")]
+  reorder_targeted_floating_focus(state);
+
   Ok(())
+}
+
+/// Restores the normal floating/tiling layers after a native focus event.
+///
+/// Windows activation raises the selected floating window, but it does not
+/// lower floating peers that GlazeWM may have previously grouped above the
+/// tiling layer. Rebuild the relevant order as:
+///
+///   selected floating > tiling windows > other normal floating windows
+///
+/// Explicitly always-on-top windows are left untouched.
+#[cfg(target_os = "windows")]
+fn reorder_targeted_floating_focus(state: &WmState) {
+  for (workspace_id, focused_window_id) in
+    state.pending_sync.focused_windows_to_bring_to_front()
+  {
+    let Some(workspace) = state
+      .workspaces()
+      .into_iter()
+      .find(|workspace| workspace.id() == *workspace_id)
+    else {
+      continue;
+    };
+
+    reorder_targeted_floating_focus_in_workspace(
+      &workspace,
+      *focused_window_id,
+    );
+  }
+}
+
+#[cfg(target_os = "windows")]
+fn reorder_targeted_floating_focus_in_workspace(
+  workspace: &Workspace,
+  focused_window_id: Uuid,
+) {
+  let windows = workspace
+    .descendants()
+    .filter_map(|container| container.as_window_container().ok())
+    .filter(|window| {
+      matches!(
+        window.display_state(),
+        DisplayState::Showing | DisplayState::Shown
+      )
+    })
+    .collect::<Vec<_>>();
+
+  if !workspace.is_displayed() {
+    return;
+  }
+
+  let Some(focused_window) = windows
+    .iter()
+    .find(|window| window.id() == focused_window_id)
+  else {
+    return;
+  };
+
+  let WindowState::Floating(focused_config) = focused_window.state()
+  else {
+    return;
+  };
+
+  if focused_config.shown_on_top {
+    return;
+  }
+
+  let tiling_windows = windows
+    .iter()
+    .filter(|window| matches!(window.state(), WindowState::Tiling))
+    .collect::<Vec<_>>();
+
+  let other_floating_windows = windows
+    .iter()
+    .filter(|window| {
+      window.id() != focused_window_id
+        && matches!(
+          window.state(),
+          WindowState::Floating(config) if !config.shown_on_top
+        )
+    })
+    .collect::<Vec<_>>();
+
+  let mut window_ids = vec![focused_window.native().id()];
+  window_ids
+    .extend(tiling_windows.iter().map(|window| window.native().id()));
+  window_ids.extend(
+    other_floating_windows
+      .iter()
+      .map(|window| window.native().id()),
+  );
+
+  if let Err(err) = reorder_z_order(&window_ids) {
+    tracing::warn!(
+      "Failed to reorder natively focused floating window chain: {}",
+      err
+    );
+  }
 }
 
 fn reposition_window(

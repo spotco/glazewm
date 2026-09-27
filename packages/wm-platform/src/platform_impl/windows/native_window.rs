@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+  sync::atomic::{AtomicU64, Ordering},
+  time::Duration,
+};
 
 use tokio::task;
 use tracing::warn;
@@ -51,6 +54,8 @@ use crate::{
 /// Magic number used to identify programmatic mouse inputs from our own
 /// process.
 pub(crate) const FOREGROUND_INPUT_IDENTIFIER: u32 = 6379;
+
+static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Platform-specific implementation of [`NativeWindow`].
 #[derive(Clone, Debug)]
@@ -739,6 +744,60 @@ impl NativeWindow {
 
     Ok(cloaked != 0)
   }
+}
+
+/// Reorders a normal-window chain without changing focus or visibility.
+///
+/// The first window is placed at the top of the normal z-order. Each
+/// subsequent window is placed immediately after the previous one. The
+/// delayed retry is generation-aware so a fast native-focus transition
+/// cannot replay an obsolete chain after a newer one has been requested.
+pub(crate) fn reorder_z_order(
+  window_ids: &[WindowId],
+) -> crate::Result<()> {
+  if window_ids.is_empty() {
+    return Ok(());
+  }
+
+  let generation = Z_ORDER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+  apply_z_order_chain(window_ids)?;
+
+  let window_ids = window_ids.to_vec();
+  let focused_window = window_ids[0];
+  task::spawn(async move {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+      || unsafe { GetForegroundWindow() } != HWND(focused_window.0)
+    {
+      return;
+    }
+
+    let _ = apply_z_order_chain(&window_ids);
+  });
+
+  Ok(())
+}
+
+fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
+  let flags = SWP_NOACTIVATE
+    | SWP_NOCOPYBITS
+    | SWP_NOMOVE
+    | SWP_NOSIZE
+    | SWP_NOOWNERZORDER;
+
+  for (index, window_id) in window_ids.iter().enumerate() {
+    let insert_after = index
+      .checked_sub(1)
+      .and_then(|previous| window_ids.get(previous))
+      .map_or(HWND_TOP, |previous| HWND(previous.0));
+
+    unsafe {
+      SetWindowPos(HWND(window_id.0), insert_after, 0, 0, 0, 0, flags)
+    }?;
+  }
+
+  Ok(())
 }
 
 impl PartialEq for NativeWindow {

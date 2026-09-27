@@ -93,7 +93,17 @@ pub fn handle_window_focused(
     )?;
 
     state.is_focus_synced = true;
-    state.pending_sync.queue_workspace_to_reorder(workspace);
+    let pending_sync = state
+      .pending_sync
+      .queue_workspace_to_reorder(workspace.clone());
+
+    if matches!(
+      window.state(),
+      wm_common::WindowState::Floating(config) if !config.shown_on_top
+    ) {
+      pending_sync
+        .queue_focused_window_to_bring_to_front(&workspace, window.id());
+    }
 
     // Broadcast the focus change event.
     state.emit_event(WmEvent::FocusChanged {
