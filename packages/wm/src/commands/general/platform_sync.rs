@@ -8,6 +8,8 @@ use wm_common::{
   WindowState, WmEvent,
 };
 #[cfg(target_os = "windows")]
+use wm_platform::reorder_z_order;
+#[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
 #[cfg(target_os = "windows")]
 use wm_platform::{CornerStyle, OpacityValue};
@@ -405,7 +407,17 @@ fn reorder_targeted_floating_focus_in_workspace(
   let windows = workspace
     .descendants()
     .filter_map(|container| container.as_window_container().ok())
+    .filter(|window| {
+      matches!(
+        window.display_state(),
+        DisplayState::Showing | DisplayState::Shown
+      )
+    })
     .collect::<Vec<_>>();
+
+  if !workspace.is_displayed() {
+    return;
+  }
 
   let Some(focused_window) = windows
     .iter()
@@ -439,41 +451,20 @@ fn reorder_targeted_floating_focus_in_workspace(
     })
     .collect::<Vec<_>>();
 
-  if let Err(err) = focused_window.native().set_z_order(&WindowZOrder::Top)
-  {
+  let mut window_ids = vec![focused_window.native().id()];
+  window_ids
+    .extend(tiling_windows.iter().map(|window| window.native().id()));
+  window_ids.extend(
+    other_floating_windows
+      .iter()
+      .map(|window| window.native().id()),
+  );
+
+  if let Err(err) = reorder_z_order(&window_ids) {
     tracing::warn!(
-      "Failed to promote natively focused floating window: {}",
+      "Failed to reorder natively focused floating window chain: {}",
       err
     );
-    return;
-  }
-
-  let mut anchor = focused_window.native().id();
-
-  for window in tiling_windows {
-    if let Err(err) = window
-      .native()
-      .set_z_order(&WindowZOrder::AfterWindow(anchor))
-    {
-      tracing::warn!(
-        "Failed to order tiling window below focused float: {}",
-        err
-      );
-    }
-    anchor = window.native().id();
-  }
-
-  for window in other_floating_windows {
-    if let Err(err) = window
-      .native()
-      .set_z_order(&WindowZOrder::AfterWindow(anchor))
-    {
-      tracing::warn!(
-        "Failed to order floating peer below tiling windows: {}",
-        err
-      );
-    }
-    anchor = window.native().id();
   }
 }
 

@@ -54,6 +54,16 @@ pub enum WindowZOrder {
   TopMost,
 }
 
+/// Reorders a normal-window chain without changing focus or visibility.
+///
+/// # Platform-specific
+///
+/// This method is only available on Windows.
+#[cfg(target_os = "windows")]
+pub fn reorder_z_order(window_ids: &[WindowId]) -> crate::Result<()> {
+  platform_impl::reorder_z_order(window_ids)
+}
+
 /// macOS-specific extension trait for [`NativeWindow`].
 #[cfg(target_os = "macos")]
 pub trait NativeWindowExtMacOs {
