@@ -527,6 +527,11 @@ impl NativeWindow {
     &self,
     visible: bool,
   ) -> crate::Result<()> {
+    // Input-method helper HWNDs are not user windows. Never register them
+    // as explicit taskbar tabs, regardless of which cleanup/restore
+    // path calls this shared API.
+    let visible = visible && !is_taskbar_helper_window(self);
+
     COM_INIT.with(|com_init| -> crate::Result<()> {
       com_init.borrow_mut().with_retry(|com| {
         let taskbar_list = com.taskbar_list()?;
