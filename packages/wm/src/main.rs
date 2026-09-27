@@ -34,8 +34,8 @@ use crate::{
     layout_debug_log_path, layout_snapshot_path, load_layout_snapshot,
     pick_layout_snapshot_path, platform_sync, read_layout_snapshot_file,
     save_layout_snapshot_with_dialog, set_layout_debug_log_path,
-    try_load_persisted_layout_snapshot, wm_event_affects_layout_snapshot,
-    LayoutAutoSave,
+    show_desktop, try_load_persisted_layout_snapshot,
+    wm_event_affects_layout_snapshot, LayoutAutoSave,
   },
   ipc_server::IpcServer,
   sys_tray::SystemTray,
@@ -336,6 +336,9 @@ async fn start_wm(
           }
           Ok(())
         })()
+      },
+      Some(()) = tray.show_desktop_rx.recv() => {
+        show_desktop(&wm.state)
       },
       Some(event) = mouse_listener.next_event() => {
         tracing::debug!("Received mouse event: {:?}", event);

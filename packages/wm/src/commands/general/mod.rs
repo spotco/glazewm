@@ -9,6 +9,7 @@ mod platform_sync;
 mod reload_config;
 mod save_layout_snapshot;
 mod shell_exec;
+mod show_desktop;
 mod toggle_pause;
 
 pub use cycle_focus::*;
@@ -22,4 +23,5 @@ pub use platform_sync::*;
 pub use reload_config::*;
 pub use save_layout_snapshot::*;
 pub use shell_exec::*;
+pub use show_desktop::*;
 pub use toggle_pause::*;
