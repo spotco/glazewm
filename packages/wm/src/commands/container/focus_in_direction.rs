@@ -1,4 +1,5 @@
 use anyhow::Context;
+use uuid::Uuid;
 use wm_common::{geometric_focus_target_index, WindowState};
 use wm_platform::{Direction, Rect};
 
@@ -92,12 +93,24 @@ fn geometric_tiling_focus_target(
     .context("Geometric focus requires a tiling window.")?;
   let origin_rect = origin_window.to_rect()?;
   let workspace = origin_window.workspace().context("No workspace.")?;
+  geometric_tiling_focus_target_in_workspace(
+    origin_window.id(),
+    &origin_rect,
+    &workspace,
+    direction,
+  )
+}
+
+fn geometric_tiling_focus_target_in_workspace(
+  origin_id: Uuid,
+  origin_rect: &Rect,
+  workspace: &crate::models::Workspace,
+  direction: &Direction,
+) -> anyhow::Result<Option<Container>> {
   let candidates = workspace
     .descendants()
     .filter_map(|container| match container {
-      Container::TilingWindow(window)
-        if window.id() != origin_window.id() =>
-      {
+      Container::TilingWindow(window) if window.id() != origin_id => {
         Some(window)
       }
       _ => None,
@@ -121,7 +134,7 @@ fn geometric_tiling_focus_target(
     .join(", ");
   layout_debug_log(format!(
     "geometric focus: origin={} rect={origin_rect:?} dir={direction:?} candidates=[{candidate_summary}] target={}",
-    origin_window.id(),
+    origin_id,
     target_index
       .and_then(|index| candidates.get(index))
       .map_or_else(|| "none".into(), |window| window.id().to_string()),
@@ -321,7 +334,22 @@ fn workspace_focus_target(
       _ => false,
     });
 
+  let geometric_target = target_workspace
+    .as_ref()
+    .map(|workspace| {
+      let origin_rect = origin_container.to_rect()?;
+      geometric_tiling_focus_target_in_workspace(
+        origin_container.id(),
+        &origin_rect,
+        workspace,
+        direction,
+      )
+    })
+    .transpose()?
+    .flatten();
+
   let focus_target = focused_fullscreen
+    .or(geometric_target)
     .or_else(|| {
       target_workspace.as_ref().and_then(|workspace| {
         workspace
