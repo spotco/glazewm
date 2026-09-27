@@ -49,9 +49,15 @@ fn set_tiling(
   let workspace =
     window.workspace().context("Window has no workspace.")?;
 
-  // Check whether insertion target is still valid.
-  let insertion_target =
-    window.insertion_target().filter(|insertion_target| {
+  // Check whether the window has a valid insertion target from a previous
+  // tiled state. A non-tiling window can retain an old insertion target
+  // after moving through fullscreen, so do not use that stale layout
+  // unless the previous state is actually tiling.
+  let insertion_target = window
+    .prev_state()
+    .filter(|state| matches!(state, WindowState::Tiling))
+    .and_then(|_| window.insertion_target())
+    .filter(|insertion_target| {
       insertion_target
         .target_parent
         .workspace()

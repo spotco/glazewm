@@ -10,6 +10,23 @@ use crate::{
   user_config::UserConfig,
 };
 
+/// Returns the target state for the floating/tiling toggle.
+///
+/// Unlike the generic state toggle, this command only toggles between
+/// floating and tiling. In particular, a floating window whose previous
+/// state was fullscreen must reattach as tiling rather than returning to
+/// fullscreen.
+fn floating_toggle_target(
+  current_state: &WindowState,
+  floating_state: WindowState,
+) -> WindowState {
+  if current_state.is_same_state(&floating_state) {
+    WindowState::Tiling
+  } else {
+    floating_state
+  }
+}
+
 #[delegatable_trait]
 pub trait WindowGetters: CommonGetters {
   fn state(&self) -> WindowState;
@@ -56,6 +73,18 @@ pub trait WindowGetters: CommonGetters {
         ),
         _ => WindowState::Tiling,
       })
+  }
+
+  /// Gets the state for the floating/tiling toggle command.
+  ///
+  /// This intentionally ignores `prev_state`: toggling a floating window
+  /// must always reattach it to the tiling tree, even when its previous
+  /// state was fullscreen.
+  fn toggled_floating_state(
+    &self,
+    floating_state: WindowState,
+  ) -> WindowState {
+    floating_toggle_target(&self.state(), floating_state)
   }
 
   fn native(&self) -> Ref<'_, NativeWindow>;
@@ -166,6 +195,45 @@ pub trait WindowGetters: CommonGetters {
   fn update_native_properties<F>(&self, updater: F)
   where
     F: FnOnce(&mut NativeWindowProperties);
+}
+
+#[cfg(test)]
+mod tests {
+  use wm_common::{FloatingStateConfig, FullscreenStateConfig};
+
+  use super::floating_toggle_target;
+
+  #[test]
+  fn floating_toggle_always_returns_tiling_when_already_floating() {
+    let target = floating_toggle_target(
+      &wm_common::WindowState::Floating(FloatingStateConfig {
+        centered: true,
+        shown_on_top: false,
+      }),
+      wm_common::WindowState::Floating(FloatingStateConfig {
+        centered: true,
+        shown_on_top: false,
+      }),
+    );
+
+    assert_eq!(target, wm_common::WindowState::Tiling);
+  }
+
+  #[test]
+  fn floating_toggle_targets_floating_from_other_states() {
+    let target = floating_toggle_target(
+      &wm_common::WindowState::Fullscreen(FullscreenStateConfig {
+        maximized: false,
+        shown_on_top: false,
+      }),
+      wm_common::WindowState::Floating(FloatingStateConfig {
+        centered: true,
+        shown_on_top: false,
+      }),
+    );
+
+    assert!(matches!(target, wm_common::WindowState::Floating(_)));
+  }
 }
 
 /// Implements the `WindowGetters` trait for a given struct.

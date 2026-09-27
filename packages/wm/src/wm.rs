@@ -869,7 +869,7 @@ impl WindowManager {
 
           let window = update_window_state(
             window.clone(),
-            window.toggled_state(target_state, config),
+            window.toggled_floating_state(target_state),
             state,
             config,
           )?;
