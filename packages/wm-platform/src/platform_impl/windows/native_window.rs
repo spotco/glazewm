@@ -1042,6 +1042,18 @@ pub(crate) fn unhide_all_cloaked_windows(
     if skip_handles.contains(&handle) {
       continue;
     }
+
+    // explorer.exe owns both real File Explorer windows and a large number
+    // of shell/desktop helper HWNDs (WorkerW, Progman, taskbar internals,
+    // etc.). The latter are not user windows, but AddTab below would
+    // create a blank, uncloseable taskbar entry for them. Keep real
+    // Explorer folder windows eligible while cleaning up any stale
+    // shell tabs left by older versions of this command.
+    if is_explorer_shell_window(&window) {
+      let _ = window.set_taskbar_visibility(false);
+      continue;
+    }
+
     let cloaked = match window.is_cloaked() {
       Ok(true) => true,
       Ok(false) => false,
@@ -1073,6 +1085,22 @@ pub(crate) fn unhide_all_cloaked_windows(
   }
 
   Ok(unhidden)
+}
+
+fn is_explorer_shell_window(window: &NativeWindow) -> bool {
+  let Ok(process_name) = window.process_name() else {
+    return false;
+  };
+
+  if !process_name.eq_ignore_ascii_case("explorer") {
+    return false;
+  }
+
+  let Ok(class_name) = window.class_name() else {
+    return false;
+  };
+
+  !matches!(class_name.as_str(), "CabinetWClass" | "ExploreWClass")
 }
 
 /// Implements [`Dispatcher::focused_window`].
