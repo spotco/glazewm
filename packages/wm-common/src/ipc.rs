@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use wm_platform::NativeWindowDebugInfo;
 
 use crate::{
   BindingModeConfig, ContainerDto, LayoutMatchReport, LayoutSnapshot,
@@ -129,6 +130,7 @@ pub enum ClientResponseData {
   GlobalTilingDirection(GlobalTilingDirectionData),
   LayoutHistory(LayoutHistoryData),
   Windows(WindowsData),
+  WindowsDebug(WindowsDebugData),
   Workspaces(WorkspacesData),
   Paused(bool),
   Ignored(crate::IgnoredWindowsData),
@@ -199,6 +201,27 @@ pub struct LayoutHistoryData {
 #[serde(rename_all = "camelCase")]
 pub struct WindowsData {
   pub windows: Vec<ContainerDto>,
+}
+
+/// Full, read-only diagnostics for managed and native windows.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsDebugData {
+  pub focused_window_handle: Option<isize>,
+  pub wm_focused_container_id: Option<Uuid>,
+  pub wm_focus_is_synced: bool,
+  pub windows: Vec<WindowDebugData>,
+  pub ignored_windows: Vec<NativeWindowDebugInfo>,
+  /// All top-level native windows in current native z-order.
+  pub top_level_windows: Vec<NativeWindowDebugInfo>,
+}
+
+/// WM state paired with a point-in-time native window diagnostic.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowDebugData {
+  pub wm: ContainerDto,
+  pub native: NativeWindowDebugInfo,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -555,6 +555,17 @@ impl Dispatcher {
     platform_impl::visible_windows(self)
   }
 
+  /// Captures best-effort diagnostics for all top-level native windows.
+  ///
+  /// On Windows, the result follows the `EnumWindows` z-order from top to
+  /// bottom. Other platforms return the windows available through their
+  /// native window enumeration APIs.
+  pub fn debug_windows(
+    &self,
+  ) -> crate::Result<Vec<crate::NativeWindowDebugInfo>> {
+    platform_impl::debug_windows(self)
+  }
+
   /// Uncloak/show all top-level cloaked windows (Windows DWM cloak).
   ///
   /// Enumerates via `EnumWindows` including cloaked HWNDs that

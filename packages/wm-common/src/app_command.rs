@@ -177,6 +177,13 @@ pub enum QueryCommand {
   Monitors,
   /// Outputs all windows.
   Windows,
+  /// Outputs WM state and read-only native OS diagnostics for all
+  /// windows.
+  ///
+  /// On Windows, this also includes every top-level HWND in native
+  /// z-order.
+  #[clap(name = "windows-debug")]
+  WindowsDebug,
   /// Outputs all active workspaces.
   Workspaces,
   /// Outputs whether the window manager is paused.
@@ -444,6 +451,11 @@ pub struct InvokeMoveCommand {
   #[serde(flatten)]
   pub target: InvokeMoveTarget,
 
+  /// Move every window in the current workspace instead of only the
+  /// focused window.
+  #[clap(long, action)]
+  pub all: bool,
+
   /// Use the inverse of the WM global stack direction for this move only
   /// (does not flip the stored global flag). Spotcobuild
   /// Super+Shift+Ctrl.
@@ -574,6 +586,34 @@ mod shell_exec_ipc_tests {
   #[test]
   fn bare_move_is_rejected() {
     assert!(InvokeCommand::try_parse_from(["glazewm", "move"]).is_err());
+  }
+
+  #[test]
+  fn move_all_windows_target_parses() {
+    let command = InvokeCommand::try_parse_from([
+      "glazewm",
+      "move",
+      "--workspace",
+      "2",
+      "--all",
+    ])
+    .expect("move all windows command should parse");
+
+    match command {
+      InvokeCommand::Move(move_command) => {
+        assert_eq!(move_command.target.workspace.as_deref(), Some("2"));
+        assert!(move_command.all);
+      }
+      other => panic!("expected Move, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn windows_debug_query_parses() {
+    assert!(matches!(
+      QueryCommand::try_parse_from(["glazewm", "windows-debug"]),
+      Ok(QueryCommand::WindowsDebug)
+    ));
   }
 
   #[test]

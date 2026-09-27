@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 use anyhow::{bail, Context};
 use clap::Parser;
@@ -18,8 +18,8 @@ use wm_common::{
   GlobalTilingDirectionData, IgnoredWindowsData, LayoutHistoryData,
   LayoutSnapshot, LoadLayoutData, MonitorsData, QueryCommand,
   ServerMessage, SnapshotWindow, SnapshotWindowIdentity,
-  SubscribableEvent, TilingDirectionData, WindowsData, WmEvent,
-  WorkspacesData,
+  SubscribableEvent, TilingDirectionData, WindowDebugData, WindowsData,
+  WindowsDebugData, WmEvent, WorkspacesData,
 };
 use wm_platform::Dispatcher;
 
@@ -28,7 +28,7 @@ use crate::{
     inspect_layout_snapshot, load_layout_snapshot,
     read_layout_snapshot_file,
   },
-  traits::{CommonGetters, TilingDirectionGetters},
+  traits::{CommonGetters, TilingDirectionGetters, WindowGetters},
   user_config::UserConfig,
   wm::WindowManager,
 };
@@ -221,6 +221,63 @@ impl IpcServer {
               .into_iter()
               .map(|window| window.to_dto())
               .try_collect()?,
+          })
+        }
+        QueryCommand::WindowsDebug => {
+          let top_level_windows = wm.state.dispatcher.debug_windows()?;
+          let native_by_handle: HashMap<isize, _> = top_level_windows
+            .iter()
+            .cloned()
+            .map(|window| (window.handle, window))
+            .collect();
+
+          let windows: Vec<WindowDebugData> = wm
+            .state
+            .windows()
+            .into_iter()
+            .map(|window| -> anyhow::Result<WindowDebugData> {
+              let native_snapshot = window.native().debug_info();
+              let native = native_by_handle
+                .get(&native_snapshot.handle)
+                .cloned()
+                .unwrap_or(native_snapshot);
+
+              Ok(WindowDebugData {
+                wm: window.to_dto()?,
+                native,
+              })
+            })
+            .try_collect()?;
+
+          let ignored_windows = wm
+            .state
+            .ignored_windows
+            .iter()
+            .map(|window| {
+              let native_snapshot = window.debug_info();
+              native_by_handle
+                .get(&native_snapshot.handle)
+                .cloned()
+                .unwrap_or(native_snapshot)
+            })
+            .collect();
+
+          let focused_window_handle = wm
+            .state
+            .dispatcher
+            .focused_window()
+            .ok()
+            .map(|window| window.debug_info().handle);
+          let wm_focused_container_id =
+            wm.state.focused_container().map(|container| container.id());
+
+          ClientResponseData::WindowsDebug(WindowsDebugData {
+            focused_window_handle,
+            wm_focused_container_id,
+            wm_focus_is_synced: wm.state.is_focus_synced,
+            windows,
+            ignored_windows,
+            top_level_windows,
           })
         }
         QueryCommand::Workspaces => {

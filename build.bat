@@ -2,7 +2,9 @@
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
-set "LOG=%~dp0build.log"
+set "TEMP_DIR=%~dp0Temp"
+if not exist "%TEMP_DIR%" mkdir "%TEMP_DIR%"
+set "LOG=%TEMP_DIR%\build.log"
 echo ========================================
 echo  GlazeWM Windows build.bat
 echo  Repo: %CD%

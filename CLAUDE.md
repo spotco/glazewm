@@ -12,6 +12,15 @@ Crate structure:
 
 </project_overview>
 
+<temporary_artifact_policy>
+
+- Put all temporary, generated, diagnostic, scratch, build/test output, logs, snapshots, and patch files that are not intended for commit under the repository's `Temp/` directory.
+- Create `Temp/` when it does not exist; it is gitignored and is the only location for non-checked-in work artifacts.
+- Do not create temporary files at the repository root or in source directories.
+- Keep files intended for the project (source, tests, configuration, and documentation) in their normal tracked locations.
+
+</temporary_artifact_policy>
+
 <output_guidelines>
 
 - Be extremely concise. Sacrifice grammar for the sake of conciseness.

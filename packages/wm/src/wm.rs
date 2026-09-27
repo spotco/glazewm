@@ -29,9 +29,10 @@ use crate::{
     },
     monitor::focus_monitor,
     window::{
-      ignore_window, move_window_in_direction, move_window_to_workspace,
-      resize_window, set_window_position, set_window_size,
-      update_window_state, WindowPositionTarget,
+      ignore_window, move_all_windows_to_workspace,
+      move_window_in_direction, move_window_to_workspace, resize_window,
+      set_window_position, set_window_size, update_window_state,
+      WindowPositionTarget,
     },
     workspace::{
       focus_workspace, move_workspace_in_direction,
@@ -341,6 +342,44 @@ impl WindowManager {
         }
       }
       InvokeCommand::Move(args) => {
+        if args.all {
+          if args.target.direction.is_some() {
+            bail!(
+              "The --all flag can only be used with a workspace move target."
+            );
+          }
+
+          let target =
+            if let Some(direction) = &args.target.workspace_in_direction {
+              WorkspaceTarget::Direction(direction.clone())
+            } else if let Some(name) = &args.target.workspace {
+              WorkspaceTarget::Name(name.clone())
+            } else if args.target.next_active_workspace {
+              WorkspaceTarget::NextActive
+            } else if args.target.prev_active_workspace {
+              WorkspaceTarget::PreviousActive
+            } else if args.target.next_workspace {
+              WorkspaceTarget::Next
+            } else if args.target.prev_workspace {
+              WorkspaceTarget::Previous
+            } else if args.target.next_active_workspace_on_monitor {
+              WorkspaceTarget::NextActiveInMonitor
+            } else if args.target.prev_active_workspace_on_monitor {
+              WorkspaceTarget::PreviousActiveInMonitor
+            } else if args.target.recent_workspace {
+              WorkspaceTarget::Recent
+            } else {
+              bail!("The --all flag requires a workspace move target.");
+            };
+
+          state.layout_history.clear("move all windows command");
+          let workspace =
+            subject_container.workspace().context("No workspace.")?;
+          return move_all_windows_to_workspace(
+            &workspace, target, state, config,
+          );
+        }
+
         if args.target.direction.is_none() {
           state.layout_history.clear("workspace move command");
         }

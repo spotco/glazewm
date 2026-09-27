@@ -21,25 +21,28 @@ use windows::{
     },
     UI::{
       Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
+        IsWindowEnabled, SendInput, INPUT, INPUT_0, INPUT_MOUSE,
+        MOUSEINPUT,
       },
       WindowsAndMessaging::{
         EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow,
-        GetForegroundWindow, GetLayeredWindowAttributes, GetShellWindow,
-        GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-        IsZoomed, SendNotifyMessageW, SetForegroundWindow,
-        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
-        SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
-        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
-        HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
-        LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-        SW_SHOWNA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
-        WS_THICKFRAME,
+        GetForegroundWindow, GetLayeredWindowAttributes, GetParent,
+        GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+        IsWindowVisible, IsZoomed, SendNotifyMessageW,
+        SetForegroundWindow, SetLayeredWindowAttributes,
+        SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+        ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
+        GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
+        SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA,
+        WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+        WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_POPUP, WS_THICKFRAME,
       },
     },
   },
@@ -47,8 +50,9 @@ use windows::{
 
 use super::com::{IApplicationView, COM_INIT};
 use crate::{
-  Color, CornerStyle, Delta, Dispatcher, LengthValue, OpacityValue, Point,
-  Rect, RectDelta, WindowId, WindowZOrder,
+  Color, CornerStyle, Delta, Dispatcher, LengthValue,
+  NativeWindowDebugInfo, OpacityValue, Point, Rect, RectDelta, WindowId,
+  WindowZOrder,
 };
 
 /// Magic number used to identify programmatic mouse inputs from our own
@@ -570,12 +574,24 @@ impl NativeWindow {
       | SWP_NOMOVE
       | SWP_NOSIZE;
 
+    // Z-order can sometimes still be incorrect after the above call. Make
+    // the retry generation-aware so an older focus transition cannot
+    // replay after a newer z-order repair has completed.
+    let generation = next_z_order_generation();
+    let expected_foreground = (!matches!(z_order, WindowZOrder::TopMost))
+      .then(|| unsafe { GetForegroundWindow() });
     unsafe { SetWindowPos(self.hwnd(), z_order_hwnd, 0, 0, 0, 0, flags) }?;
 
-    // Z-order can sometimes still be incorrect after the above call.
     let handle = self.handle;
     task::spawn(async move {
       tokio::time::sleep(Duration::from_millis(10)).await;
+      if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+        || expected_foreground.is_some_and(|foreground| {
+          (unsafe { GetForegroundWindow() }) != foreground
+        })
+      {
+        return;
+      }
       let _ = unsafe {
         SetWindowPos(HWND(handle), z_order_hwnd, 0, 0, 0, 0, flags)
       };
@@ -746,6 +762,93 @@ impl NativeWindow {
   }
 }
 
+fn capture_debug_value<T>(
+  errors: &mut Vec<String>,
+  name: &str,
+  result: crate::Result<T>,
+) -> Option<T> {
+  match result {
+    Ok(value) => Some(value),
+    Err(error) => {
+      errors.push(format!("{name}: {error}"));
+      None
+    }
+  }
+}
+
+/// Captures best-effort diagnostics for one native window.
+pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
+  let hwnd = window.hwnd();
+  let mut errors = Vec::new();
+  let is_valid = window.is_valid();
+  let title = capture_debug_value(&mut errors, "title", window.title());
+  let class_name =
+    capture_debug_value(&mut errors, "className", window.class_name());
+  let process_path =
+    capture_debug_value(&mut errors, "processPath", window.process_path());
+  let process_name =
+    capture_debug_value(&mut errors, "processName", window.process_name());
+  let frame = capture_debug_value(&mut errors, "frame", window.frame());
+  let frame_with_shadows = capture_debug_value(
+    &mut errors,
+    "frameWithShadows",
+    window.frame_with_shadows(),
+  );
+  let is_cloaked =
+    capture_debug_value(&mut errors, "isCloaked", window.is_cloaked());
+  let is_minimized =
+    capture_debug_value(&mut errors, "isMinimized", window.is_minimized());
+  let is_maximized =
+    capture_debug_value(&mut errors, "isMaximized", window.is_maximized());
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  let extended_style =
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+  let is_window_visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+  let foreground_handle = unsafe { GetForegroundWindow() };
+  let owner_handle = unsafe { GetWindow(hwnd, GW_OWNER) }.0;
+  let parent_handle = unsafe { GetParent(hwnd) }.0;
+  let process_id_and_thread_id = {
+    let mut process_id = 0u32;
+    let thread_id =
+      unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    (process_id != 0).then_some((process_id, thread_id))
+  };
+
+  NativeWindowDebugInfo {
+    handle: window.handle,
+    title,
+    class_name,
+    process_name,
+    process_path,
+    process_id: process_id_and_thread_id.map(|(process_id, _)| process_id),
+    thread_id: process_id_and_thread_id.map(|(_, thread_id)| thread_id),
+    frame,
+    frame_with_shadows,
+    is_valid,
+    is_window_visible: Some(is_window_visible),
+    is_visible: is_cloaked.map(|cloaked| is_window_visible && !cloaked),
+    is_cloaked,
+    is_minimized,
+    is_maximized,
+    is_enabled: Some(unsafe { IsWindowEnabled(hwnd) }.as_bool()),
+    is_foreground: hwnd == foreground_handle,
+    owner_handle: (owner_handle != 0).then_some(owner_handle),
+    parent_handle: (parent_handle != 0).then_some(parent_handle),
+    style: Some(style),
+    extended_style: Some(extended_style),
+    is_topmost: Some((extended_style & WS_EX_TOPMOST.0) != 0),
+    is_tool_window: Some((extended_style & WS_EX_TOOLWINDOW.0) != 0),
+    is_app_window: Some((extended_style & WS_EX_APPWINDOW.0) != 0),
+    is_no_activate: Some((extended_style & WS_EX_NOACTIVATE.0) != 0),
+    is_child: Some((style & WS_CHILD.0) != 0),
+    is_popup: Some((style & WS_POPUP.0) != 0),
+    z_order_index: None,
+    errors,
+  }
+}
+
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
 /// The first window is placed at the top of the normal z-order. Each
@@ -759,7 +862,7 @@ pub(crate) fn reorder_z_order(
     return Ok(());
   }
 
-  let generation = Z_ORDER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+  let generation = next_z_order_generation();
   apply_z_order_chain(window_ids)?;
 
   let window_ids = window_ids.to_vec();
@@ -779,12 +882,26 @@ pub(crate) fn reorder_z_order(
   Ok(())
 }
 
+fn next_z_order_generation() -> u64 {
+  Z_ORDER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
     | SWP_NOSIZE
     | SWP_NOOWNERZORDER;
+
+  // A normal WM window must not retain a native TOPMOST bit from a
+  // previous state or an application-side z-order change. Demote the
+  // complete chain before rebuilding its order; HWND_TOP alone does not
+  // clear TOPMOST.
+  for window_id in window_ids {
+    unsafe {
+      SetWindowPos(HWND(window_id.0), HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+    }?;
+  }
 
   for (index, window_id) in window_ids.iter().enumerate() {
     let insert_after = index
@@ -843,6 +960,46 @@ pub(crate) fn visible_windows(
       .map(NativeWindow::new)
       .filter(|window| window.is_visible().unwrap_or(false))
       .map(Into::into)
+      .collect(),
+  )
+}
+
+/// Implements [`Dispatcher::debug_windows`].
+pub(crate) fn debug_windows(
+  _: &Dispatcher,
+) -> crate::Result<Vec<NativeWindowDebugInfo>> {
+  let mut handles: Vec<isize> = Vec::new();
+
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn debug_windows_proc(
+    handle: HWND,
+    data: LPARAM,
+  ) -> BOOL {
+    let handles = data.0 as *mut Vec<isize>;
+    unsafe { (*handles).push(handle.0) };
+    true.into()
+  }
+
+  unsafe {
+    EnumWindows(
+      Some(debug_windows_proc),
+      LPARAM(std::ptr::from_mut(&mut handles) as _),
+    )
+  }?;
+
+  Ok(
+    handles
+      .into_iter()
+      .enumerate()
+      .map(|(index, handle)| {
+        let window = NativeWindow::new(handle);
+        let mut info = debug_info(&window);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+          info.z_order_index = Some(index as u32);
+        }
+        info
+      })
       .collect(),
   )
 }

@@ -293,6 +293,27 @@ keybindings:
   - commands: ['move --workspace 9', 'focus --workspace 9']
     bindings: ['lwin+shift+9']
 
+  # Ctrl + Shift + Alt + Mod + 1..9 — move all windows to workspace
+  # (preserves the source tiling layout; existing target windows remain)
+  - commands: ['move --workspace 1 --all']
+    bindings: ['ctrl+shift+alt+lwin+1']
+  - commands: ['move --workspace 2 --all']
+    bindings: ['ctrl+shift+alt+lwin+2']
+  - commands: ['move --workspace 3 --all']
+    bindings: ['ctrl+shift+alt+lwin+3']
+  - commands: ['move --workspace 4 --all']
+    bindings: ['ctrl+shift+alt+lwin+4']
+  - commands: ['move --workspace 5 --all']
+    bindings: ['ctrl+shift+alt+lwin+5']
+  - commands: ['move --workspace 6 --all']
+    bindings: ['ctrl+shift+alt+lwin+6']
+  - commands: ['move --workspace 7 --all']
+    bindings: ['ctrl+shift+alt+lwin+7']
+  - commands: ['move --workspace 8 --all']
+    bindings: ['ctrl+shift+alt+lwin+8']
+  - commands: ['move --workspace 9 --all']
+    bindings: ['ctrl+shift+alt+lwin+9']
+
   # --- Extra utilities (kept, remapped off Omarchy chords) ---
 
   # Resize: Win + - shrinks, Win + = grows (plus=bigger, minus=smaller)

@@ -2,6 +2,7 @@
 use objc2_application_services::AXUIElement;
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
+use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
 use windows::Win32::{
   Foundation::HWND,
@@ -52,6 +53,46 @@ pub enum WindowZOrder {
   AfterWindow(WindowId),
   Top,
   TopMost,
+}
+
+/// Point-in-time native window state used by the diagnostic window query.
+///
+/// Fields that cannot be read for a particular window are `None`;
+/// collecting diagnostics must not fail because another process destroyed
+/// a window or denied a process query while the snapshot was being
+/// collected.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeWindowDebugInfo {
+  pub handle: isize,
+  pub title: Option<String>,
+  pub class_name: Option<String>,
+  pub process_name: Option<String>,
+  pub process_path: Option<String>,
+  pub process_id: Option<u32>,
+  pub thread_id: Option<u32>,
+  pub frame: Option<Rect>,
+  pub frame_with_shadows: Option<Rect>,
+  pub is_valid: bool,
+  pub is_window_visible: Option<bool>,
+  pub is_visible: Option<bool>,
+  pub is_cloaked: Option<bool>,
+  pub is_minimized: Option<bool>,
+  pub is_maximized: Option<bool>,
+  pub is_enabled: Option<bool>,
+  pub is_foreground: bool,
+  pub owner_handle: Option<isize>,
+  pub parent_handle: Option<isize>,
+  pub style: Option<u32>,
+  pub extended_style: Option<u32>,
+  pub is_topmost: Option<bool>,
+  pub is_tool_window: Option<bool>,
+  pub is_app_window: Option<bool>,
+  pub is_no_activate: Option<bool>,
+  pub is_child: Option<bool>,
+  pub is_popup: Option<bool>,
+  pub z_order_index: Option<u32>,
+  pub errors: Vec<String>,
 }
 
 /// Reorders a normal-window chain without changing focus or visibility.
@@ -576,6 +617,12 @@ impl NativeWindow {
   ///   title bar.
   pub fn close(&self) -> crate::Result<()> {
     self.inner.close()
+  }
+
+  /// Captures best-effort native state for diagnostics.
+  #[must_use]
+  pub fn debug_info(&self) -> NativeWindowDebugInfo {
+    platform_impl::debug_info(&self.inner)
   }
 }
 

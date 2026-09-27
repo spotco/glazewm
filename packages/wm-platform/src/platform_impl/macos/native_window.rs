@@ -14,7 +14,7 @@ use crate::{
   platform_impl::{
     self, ffi, AXUIElement, AXUIElementExt, AXValueExt, Application,
   },
-  Dispatcher, Point, Rect, ThreadBound, WindowId,
+  Dispatcher, NativeWindowDebugInfo, Point, Rect, ThreadBound, WindowId,
 };
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -391,6 +391,74 @@ impl NativeWindow {
   }
 }
 
+/// Captures best-effort diagnostics for one native window.
+pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
+  let mut errors = Vec::new();
+  let title = match window.title() {
+    Ok(value) => Some(value),
+    Err(error) => {
+      errors.push(format!("title: {error}"));
+      None
+    }
+  };
+  let process_name = match window.process_name() {
+    Ok(value) => Some(value),
+    Err(error) => {
+      errors.push(format!("processName: {error}"));
+      None
+    }
+  };
+  let frame = match window.frame() {
+    Ok(value) => Some(value),
+    Err(error) => {
+      errors.push(format!("frame: {error}"));
+      None
+    }
+  };
+  let is_visible = match window.is_visible() {
+    Ok(value) => Some(value),
+    Err(error) => {
+      errors.push(format!("isVisible: {error}"));
+      None
+    }
+  };
+
+  #[allow(clippy::cast_possible_wrap)]
+  let handle = window.id().0 as isize;
+
+  NativeWindowDebugInfo {
+    handle,
+    title,
+    class_name: None,
+    process_name,
+    process_path: None,
+    process_id: None,
+    thread_id: None,
+    frame: frame.clone(),
+    frame_with_shadows: frame,
+    is_valid: window.is_valid(),
+    is_window_visible: is_visible,
+    is_visible,
+    is_cloaked: None,
+    is_minimized: window.is_minimized().ok(),
+    is_maximized: window.is_maximized().ok(),
+    is_enabled: None,
+    is_foreground: false,
+    owner_handle: None,
+    parent_handle: None,
+    style: None,
+    extended_style: None,
+    is_topmost: None,
+    is_tool_window: None,
+    is_app_window: None,
+    is_no_activate: None,
+    is_child: None,
+    is_popup: None,
+    z_order_index: None,
+    errors,
+  }
+}
+
 impl From<NativeWindow> for crate::NativeWindow {
   fn from(window: NativeWindow) -> Self {
     crate::NativeWindow { inner: window }
@@ -415,6 +483,26 @@ pub(crate) fn visible_windows(
       .iter()
       .filter_map(|app| app.windows().ok())
       .flat_map(std::iter::IntoIterator::into_iter)
+      .collect(),
+  )
+}
+
+/// Implements [`Dispatcher::debug_windows`].
+pub(crate) fn debug_windows(
+  dispatcher: &Dispatcher,
+) -> crate::Result<Vec<NativeWindowDebugInfo>> {
+  Ok(
+    visible_windows(dispatcher)?
+      .into_iter()
+      .enumerate()
+      .map(|(index, window)| {
+        let mut info = window.debug_info();
+        #[allow(clippy::cast_possible_truncation)]
+        {
+          info.z_order_index = Some(index as u32);
+        }
+        info
+      })
       .collect(),
   )
 }
