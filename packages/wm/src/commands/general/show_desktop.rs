@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use wm_platform::NativeWindow;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
@@ -14,7 +16,7 @@ use crate::{
 /// currently visible. Visible unmanaged windows are selected from the
 /// monitor displaying the focused workspace. Desktop and shell helper
 /// windows are excluded.
-pub fn show_desktop(state: &WmState) -> anyhow::Result<()> {
+pub fn show_desktop(state: &mut WmState) -> anyhow::Result<()> {
   let current_workspace = state
     .focused_container()
     .and_then(|container| container.workspace())
@@ -36,6 +38,7 @@ pub fn show_desktop(state: &WmState) -> anyhow::Result<()> {
   for window in state.dispatcher.visible_windows()? {
     if state.window_from_native(&window).is_some()
       || is_desktop_or_shell_window(&window)
+      || is_zebar_window(&window)
       || state
         .nearest_monitor(&window)
         .is_none_or(|monitor| monitor.id() != current_monitor.id())
@@ -49,6 +52,14 @@ pub fn show_desktop(state: &WmState) -> anyhow::Result<()> {
     {
       windows.push(window);
     }
+  }
+
+  if !windows.is_empty() {
+    // Windows can emit a focus event for the next z-order window before
+    // its minimize event reaches the WM. Reuse the normal short focus
+    // override window so that event cannot switch to another workspace
+    // mid-action.
+    state.unmanaged_or_minimized_timestamp = Some(Instant::now());
   }
 
   let mut minimized = 0;
@@ -74,6 +85,16 @@ pub fn show_desktop(state: &WmState) -> anyhow::Result<()> {
   tracing::info!(
     "Show desktop minimized {minimized} window(s); {failed} failed."
   );
+
+  // Minimizing the final foreground window can make Windows activate a
+  // window from another workspace. Keep the WM on the desktop instead of
+  // allowing that fallback activation to switch workspaces.
+  if minimized > 0 {
+    if let Err(err) = state.dispatcher.reset_focus() {
+      tracing::warn!("Show desktop failed to reset focus: {}", err);
+    }
+  }
+
   Ok(())
 }
 
@@ -98,4 +119,10 @@ fn is_desktop_or_shell_window(window: &NativeWindow) -> bool {
   }
 
   false
+}
+
+fn is_zebar_window(window: &NativeWindow) -> bool {
+  window
+    .process_name()
+    .is_ok_and(|name| name.eq_ignore_ascii_case("zebar"))
 }

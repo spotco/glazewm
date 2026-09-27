@@ -338,7 +338,7 @@ async fn start_wm(
         })()
       },
       Some(()) = tray.show_desktop_rx.recv() => {
-        show_desktop(&wm.state)
+        show_desktop(&mut wm.state)
       },
       Some(event) = mouse_listener.next_event() => {
         tracing::debug!("Received mouse event: {:?}", event);

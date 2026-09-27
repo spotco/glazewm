@@ -559,7 +559,20 @@ impl WmState {
   /// Gets the currently focused container. This can either be a window or
   /// a workspace without any descendant windows.
   pub fn focused_container(&self) -> Option<Container> {
-    self.root_container.descendant_focus_order().next()
+    let focused_container =
+      self.root_container.descendant_focus_order().next()?;
+
+    // A minimized window must never be treated as the native focus target.
+    // When every window in the focused workspace is minimized, retain
+    // focus at the workspace level so platform_sync resets focus to
+    // the desktop instead of restoring one of those minimized windows.
+    if let Ok(window) = focused_container.as_window_container() {
+      if window.state() == WindowState::Minimized {
+        return window.workspace().map(Into::into);
+      }
+    }
+
+    Some(focused_container)
   }
 
   /// Emits a WM event through an MSPC channel.
@@ -634,9 +647,7 @@ impl WmState {
       .find(|descendant| descendant.state() != WindowState::Minimized)
       .map(Into::into);
 
-    non_minimized_focus_target
-      .or(descendant_focus_order.first().cloned())
-      .or(Some(workspace.into()))
+    non_minimized_focus_target.or(Some(workspace.into()))
   }
 
   /// Returns all containers that contain the given point.
