@@ -63,6 +63,38 @@ impl Workspace {
     self.0.borrow_mut().config = config;
   }
 
+  /// Swaps the window/container contents of two workspaces while
+  /// preserving each workspace's tree and focus order.
+  ///
+  /// The workspace configuration, monitor assignment, and tiling direction
+  /// remain attached to their original workspaces. Root containers are
+  /// rebound to their new workspace so saved insertion targets inside
+  /// those trees remain valid when a window is later restored from
+  /// fullscreen.
+  pub fn swap_contents(&self, other: &Self) {
+    if self.id() == other.id() {
+      return;
+    }
+
+    {
+      let mut this = self.0.borrow_mut();
+      let mut other = other.0.borrow_mut();
+
+      std::mem::swap(&mut this.children, &mut other.children);
+      std::mem::swap(
+        &mut this.child_focus_order,
+        &mut other.child_focus_order,
+      );
+    }
+
+    for child in self.children() {
+      *child.borrow_parent_mut() = Some(self.clone().into());
+    }
+    for child in other.children() {
+      *child.borrow_parent_mut() = Some(other.clone().into());
+    }
+  }
+
   /// Whether the workspace is currently displayed by the parent monitor.
   pub fn is_displayed(&self) -> bool {
     self

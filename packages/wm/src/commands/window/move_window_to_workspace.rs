@@ -4,19 +4,11 @@ use wm_common::WindowState;
 
 use crate::{
   commands::{
-    container::{
-      move_container_within_tree, set_focused_descendant,
-      wrap_in_split_container,
-    },
-    workspace::activate_workspace,
+    container::{move_container_within_tree, set_focused_descendant},
+    workspace::{activate_workspace, focus_workspace},
   },
-  models::{
-    Container, SplitContainer, TilingContainer, WindowContainer,
-    Workspace, WorkspaceTarget,
-  },
-  traits::{
-    CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
-  },
+  models::{WindowContainer, Workspace, WorkspaceTarget},
+  traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
 };
@@ -155,13 +147,12 @@ pub fn move_window_to_workspace(
   Ok(())
 }
 
-/// Moves every window in `current_workspace` to another workspace while
-/// preserving the source workspace's tiling tree.
+/// Swaps all windows between the current workspace and another workspace.
 ///
-/// When the target already contains tiled windows, the source tree is kept
-/// as one nested split. This preserves the source windows' relative sizes
-/// and layout while allowing the target's existing layout to remain in
-/// place.
+/// An empty target naturally behaves like a move: the source becomes empty
+/// and the target receives its contents. When both workspaces contain
+/// windows, each complete root tree is exchanged instead of nesting or
+/// merging the source tree into the target.
 pub fn move_all_windows_to_workspace(
   current_workspace: &Workspace,
   target: WorkspaceTarget,
@@ -210,77 +201,53 @@ pub fn move_all_windows_to_workspace(
     target_workspace.monitor().context("No monitor.")?;
   let has_dpi_difference =
     current_monitor.has_dpi_difference(&target_monitor.clone().into())?;
+  let monitors_differ = current_monitor.id() != target_monitor.id();
 
-  let source_tiling_children: Vec<TilingContainer> =
-    current_workspace.tiling_children().collect();
-
-  // Keep multiple root tiling children together so their original root
-  // ratios remain meaningful after they are inserted into the target tree.
-  let tiling_group: Option<Container> = match source_tiling_children
-    .as_slice()
-  {
-    [] => None,
-    [child] => Some(child.clone().into()),
-    _ => {
-      let split = SplitContainer::new(
-        current_workspace.tiling_direction(),
-        config.value.gaps.clone(),
-      );
-      let current_container: Container = current_workspace.clone().into();
-      wrap_in_split_container(
-        &split,
-        &current_container,
-        &source_tiling_children,
-      )?;
-      Some(split.into())
-    }
-  };
-
-  if let Some(tiling_group) = tiling_group {
-    if has_dpi_difference {
-      for window in tiling_group
-        .self_and_descendants()
-        .filter_map(|descendant| descendant.as_window_container().ok())
+  // Preserve the complete root trees on both sides. This avoids the nested
+  // split created by the old merge behavior, which could later be
+  // flattened when a child entered fullscreen and lose the child's
+  // restore location.
+  if has_dpi_difference || monitors_differ {
+    for (workspace, destination) in [
+      (current_workspace.clone(), target_workspace.clone()),
+      (target_workspace.clone(), current_workspace.clone()),
+    ] {
+      let destination_rect = destination.to_rect()?;
+      for window in workspace
+        .descendants()
+        .filter_map(|container| container.as_window_container().ok())
       {
-        window.set_has_pending_dpi_adjustment(true);
+        if has_dpi_difference {
+          window.set_has_pending_dpi_adjustment(true);
+        }
+        if monitors_differ {
+          window.set_floating_placement(
+            window
+              .floating_placement()
+              .translate_to_center(&destination_rect),
+          );
+        }
       }
     }
-
-    move_container_within_tree(
-      &tiling_group,
-      &target_workspace.clone().into(),
-      target_workspace.child_count(),
-      state,
-    )?;
   }
 
-  // Floating, fullscreen, and minimized windows are direct workspace
-  // children. Reuse the regular move path so their placement, focus
-  // fallback, and cross-monitor behavior stay consistent.
-  let non_tiling_windows = current_workspace
-    .children()
-    .into_iter()
-    .filter_map(|child| child.as_window_container().ok())
-    .collect::<Vec<_>>();
-  let target_name = target_workspace.config().name;
-  for window in non_tiling_windows {
-    move_window_to_workspace(
-      window,
-      WorkspaceTarget::Name(target_name.clone()),
-      state,
-      config,
-    )?;
-  }
+  current_workspace.swap_contents(&target_workspace);
 
-  // The source workspace remains displayed, so keep focus there after its
-  // windows have been moved rather than focusing a hidden target
-  // workspace.
-  set_focused_descendant(&current_workspace.clone().into(), None);
-  state.pending_sync.queue_focus_change();
   state
     .pending_sync
-    .queue_containers_to_redraw(target_workspace.tiling_children())
-    .queue_workspace_to_reorder(target_workspace);
+    .queue_container_to_redraw(current_workspace.clone())
+    .queue_container_to_redraw(target_workspace.clone())
+    .queue_workspace_to_reorder(current_workspace.clone())
+    .queue_workspace_to_reorder(target_workspace.clone());
+
+  // Move focus to the destination workspace after the contents have been
+  // exchanged. Its swapped-in focus order selects the source's prior
+  // focus.
+  focus_workspace(
+    WorkspaceTarget::Name(target_workspace.config().name),
+    state,
+    config,
+  )?;
 
   Ok(())
 }
