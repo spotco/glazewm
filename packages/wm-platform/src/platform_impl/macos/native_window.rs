@@ -474,6 +474,14 @@ pub(crate) fn unhide_all_cloaked_windows(
   Ok(0)
 }
 
+/// macOS has no taskbar helper tabs; no-op for API parity.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn cleanup_taskbar_helper_windows(
+  _: &Dispatcher,
+) -> crate::Result<usize> {
+  Ok(0)
+}
+
 /// Implements [`Dispatcher::visible_windows`].
 pub(crate) fn visible_windows(
   dispatcher: &Dispatcher,

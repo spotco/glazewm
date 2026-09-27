@@ -1017,21 +1017,7 @@ pub(crate) fn unhide_all_cloaked_windows(
   skip_handles: &[isize],
   _: &Dispatcher,
 ) -> crate::Result<usize> {
-  let mut handles: Vec<isize> = Vec::new();
-
-  #[allow(clippy::items_after_statements)]
-  extern "system" fn enum_proc(handle: HWND, data: LPARAM) -> BOOL {
-    let handles = data.0 as *mut Vec<isize>;
-    unsafe { (*handles).push(handle.0) };
-    true.into()
-  }
-
-  unsafe {
-    EnumWindows(
-      Some(enum_proc),
-      LPARAM(std::ptr::from_mut(&mut handles) as _),
-    )
-  }?;
+  let handles = top_level_window_handles()?;
 
   let mut unhidden = 0usize;
   for handle in handles {
@@ -1049,7 +1035,7 @@ pub(crate) fn unhide_all_cloaked_windows(
     // create a blank, uncloseable taskbar entry for them. Keep real
     // Explorer folder windows eligible while cleaning up any stale
     // shell tabs left by older versions of this command.
-    if is_explorer_shell_window(&window) {
+    if is_taskbar_helper_window(&window) {
       let _ = window.set_taskbar_visibility(false);
       continue;
     }
@@ -1085,6 +1071,56 @@ pub(crate) fn unhide_all_cloaked_windows(
   }
 
   Ok(unhidden)
+}
+
+/// Removes taskbar tabs left behind by broad uncloak operations that
+/// treated shell/input helper HWNDs as user windows.
+pub(crate) fn cleanup_taskbar_helper_windows(
+  _: &Dispatcher,
+) -> crate::Result<usize> {
+  let mut cleaned = 0usize;
+  for handle in top_level_window_handles()? {
+    let window = NativeWindow::new(handle);
+    if !window.is_valid() || !is_taskbar_helper_window(&window) {
+      continue;
+    }
+
+    if window.set_taskbar_visibility(false).is_ok() {
+      cleaned += 1;
+    }
+  }
+
+  Ok(cleaned)
+}
+
+fn top_level_window_handles() -> crate::Result<Vec<isize>> {
+  let mut handles: Vec<isize> = Vec::new();
+
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn enum_proc(handle: HWND, data: LPARAM) -> BOOL {
+    let handles = data.0 as *mut Vec<isize>;
+    unsafe { (*handles).push(handle.0) };
+    true.into()
+  }
+
+  unsafe {
+    EnumWindows(
+      Some(enum_proc),
+      LPARAM(std::ptr::from_mut(&mut handles) as _),
+    )
+  }?;
+
+  Ok(handles)
+}
+
+fn is_taskbar_helper_window(window: &NativeWindow) -> bool {
+  is_explorer_shell_window(window) || is_input_method_window(window)
+}
+
+fn is_input_method_window(window: &NativeWindow) -> bool {
+  window.class_name().is_ok_and(|class_name| {
+    matches!(class_name.as_str(), "MSCTFIME UI" | "IME")
+  })
 }
 
 fn is_explorer_shell_window(window: &NativeWindow) -> bool {

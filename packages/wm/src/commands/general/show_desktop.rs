@@ -46,6 +46,7 @@ pub fn show_desktop(
   for window in state.dispatcher.visible_windows()? {
     if state.window_from_native(&window).is_some()
       || is_desktop_or_shell_window(&window)
+      || is_input_method_window(&window)
       || is_zebar_window(&window)
       || state
         .nearest_monitor(&window)
@@ -175,4 +176,19 @@ fn is_zebar_window(window: &NativeWindow) -> bool {
   window
     .process_name()
     .is_ok_and(|name| name.eq_ignore_ascii_case("zebar"))
+}
+
+fn is_input_method_window(window: &NativeWindow) -> bool {
+  #[cfg(target_os = "windows")]
+  {
+    return window.class_name().is_ok_and(|class_name| {
+      matches!(class_name.as_str(), "MSCTFIME UI" | "IME")
+    });
+  }
+
+  #[cfg(not(target_os = "windows"))]
+  {
+    let _ = window;
+    false
+  }
 }

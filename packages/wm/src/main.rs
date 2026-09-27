@@ -146,6 +146,17 @@ async fn start_wm(
     layout_log_path.display()
   ));
 
+  #[cfg(target_os = "windows")]
+  match dispatcher.cleanup_taskbar_helper_windows() {
+    Ok(0) => {}
+    Ok(count) => tracing::info!(
+      "Removed {count} stale taskbar tab(s) from shell/input helpers."
+    ),
+    Err(err) => tracing::warn!(
+      "Failed to clean shell/input-helper taskbar tabs: {err:?}"
+    ),
+  }
+
   // Add application icon to system tray.
   let mut tray = SystemTray::new(&config.path, dispatcher.clone())?;
 

@@ -577,6 +577,12 @@ impl Dispatcher {
     platform_impl::unhide_all_cloaked_windows(skip_handles, self)
   }
 
+  /// Removes stale taskbar tabs belonging to shell and input-method helper
+  /// windows.
+  pub fn cleanup_taskbar_helper_windows(&self) -> crate::Result<usize> {
+    platform_impl::cleanup_taskbar_helper_windows(self)
+  }
+
   /// Gets the currently focused (foreground) window.
   ///
   /// This may be the desktop window if no window has focus.
