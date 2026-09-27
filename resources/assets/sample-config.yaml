@@ -296,23 +296,23 @@ keybindings:
   # Alt + Shift + Mod + 1..9 — swap all windows with another workspace
   # (the target workspace becomes focused; an empty target behaves like move)
   - commands: ['move --workspace 1 --all']
-    bindings: ['alt+shift+lwin+1']
+    bindings: ['alt+shift+win+1']
   - commands: ['move --workspace 2 --all']
-    bindings: ['alt+shift+lwin+2']
+    bindings: ['alt+shift+win+2']
   - commands: ['move --workspace 3 --all']
-    bindings: ['alt+shift+lwin+3']
+    bindings: ['alt+shift+win+3']
   - commands: ['move --workspace 4 --all']
-    bindings: ['alt+shift+lwin+4']
+    bindings: ['alt+shift+win+4']
   - commands: ['move --workspace 5 --all']
-    bindings: ['alt+shift+lwin+5']
+    bindings: ['alt+shift+win+5']
   - commands: ['move --workspace 6 --all']
-    bindings: ['alt+shift+lwin+6']
+    bindings: ['alt+shift+win+6']
   - commands: ['move --workspace 7 --all']
-    bindings: ['alt+shift+lwin+7']
+    bindings: ['alt+shift+win+7']
   - commands: ['move --workspace 8 --all']
-    bindings: ['alt+shift+lwin+8']
+    bindings: ['alt+shift+win+8']
   - commands: ['move --workspace 9 --all']
-    bindings: ['alt+shift+lwin+9']
+    bindings: ['alt+shift+win+9']
 
   # --- Extra utilities (kept, remapped off Omarchy chords) ---
 
