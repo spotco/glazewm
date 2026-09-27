@@ -1,11 +1,15 @@
 use std::time::Instant;
 
+use wm_common::WindowState;
 use wm_platform::NativeWindow;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
 
 use crate::{
+  commands::window::update_window_state,
+  models::WindowContainer,
   traits::{CommonGetters, WindowGetters},
+  user_config::UserConfig,
   wm_state::WmState,
 };
 
@@ -16,7 +20,10 @@ use crate::{
 /// currently visible. Visible unmanaged windows are selected from the
 /// monitor displaying the focused workspace. Desktop and shell helper
 /// windows are excluded.
-pub fn show_desktop(state: &mut WmState) -> anyhow::Result<()> {
+pub fn show_desktop(
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
   let current_workspace = state
     .focused_container()
     .and_then(|container| container.workspace())
@@ -25,11 +32,12 @@ pub fn show_desktop(state: &mut WmState) -> anyhow::Result<()> {
     .monitor()
     .ok_or_else(|| anyhow::anyhow!("Focused workspace has no monitor."))?;
 
-  let mut windows = current_workspace
+  let managed_windows = current_workspace
     .descendants()
     .filter_map(|container| container.as_window_container().ok())
-    .map(|window| window.native().clone())
     .collect::<Vec<_>>();
+
+  let mut unmanaged_windows: Vec<NativeWindow> = Vec::new();
 
   // visible_windows contains top-level windows that are not necessarily
   // managed by GlazeWM. On a displayed workspace, an unmanaged visible
@@ -46,15 +54,15 @@ pub fn show_desktop(state: &mut WmState) -> anyhow::Result<()> {
       continue;
     }
 
-    if !windows
+    if !unmanaged_windows
       .iter()
       .any(|candidate| candidate.id() == window.id())
     {
-      windows.push(window);
+      unmanaged_windows.push(window);
     }
   }
 
-  if !windows.is_empty() {
+  if !managed_windows.is_empty() || !unmanaged_windows.is_empty() {
     // Windows can emit a focus event for the next z-order window before
     // its minimize event reaches the WM. Reuse the normal short focus
     // override window so that event cannot switch to another workspace
@@ -64,7 +72,22 @@ pub fn show_desktop(state: &mut WmState) -> anyhow::Result<()> {
 
   let mut minimized = 0;
   let mut failed = 0;
-  for window in windows {
+  for window in managed_windows {
+    match minimize_managed_window(&window, state, config) {
+      Ok(true) => minimized += 1,
+      Ok(false) => {}
+      Err(err) => {
+        failed += 1;
+        tracing::warn!(
+          "Show desktop failed to minimize window {:?}: {}",
+          window.native().id(),
+          err
+        );
+      }
+    }
+  }
+
+  for window in unmanaged_windows {
     if window.is_minimized().unwrap_or(false) {
       continue;
     }
@@ -90,12 +113,39 @@ pub fn show_desktop(state: &mut WmState) -> anyhow::Result<()> {
   // window from another workspace. Keep the WM on the desktop instead of
   // allowing that fallback activation to switch workspaces.
   if minimized > 0 {
-    if let Err(err) = state.dispatcher.reset_focus() {
-      tracing::warn!("Show desktop failed to reset focus: {}", err);
-    }
+    state.pending_sync.queue_focus_change();
+    super::platform_sync::platform_sync(state, config)?;
   }
 
   Ok(())
+}
+
+/// Minimizes a managed window while synchronously applying GlazeWM's
+/// minimized state transition. The native minimize event arrives later and
+/// is then only a cache update, rather than a second tree mutation.
+fn minimize_managed_window(
+  window: &WindowContainer,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<bool> {
+  let was_minimized = window.native().is_minimized()?;
+
+  if !was_minimized {
+    window.native().minimize()?;
+  }
+
+  window.update_native_properties(|properties| {
+    properties.is_minimized = true;
+  });
+
+  update_window_state(
+    window.clone(),
+    WindowState::Minimized,
+    state,
+    config,
+  )?;
+
+  Ok(!was_minimized)
 }
 
 fn is_desktop_or_shell_window(window: &NativeWindow) -> bool {
