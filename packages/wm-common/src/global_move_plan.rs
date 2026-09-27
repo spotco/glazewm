@@ -349,7 +349,6 @@ fn plan_orthogonal(
     &mut tree.children,
     &neighbor,
     window,
-    direction,
     stack_direction,
   ) {
     return Some(());
@@ -546,7 +545,6 @@ fn replace_target_with_joined_stack(
   children: &mut Vec<MoveNode>,
   target: &MoveNode,
   window: MoveNode,
-  direction: &Direction,
   stack_direction: &TilingDirection,
 ) -> bool {
   if let Some(index) = children.iter().position(|child| child == target) {
@@ -572,7 +570,6 @@ fn replace_target_with_joined_stack(
         children,
         target,
         window.clone(),
-        direction,
         stack_direction,
       ) {
         return true;

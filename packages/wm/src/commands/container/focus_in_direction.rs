@@ -120,11 +120,8 @@ fn geometric_tiling_focus_target_in_workspace(
     .iter()
     .map(TilingWindow::to_rect)
     .collect::<anyhow::Result<Vec<Rect>>>()?;
-  let target_index = geometric_focus_target_index(
-    &origin_rect,
-    direction,
-    &candidate_rects,
-  );
+  let target_index =
+    geometric_focus_target_index(origin_rect, direction, &candidate_rects);
 
   let candidate_summary = candidates
     .iter()
@@ -191,6 +188,7 @@ mod tests {
   }
 
   #[test]
+  #[allow(clippy::too_many_lines)]
   fn live_tree_geometry_selects_window_containing_edge_midpoint() {
     let (event_loop, dispatcher) = EventLoop::new().expect("event loop");
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
