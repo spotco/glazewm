@@ -25,11 +25,9 @@ pub fn handle_window_focused(
     .iter()
     .any(|ignored_window| ignored_window == native_window);
 
-  // Ignored windows are outside the WM's logical focus model. Native focus
-  // is already bringing them to the foreground. Cancel focus and z-order
-  // work that was queued before this event; a later drain must not rebuild
-  // the chain under the previous logical focus. The next managed focus
-  // event clears the suspension and reconciles.
+  // Ignored windows stay out of logical focus. Record the promotion
+  // immediately so a later Alt-Tab does not replay a chain that still
+  // has this window behind the tiled group.
   if is_ignored_window {
     let native_debug = native_window.debug_info();
     crate::commands::general::layout_debug_log(format!(
@@ -81,17 +79,11 @@ pub fn handle_window_focused(
   //  3. A window that received manual focus.
   state.pending_sync.queue_focused_effect_update();
 
-  // An owned dialog or other unmanaged popup can temporarily become the
-  // native foreground window without changing GlazeWM's logical focus. Its
-  // activation may disturb the normal-window z-order, and some
-  // applications do not emit a reliable focus event for the owner when
-  // the popup closes. Reconcile the focused workspace while the logical
-  // focus is still known so detached windows cannot remain above the
-  // tiled layer.
+  // Unknown foreground windows (the Alt-Tab switcher, for example) must
+  // not reconcile z-order. Doing so raises the logical tiled focus and
+  // pulls every other window behind the tiled group mid-gesture.
   if found_window.is_none() {
-    if let Some(workspace) = focused_container.workspace() {
-      state.pending_sync.queue_workspace_to_reorder(workspace);
-    }
+    return Ok(());
   }
 
   if let Some(window) = found_window {
@@ -288,7 +280,10 @@ mod tests {
     )
     .expect("handle unmanaged popup focus");
 
-    assert_eq!(state.pending_sync.workspaces_to_reorder().len(), 1);
+    assert!(
+      state.pending_sync.workspaces_to_reorder().is_empty(),
+      "an unknown foreground window must not reorder z-order"
+    );
     assert!(!state.is_focus_synced);
 
     // An explicitly ignored window is allowed to own native focus. Work

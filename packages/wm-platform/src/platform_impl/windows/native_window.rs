@@ -1,9 +1,5 @@
-use std::{
-  sync::atomic::{AtomicU64, Ordering},
-  time::Duration,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::task;
 use tracing::warn;
 use windows::{
   core::PWSTR,
@@ -574,33 +570,11 @@ impl NativeWindow {
 
     let flags = SWP_NOACTIVATE
       | SWP_NOCOPYBITS
-      | SWP_ASYNCWINDOWPOS
       | SWP_NOOWNERZORDER
       | SWP_NOMOVE
       | SWP_NOSIZE;
 
-    // Z-order can sometimes still be incorrect after the above call. Make
-    // the retry generation-aware so an older focus transition cannot
-    // replay after a newer z-order repair has completed.
-    let generation = current_or_new_z_order_generation();
-    let expected_foreground = (!matches!(z_order, WindowZOrder::TopMost))
-      .then(|| unsafe { GetForegroundWindow() });
     unsafe { SetWindowPos(self.hwnd(), z_order_hwnd, 0, 0, 0, 0, flags) }?;
-
-    let handle = self.handle;
-    task::spawn(async move {
-      tokio::time::sleep(Duration::from_millis(10)).await;
-      if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
-        || expected_foreground.is_some_and(|foreground| {
-          (unsafe { GetForegroundWindow() }) != foreground
-        })
-      {
-        return;
-      }
-      let _ = unsafe {
-        SetWindowPos(HWND(handle), z_order_hwnd, 0, 0, 0, 0, flags)
-      };
-    });
 
     Ok(())
   }
@@ -857,9 +831,9 @@ pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
 /// The first window is placed at the top of the normal z-order. Each
-/// subsequent window is placed immediately after the previous one. The
-/// delayed retry is generation-aware so a fast native-focus transition
-/// cannot replay an obsolete chain after a newer one has been requested.
+/// subsequent window is placed immediately after the previous one.
+/// Placement is synchronous so a later call cannot be overtaken by an
+/// older one.
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -867,24 +841,125 @@ pub(crate) fn reorder_z_order(
     return Ok(());
   }
 
-  let generation = next_z_order_generation();
-  apply_z_order_chain(window_ids)?;
+  let _ = next_z_order_generation();
+  apply_z_order_chain(window_ids)
+}
 
-  let window_ids = window_ids.to_vec();
-  let focused_window = window_ids[0];
-  task::spawn(async move {
-    tokio::time::sleep(Duration::from_millis(10)).await;
+#[cfg(test)]
+mod reorder_z_order_tests {
+  use std::os::windows::ffi::OsStrExt;
 
-    if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
-      || unsafe { GetForegroundWindow() } != HWND(focused_window.0)
-    {
-      return;
+  use windows::{
+    core::PCWSTR,
+    Win32::{
+      Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+      UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetTopWindow,
+        GetWindow, RegisterClassW, UnregisterClassW, GW_HWNDNEXT,
+        WINDOW_EX_STYLE, WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        WS_VISIBLE,
+      },
+    },
+  };
+
+  use super::reorder_z_order;
+  use crate::WindowId;
+
+  unsafe extern "system" fn reorder_test_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+  ) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+  }
+
+  fn wide(value: &str) -> Vec<u16> {
+    std::ffi::OsStr::new(value)
+      .encode_wide()
+      .chain(Some(0))
+      .collect()
+  }
+
+  /// Creates a visible top-level window. `topmost` reproduces a Snipping
+  /// Tool window left WS_EX_TOPMOST by a previous GlazeWM session.
+  fn create_test_window(class: &[u16], topmost: bool) -> HWND {
+    let title = wide("glazewm-z-order-test");
+    let ex_style = if topmost {
+      WS_EX_TOPMOST
+    } else {
+      WINDOW_EX_STYLE::default()
+    };
+    let hwnd = unsafe {
+      CreateWindowExW(
+        ex_style,
+        PCWSTR(class.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        40,
+        40,
+        160,
+        80,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create z-order test window");
+    hwnd
+  }
+
+  fn relative_order(targets: &[HWND]) -> Vec<isize> {
+    let mut order = Vec::new();
+    let mut hwnd = unsafe { GetTopWindow(None) };
+    while hwnd.0 != 0 {
+      if targets.iter().any(|target| target.0 == hwnd.0) {
+        order.push(hwnd.0);
+      }
+      hwnd = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
+    }
+    order
+  }
+
+  #[test]
+  fn reorder_z_order_sinks_a_topmost_window_to_the_bottom_of_the_chain() {
+    let class_name =
+      wide(&format!("GlazeWmZOrderTest{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&class) };
+    assert_ne!(atom, 0, "register z-order test class");
+
+    let visual_studio = create_test_window(&class_name, false);
+    let tiled = create_test_window(&class_name, false);
+    // Start topmost, which is the bad post-restart Snipping Tool state.
+    let snipping = create_test_window(&class_name, true);
+
+    let chain = [
+      WindowId(visual_studio.0),
+      WindowId(tiled.0),
+      WindowId(snipping.0),
+    ];
+    reorder_z_order(&chain).expect("reorder");
+
+    let order = relative_order(&[visual_studio, tiled, snipping]);
+    unsafe {
+      let _ = DestroyWindow(visual_studio);
+      let _ = DestroyWindow(tiled);
+      let _ = DestroyWindow(snipping);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
     }
 
-    let _ = apply_z_order_chain(&window_ids);
-  });
-
-  Ok(())
+    assert_eq!(
+      order,
+      vec![visual_studio.0, tiled.0, snipping.0],
+      "chain must be applied top-to-bottom, with the topmost ignored window sunk"
+    );
+  }
 }
 
 fn next_z_order_generation() -> u64 {
@@ -895,32 +970,15 @@ pub(crate) fn begin_z_order_batch() -> u64 {
   next_z_order_generation()
 }
 
-fn current_or_new_z_order_generation() -> u64 {
-  let generation = Z_ORDER_GENERATION.load(Ordering::SeqCst);
-  if generation == 0 {
-    next_z_order_generation()
-  } else {
-    generation
-  }
-}
-
 fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
+  // Synchronous. `SWP_ASYNCWINDOWPOS` lets the HWND_NOTOPMOST pass
+  // complete after the placement pass and park a previously topmost
+  // window (Snipping Tool after a restart) above the tiled group.
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
     | SWP_NOSIZE
-    | SWP_ASYNCWINDOWPOS
     | SWP_NOOWNERZORDER;
-
-  // A normal WM window must not retain a native TOPMOST bit from a
-  // previous state or an application-side z-order change. Demote the
-  // complete chain before rebuilding its order; HWND_TOP alone does not
-  // clear TOPMOST.
-  for window_id in window_ids {
-    unsafe {
-      SetWindowPos(HWND(window_id.0), HWND_NOTOPMOST, 0, 0, 0, 0, flags)
-    }?;
-  }
 
   for (index, window_id) in window_ids.iter().enumerate() {
     let insert_after = index
@@ -928,9 +986,13 @@ fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
       .and_then(|previous| window_ids.get(previous))
       .map_or(HWND_TOP, |previous| HWND(previous.0));
 
+    // HWND_TOP does not clear TOPMOST. Drop that bit, then immediately
+    // place the window. HWND_NOTOPMOST alone would leave it above every
+    // non-topmost window, which is the wrong band for an ignored window.
     unsafe {
-      SetWindowPos(HWND(window_id.0), insert_after, 0, 0, 0, 0, flags)
-    }?;
+      SetWindowPos(HWND(window_id.0), HWND_NOTOPMOST, 0, 0, 0, 0, flags)?;
+      SetWindowPos(HWND(window_id.0), insert_after, 0, 0, 0, 0, flags)?;
+    }
   }
 
   Ok(())

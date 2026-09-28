@@ -436,6 +436,42 @@ fn reorder_focused_workspace_layers(
   );
 }
 
+/// Records an ignored window as the top of the normal z-order.
+///
+/// Only that window moves. The tiled group stays one block, and every
+/// other detached or ignored window keeps its position relative to the
+/// block. Applied immediately so a later managed focus cannot replay
+/// the pre-Alt-Tab chain.
+#[cfg(target_os = "windows")]
+pub fn promote_ignored_window(
+  state: &mut WmState,
+  native_window: &wm_platform::NativeWindow,
+) {
+  let Some(workspace) = state
+    .nearest_monitor(native_window)
+    .and_then(|monitor| monitor.displayed_workspace())
+  else {
+    crate::commands::general::layout_debug_log(format!(
+      "ignored promote skipped; no workspace for {:?}",
+      native_window.id()
+    ));
+    return;
+  };
+
+  reorder_focused_workspace_layers_in_workspace(
+    &workspace,
+    native_window.id(),
+    state,
+  );
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn promote_ignored_window(
+  _state: &mut WmState,
+  _native_window: &wm_platform::NativeWindow,
+) {
+}
+
 #[cfg(target_os = "windows")]
 fn reorder_focused_workspace_layers_in_workspace(
   workspace: &Workspace,
@@ -489,7 +525,7 @@ fn reorder_focused_workspace_layers_in_workspace(
     ignored_window_ids
       .iter()
       .copied()
-      .map(|window_id| (window_id, NormalZOrderLayer::Floating)),
+      .map(|window_id| (window_id, NormalZOrderLayer::Ignored)),
   );
   let focused_layer = normal_windows
     .iter()
@@ -534,6 +570,9 @@ fn reorder_focused_workspace_layers_in_workspace(
 enum NormalZOrderLayer {
   Tiling,
   Floating,
+  /// Ignored windows such as Snipping Tool. Same promotion rule as
+  /// `Floating`: only the focused one moves.
+  Ignored,
 }
 
 /// Builds the normal-window z-order chain while treating all tiled windows
@@ -610,12 +649,20 @@ fn normal_z_order_chain(
       previous_or_focus_order.insert(0, focused_window_id);
       Some(previous_or_focus_order)
     }
+    // Same rule as a detached window: move only this window to the
+    // front. The tiled block and every other detached/ignored window
+    // stay where they are.
+    NormalZOrderLayer::Ignored => {
+      previous_or_focus_order
+        .retain(|window_id| *window_id != focused_window_id);
+      previous_or_focus_order.insert(0, focused_window_id);
+      Some(previous_or_focus_order)
+    }
   }?;
 
-  // A non-focused window can change layers while another window has focus.
-  // Normalize the result in that case too, otherwise a floating window
-  // that used to sit inside the tiled block can split the remaining
-  // tiled windows.
+  // Keep the tiled windows as one contiguous block at the slot of the
+  // first tile. This repairs a split block without moving a detached
+  // or ignored window past another one.
   let tiled_window_ids = current_windows
     .iter()
     .filter(|(_, layer)| *layer == NormalZOrderLayer::Tiling)
@@ -697,60 +744,72 @@ mod tests {
   }
 
   #[test]
-  fn e2e_ignored_window_stays_between_detached_and_tiled_after_alt_tab() {
-    let detached = window(1, NormalZOrderLayer::Floating);
-    let ignored = window(2, NormalZOrderLayer::Floating);
+  fn alt_tab_to_snipping_then_visual_studio_keeps_snipping_above_tiles() {
+    let visual_studio = window(1, NormalZOrderLayer::Floating);
+    let snipping = window(2, NormalZOrderLayer::Ignored);
     let tiled_a = window(3, NormalZOrderLayer::Tiling);
     let tiled_b = window(4, NormalZOrderLayer::Tiling);
+    let windows = vec![tiled_a, tiled_b, visual_studio, snipping];
 
-    // Native state immediately before Alt-Tab: Snipping Tool was focused
-    // over the tiled group. The detached window is then selected by
-    // Alt-Tab. The required final native order is:
-    //
-    //   detached > ignored > tiled group
+    // Tiles are focused. Snipping Tool is behind the tiled group.
+    let tiles_focused =
+      [tiled_a.0, tiled_b.0, visual_studio.0, snipping.0];
+
+    // Alt-Tab to Snipping Tool promotes only that window.
+    let snipping_focused = normal_z_order_chain(
+      windows.clone(),
+      snipping.0,
+      Some(&tiles_focused),
+    )
+    .expect("snipping focus");
     assert_eq!(
-      normal_z_order_chain(
-        vec![ignored, tiled_a, tiled_b, detached],
-        detached.0,
-        Some(&[ignored.0, tiled_a.0, tiled_b.0, detached.0]),
-      ),
-      Some(vec![detached.0, ignored.0, tiled_a.0, tiled_b.0])
+      snipping_focused,
+      vec![snipping.0, tiled_a.0, tiled_b.0, visual_studio.0]
+    );
+
+    // The next Alt-Tab lands on Visual Studio. Only Visual Studio
+    // moves. Snipping Tool stays above the tiled group.
+    let visual_studio_focused = normal_z_order_chain(
+      windows,
+      visual_studio.0,
+      Some(&snipping_focused),
+    )
+    .expect("visual studio focus");
+    assert_eq!(
+      visual_studio_focused,
+      vec![visual_studio.0, snipping.0, tiled_a.0, tiled_b.0]
     );
   }
 
   #[test]
-  fn e2e_returning_from_ignored_focus_keeps_ignored_above_tiled_group() {
-    let detached = window(1, NormalZOrderLayer::Floating);
-    let ignored = window(2, NormalZOrderLayer::Floating);
+  fn focusing_a_tiled_window_raises_the_group_without_reordering_peers() {
+    let visual_studio = window(1, NormalZOrderLayer::Floating);
+    let snipping = window(2, NormalZOrderLayer::Ignored);
     let tiled_a = window(3, NormalZOrderLayer::Tiling);
     let tiled_b = window(4, NormalZOrderLayer::Tiling);
 
-    // Snipping Tool is foreground immediately before Alt-Tab returns to
-    // detached Notepad. The ignored window must remain between Notepad and
-    // the tiled group after the managed focus event is processed.
+    // Visual Studio is in front, Snipping Tool is still above the tiles.
+    let before = [visual_studio.0, snipping.0, tiled_a.0, tiled_b.0];
     assert_eq!(
       normal_z_order_chain(
-        vec![ignored, detached, tiled_a, tiled_b],
-        detached.0,
-        Some(&[ignored.0, detached.0, tiled_a.0, tiled_b.0]),
+        vec![tiled_a, tiled_b, visual_studio, snipping],
+        tiled_a.0,
+        Some(&before),
       ),
-      Some(vec![detached.0, ignored.0, tiled_a.0, tiled_b.0])
+      Some(vec![tiled_a.0, tiled_b.0, visual_studio.0, snipping.0])
     );
   }
 
   #[test]
   fn e2e_leaving_ignored_focus_rejoins_ignored_before_detached_and_after_tiled(
   ) {
-    let ignored = window(1, NormalZOrderLayer::Floating);
+    let ignored = window(1, NormalZOrderLayer::Ignored);
     let tiled_a = window(2, NormalZOrderLayer::Tiling);
     let tiled_b = window(3, NormalZOrderLayer::Tiling);
     let detached = window(4, NormalZOrderLayer::Floating);
 
-    // Snipping Tool was foreground and may have acquired a native TOPMOST
-    // bit. Once Alt-Tab returns to a tiled window, the ignored HWND must
-    // be present in the reconciliation chain so the native reorder
-    // clears that bit and leaves the ignored window below the tiled
-    // group.
+    // Snipping Tool is above the detached window. Raising the tiled
+    // group keeps that peer order behind the group.
     assert_eq!(
       normal_z_order_chain(
         vec![ignored, tiled_a, tiled_b, detached],
@@ -765,7 +824,7 @@ mod tests {
   fn e2e_ignored_focus_preserves_detached_peer_order() {
     let notepad_one = window(1, NormalZOrderLayer::Floating);
     let notepad_two = window(2, NormalZOrderLayer::Floating);
-    let ignored = window(3, NormalZOrderLayer::Floating);
+    let ignored = window(3, NormalZOrderLayer::Ignored);
     let tiled_a = window(4, NormalZOrderLayer::Tiling);
     let tiled_b = window(5, NormalZOrderLayer::Tiling);
 
@@ -777,20 +836,42 @@ mod tests {
       tiled_b.0,
     ];
 
-    // The ignored focus event is a native-only transition, so it does not
-    // call normal_z_order_chain and leaves both Notepads untouched.
-    let after_ignored_focus = initial.to_vec();
-    assert_eq!(after_ignored_focus, initial);
+    // Alt-Tab to the ignored window promotes only that window. Neither
+    // Notepad moves relative to the tiled group.
+    let after_ignored_focus = normal_z_order_chain(
+      vec![notepad_one, notepad_two, ignored, tiled_a, tiled_b],
+      ignored.0,
+      Some(&initial),
+    )
+    .expect("ignored focus chain");
+    assert_eq!(
+      after_ignored_focus,
+      vec![
+        ignored.0,
+        notepad_one.0,
+        notepad_two.0,
+        tiled_a.0,
+        tiled_b.0,
+      ]
+    );
 
-    // Returning to either detached window promotes only that window. The
-    // other detached/ignored windows retain their existing relative order.
+    // Returning to either detached window promotes only that window.
     let after_notepad_one = normal_z_order_chain(
       vec![notepad_one, notepad_two, ignored, tiled_a, tiled_b],
       notepad_one.0,
       Some(&after_ignored_focus),
     )
     .expect("detached focus chain");
-    assert_eq!(after_notepad_one, initial);
+    assert_eq!(
+      after_notepad_one,
+      vec![
+        notepad_one.0,
+        ignored.0,
+        notepad_two.0,
+        tiled_a.0,
+        tiled_b.0,
+      ]
+    );
 
     let after_notepad_two = normal_z_order_chain(
       vec![notepad_two, notepad_one, ignored, tiled_a, tiled_b],
@@ -805,12 +886,12 @@ mod tests {
         notepad_one.0,
         ignored.0,
         tiled_a.0,
-        tiled_b.0
+        tiled_b.0,
       ]
     );
 
-    // Focusing a tiled window promotes the tiled group as one unit and
-    // preserves the detached/ignored order behind it.
+    // Focusing a tiled window raises the group as one window. The
+    // detached and ignored windows keep the order they already had.
     let after_tiled = normal_z_order_chain(
       vec![tiled_a, tiled_b, notepad_two, notepad_one, ignored],
       tiled_a.0,

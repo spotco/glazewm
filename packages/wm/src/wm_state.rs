@@ -87,6 +87,14 @@ pub struct WmState {
   /// `ignore` command.
   pub ignored_windows: Vec<NativeWindow>,
 
+  /// The next `platform_sync` must reconcile z-order even if an ignored
+  /// window currently owns native foreground.
+  ///
+  /// Set for the initial load. A restart can leave Snipping Tool
+  /// foreground and above the tiled group; the normal suspension would
+  /// otherwise skip the repair.
+  startup_z_order_pending: bool,
+
   /// Ignored window that currently owns native foreground.
   ///
   /// Logical focus stays on the last managed container. While this is
@@ -136,6 +144,7 @@ impl WmState {
       show_desktop_snapshot: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
+      startup_z_order_pending: false,
       ignored_native_foreground: None,
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
       layout_history: LayoutHistory::default(),
@@ -207,7 +216,11 @@ impl WmState {
       self.pending_sync.queue_workspace_to_reorder(workspace);
     }
 
+    self.startup_z_order_pending = true;
     platform_sync(self, config)?;
+    crate::commands::general::layout_debug_log(
+      "startup: z-order reconciled after initial window load",
+    );
     self.has_initialized = true;
 
     Ok(())
@@ -821,6 +834,9 @@ impl WmState {
     self.ignored_native_foreground = Some(window_id);
     self.pending_sync.cancel_foreground_assertions();
     self.invalidate_pending_z_order_retries();
+    // Promote after cancelling stale work, so the saved chain matches
+    // the window the user just Alt-Tabbed to.
+    crate::commands::general::promote_ignored_window(self, native_window);
 
     if dropped_foreground_work {
       crate::commands::general::layout_debug_log(format!(
@@ -838,6 +854,15 @@ impl WmState {
   /// foreground. An unrelated unmanaged foreground window does not clear
   /// the flag; only a managed window or the desktop does.
   pub fn ignored_foreground_suspends_z_order(&mut self) -> bool {
+    if self.startup_z_order_pending {
+      self.startup_z_order_pending = false;
+      self.ignored_native_foreground = None;
+      crate::commands::general::layout_debug_log(
+        "startup: forcing z-order reconcile over ignored foreground",
+      );
+      return false;
+    }
+
     if let Ok(foreground) = self.dispatcher.focused_window() {
       if self
         .ignored_windows
@@ -1214,5 +1239,22 @@ mod tests {
 
     assert_eq!(target.id(), p4v.id());
     assert_ne!(target.id(), visual_studio.id());
+  }
+
+  #[test]
+  fn startup_z_order_reconcile_is_not_suspended() {
+    let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(dispatcher, event_tx, exit_tx);
+    state
+      .ignored_windows
+      .push(NativeWindow::from_handle(2688654));
+    state.ignored_native_foreground = Some(WindowId(2688654));
+    state.startup_z_order_pending = true;
+
+    assert!(!state.ignored_foreground_suspends_z_order());
+    assert!(!state.startup_z_order_pending);
+    assert_eq!(state.ignored_native_foreground, None);
   }
 }
