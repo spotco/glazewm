@@ -8,7 +8,8 @@ use tokio::sync::mpsc::{self};
 use tracing::warn;
 use uuid::Uuid;
 use wm_common::{
-  BindingModeConfig, HideCorner, TilingDirection, WindowState, WmEvent,
+  BindingModeConfig, HideCorner, LayoutSnapshot, TilingDirection,
+  WindowState, WmEvent,
 };
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
@@ -62,8 +63,10 @@ pub struct WmState {
   /// Used to decide whether to override incoming focus events.
   pub unmanaged_or_minimized_timestamp: Option<Instant>,
 
-  /// Windows natively minimized by Show Desktop while their WM tree state
-  /// is intentionally preserved.
+  /// Windows natively minimized by the active Show Desktop session. Their
+  /// logical minimized transitions may temporarily simplify the live
+  /// tree; the session snapshot restores the original topology
+  /// afterward.
   show_desktop_minimized: HashSet<Uuid>,
 
   /// Last intended normal-window z-order for each workspace, top to
@@ -71,6 +74,11 @@ pub struct WmState {
   /// focus changes promote only the selected detached window while
   /// preserving the rest of the existing stack.
   normal_z_order_by_workspace: HashMap<Uuid, Vec<Uuid>>,
+
+  /// Layout captured before Show Desktop temporarily minimizes managed
+  /// windows. The snapshot is used to rebuild the exact tree after the
+  /// last Show Desktop window is restored.
+  show_desktop_snapshot: Option<LayoutSnapshot>,
 
   /// Configs of currently enabled binding modes.
   pub binding_modes: Vec<BindingModeConfig>,
@@ -116,6 +124,7 @@ impl WmState {
       unmanaged_or_minimized_timestamp: None,
       show_desktop_minimized: HashSet::new(),
       normal_z_order_by_workspace: HashMap::new(),
+      show_desktop_snapshot: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
@@ -603,6 +612,26 @@ impl WmState {
 
   pub fn clear_show_desktop_minimized(&mut self, window_id: Uuid) {
     self.show_desktop_minimized.remove(&window_id);
+  }
+
+  pub fn show_desktop_minimized_count(&self) -> usize {
+    self.show_desktop_minimized.len()
+  }
+
+  pub fn show_desktop_session_active(&self) -> bool {
+    self.show_desktop_snapshot.is_some()
+  }
+
+  pub fn begin_show_desktop_session(&mut self, snapshot: LayoutSnapshot) {
+    self.show_desktop_snapshot = Some(snapshot);
+  }
+
+  pub fn take_show_desktop_snapshot(&mut self) -> Option<LayoutSnapshot> {
+    self.show_desktop_snapshot.take()
+  }
+
+  pub fn clear_show_desktop_session(&mut self) {
+    self.show_desktop_snapshot = None;
   }
 
   pub fn normal_z_order_for_workspace(

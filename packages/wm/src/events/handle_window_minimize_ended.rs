@@ -3,7 +3,9 @@ use wm_common::{try_warn, WindowState};
 use wm_platform::NativeWindow;
 
 use crate::{
-  commands::window::update_window_state,
+  commands::{
+    general::restore_show_desktop_layout, window::update_window_state,
+  },
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
@@ -26,6 +28,20 @@ pub fn handle_window_minimize_ended(
 
     if !is_minimized && state.is_show_desktop_minimized(window.id()) {
       state.clear_show_desktop_minimized(window.id());
+
+      let target_state = window
+        .prev_state()
+        .filter(|state| *state != WindowState::Minimized)
+        .unwrap_or(WindowState::default_from_config(&config.value));
+
+      if window.state() == WindowState::Minimized {
+        info!("Show Desktop minimize ended: {window}");
+        update_window_state(window.clone(), target_state, state, config)?;
+      }
+
+      if state.show_desktop_minimized_count() == 0 {
+        restore_show_desktop_layout(state, config)?;
+      }
     } else if !is_minimized && window.state() == WindowState::Minimized {
       info!("Window minimize ended: {window}");
 

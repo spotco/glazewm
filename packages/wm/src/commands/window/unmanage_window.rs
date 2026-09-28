@@ -16,6 +16,13 @@ pub fn unmanage_window(
   window: WindowContainer,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
+  // A window can be destroyed while it is part of a Show Desktop session.
+  // Do not leave a dead window keeping that transient session alive.
+  state.clear_show_desktop_minimized(window.id());
+  if state.show_desktop_minimized_count() == 0 {
+    state.clear_show_desktop_session();
+  }
+
   state.layout_history.clear("window unmanaged");
   // Create iterator of parent, grandparent, and great-grandparent.
   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
