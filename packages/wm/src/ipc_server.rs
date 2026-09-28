@@ -34,6 +34,11 @@ use crate::{
 };
 
 pub struct IpcServer {
+  /// Whether a localhost listener is running.
+  ///
+  /// `false` after a bind failure. The window manager still starts.
+  enabled: bool,
+
   /// Accept-loop task. Prefer joining on shutdown so `TcpListener` Drop
   /// runs synchronously before process exit (abort races Drop and can
   /// ghost ports).
@@ -54,13 +59,42 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-  pub async fn start(dispatcher: &Dispatcher) -> anyhow::Result<Self> {
+  /// Starts the localhost IPC listener.
+  ///
+  /// A bind failure is logged at error level, shown in a dialog, and
+  /// returned as a disabled server so startup can continue.
+  pub async fn start(dispatcher: &Dispatcher) -> Self {
     let (message_tx, message_rx) = mpsc::unbounded_channel();
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (unsubscribe_tx, _unsubscribe_rx) = broadcast::channel(16);
 
     let (server, server_addr) =
-      crate::ipc_conflict::bind_ipc_listener(dispatcher).await?;
+      match crate::ipc_conflict::bind_ipc_listener().await {
+        Ok(bound) => bound,
+        Err(err) => {
+          let msg = format!(
+            "startup: IPC disabled, continuing without it: {err:#}"
+          );
+          tracing::error!("{msg}");
+          crate::commands::general::layout_debug_log(&msg);
+          dispatcher.show_error_dialog(
+            "GlazeWM - IPC disabled",
+            &format!(
+              "{err:#}\n\n\
+               GlazeWM will keep running, but IPC is disabled.\n\
+               Zebar and glazewm-cli cannot connect until this port \
+               is free and GlazeWM is restarted."
+            ),
+          );
+          return Self::disabled(
+            message_rx,
+            event_tx,
+            _event_rx,
+            unsubscribe_tx,
+            _unsubscribe_rx,
+          );
+        }
+      };
     info!("IPC server started on: '{}'.", server_addr);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -77,6 +111,15 @@ impl IpcServer {
           accept = server.accept() => {
             match accept {
               Ok((stream, addr)) => {
+                if !crate::ipc_conflict::is_localhost_ip(addr.ip()) {
+                  let rejected = format!(
+                    "IPC rejected non-localhost connection from {addr}"
+                  );
+                  warn!("{rejected}");
+                  crate::commands::general::layout_debug_log(&rejected);
+                  drop(stream);
+                  continue;
+                }
                 let message_tx = message_tx.clone();
                 task::spawn(async move {
                   if let Err(err) =
@@ -96,7 +139,8 @@ impl IpcServer {
       }
     });
 
-    Ok(Self {
+    Self {
+      enabled: true,
       join_handle: Some(task),
       shutdown_tx: Some(shutdown_tx),
       #[allow(clippy::used_underscore_binding)]
@@ -106,7 +150,36 @@ impl IpcServer {
       unsubscribe_tx,
       #[allow(clippy::used_underscore_binding)]
       _unsubscribe_rx,
-    })
+    }
+  }
+
+  /// Returns whether clients can connect.
+  #[must_use]
+  pub fn is_enabled(&self) -> bool {
+    self.enabled
+  }
+
+  fn disabled(
+    message_rx: mpsc::UnboundedReceiver<(
+      String,
+      mpsc::UnboundedSender<Message>,
+      broadcast::Sender<()>,
+    )>,
+    event_tx: broadcast::Sender<(SubscribableEvent, WmEvent)>,
+    _event_rx: broadcast::Receiver<(SubscribableEvent, WmEvent)>,
+    unsubscribe_tx: broadcast::Sender<Uuid>,
+    _unsubscribe_rx: broadcast::Receiver<Uuid>,
+  ) -> Self {
+    Self {
+      enabled: false,
+      join_handle: None,
+      shutdown_tx: None,
+      message_rx,
+      _event_rx,
+      event_tx,
+      unsubscribe_tx,
+      _unsubscribe_rx,
+    }
   }
 
   async fn handle_connection(
@@ -619,6 +692,12 @@ impl IpcServer {
   /// with no process). Soft wm-exit must always take this path; taskkill
   /// /F cannot free ghosts.
   pub async fn stop_and_wait(&mut self) {
+    if !self.enabled {
+      crate::commands::general::layout_debug_log(
+        "wm-exit: IPC was disabled; no listener to drop",
+      );
+      return;
+    }
     let started = std::time::Instant::now();
     crate::commands::general::layout_debug_log(
       "wm-exit: IPC listener drop start",

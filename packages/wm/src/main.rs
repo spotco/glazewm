@@ -115,9 +115,11 @@ async fn start_wm(
   dispatcher: &Dispatcher,
 ) -> anyhow::Result<()> {
   setup_logging(&verbosity)?;
+  tracing::info!("startup: logging ready");
 
   // Ensure that only one instance of the WM is running.
   let _single_instance = SingleInstance::new()?;
+  tracing::info!("startup: single instance lock acquired");
 
   #[cfg(target_os = "macos")]
   {
@@ -141,39 +143,74 @@ async fn start_wm(
     "Layout persistence debug log -> {}",
     layout_log_path.display()
   );
-  crate::commands::general::layout_debug_log(format!(
-    "layout persistence debug log ready -> {}",
+  startup_log(format!(
+    "startup: config loaded from {}",
+    config.path.display()
+  ));
+  startup_log(format!(
+    "startup: layout log -> {}",
     layout_log_path.display()
   ));
 
   #[cfg(target_os = "windows")]
-  match dispatcher.cleanup_taskbar_helper_windows() {
-    Ok(0) => {}
-    Ok(count) => tracing::info!(
-      "Removed {count} stale taskbar tab(s) from shell/input helpers."
-    ),
-    Err(err) => tracing::warn!(
-      "Failed to clean shell/input-helper taskbar tabs: {err:?}"
-    ),
+  {
+    startup_log("startup: cleaning taskbar helper windows");
+    match dispatcher.cleanup_taskbar_helper_windows() {
+      Ok(count) => {
+        startup_log(format!(
+          "startup: taskbar helper cleanup removed {count} window(s)"
+        ));
+      }
+      Err(err) => {
+        tracing::warn!(
+          "Failed to clean shell/input-helper taskbar tabs: {err:?}"
+        );
+        startup_log(format!(
+          "startup: taskbar helper cleanup failed: {err:?}"
+        ));
+      }
+    }
   }
 
   // Add application icon to system tray.
+  startup_log("startup: creating system tray");
   let mut tray = SystemTray::new(&config.path, dispatcher.clone())?;
+  startup_log("startup: system tray ready");
 
+  startup_log("startup: populating window manager state");
   let mut wm = WindowManager::new(&mut config, dispatcher.clone())?;
+  startup_log(format!(
+    "startup: window manager ready monitors={} windows={}",
+    wm.state.monitors().len(),
+    wm.state.windows().len()
+  ));
 
-  let mut ipc_server = IpcServer::start(dispatcher).await?;
+  let mut ipc_server = IpcServer::start(dispatcher).await;
+  if ipc_server.is_enabled() {
+    startup_log("startup: IPC listener is accepting localhost clients");
+  } else {
+    startup_log("startup: IPC listener is disabled");
+  }
 
   // On Windows, start watcher process for restoring hidden windows on
-  // crash. macOS' hidden windows are always accessible.
+  // crash. macOS' hidden windows are always accessible. The watcher is
+  // an IPC client, so it cannot run when IPC failed to bind.
   #[cfg(target_os = "windows")]
-  if let Err(err) = start_watcher_process() {
-    tracing::warn!(
-      "Failed to start watcher process: {err}{}",
-      cfg!(debug_assertions)
-        .then_some(".\n Run `cargo build -p wm-watcher` to build it.")
-        .unwrap_or_default()
-    );
+  if ipc_server.is_enabled() {
+    startup_log("startup: launching watcher");
+    if let Err(err) = start_watcher_process() {
+      tracing::warn!(
+        "Failed to start watcher process: {err}{}",
+        cfg!(debug_assertions)
+          .then_some(".\n Run `cargo build -p wm-watcher` to build it.")
+          .unwrap_or_default()
+      );
+      startup_log(format!("startup: watcher failed: {err}"));
+    } else {
+      startup_log("startup: watcher launched");
+    }
+  } else {
+    startup_log("startup: watcher skipped because IPC is disabled");
   }
 
   // On macOS, update the current process' PATH variable so that
@@ -185,6 +222,7 @@ async fn start_wm(
   }
 
   // Start listening for platform events after populating initial state.
+  startup_log("startup: creating platform listeners");
   let mut window_listener = WindowListener::new(dispatcher)?;
   let mut display_listener = DisplayListener::new(dispatcher)?;
   let mut mouse_listener = MouseListener::new(
@@ -202,8 +240,13 @@ async fn start_wm(
       .collect::<Vec<_>>(),
     dispatcher,
   )?;
+  startup_log("startup: platform listeners ready");
 
   // Run user's startup commands.
+  startup_log(format!(
+    "startup: running {} startup command(s)",
+    config.value.general.startup_commands.len()
+  ));
   if let Err(err) = wm.process_commands(
     &config.value.general.startup_commands.clone(),
     None,
@@ -211,6 +254,9 @@ async fn start_wm(
   ) {
     tracing::error!("{:?}", err);
     dispatcher.show_error_dialog("Non-fatal error", &err.to_string());
+    startup_log(format!("startup: startup commands failed: {err:#}"));
+  } else {
+    startup_log("startup: startup commands finished");
   }
 
   // Best-effort restore of persisted layout.json (beside config.yaml).
@@ -219,6 +265,7 @@ async fn start_wm(
   // populate() are absent from the first pass — schedule deferred
   // retries after the event loop can manage late arrivals
   // (WindowManaged), plus timed retries.
+  startup_log("startup: layout restore starting");
   let first_load = try_load_persisted_layout_snapshot(
     &layout_path,
     &mut wm.state,
@@ -292,6 +339,8 @@ async fn start_wm(
 
   // Create an interval for periodically cleaning up invalid windows.
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
+
+  startup_log("startup: entering event loop");
 
   loop {
     let res = tokio::select! {
@@ -550,6 +599,13 @@ async fn start_wm(
   wm.cleanup(&mut config, &mut ipc_server);
 
   Ok(())
+}
+
+/// Writes one startup step to tracing and `layout.log`.
+fn startup_log(message: impl AsRef<str>) {
+  let message = message.as_ref();
+  tracing::info!("{message}");
+  crate::commands::general::layout_debug_log(message);
 }
 
 /// Initialize logging with the specified verbosity level.
