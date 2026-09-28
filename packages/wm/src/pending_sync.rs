@@ -171,8 +171,4 @@ impl PendingSync {
       .get(&workspace.id())
       .copied()
   }
-
-  pub fn focused_windows_to_bring_to_front(&self) -> &HashMap<Uuid, Uuid> {
-    &self.focused_windows_to_bring_to_front
-  }
 }

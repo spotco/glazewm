@@ -14,6 +14,8 @@ use wm_platform::reorder_z_order;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
 #[cfg(target_os = "windows")]
+use wm_platform::WindowId;
+#[cfg(target_os = "windows")]
 use wm_platform::{CornerStyle, OpacityValue};
 use wm_platform::{Rect, WindowZOrder};
 
@@ -210,6 +212,13 @@ fn redraw_containers(
   let windows_to_redraw = state.windows_to_redraw();
   let windows_to_bring_to_front =
     windows_to_bring_to_front(focused_container, state)?;
+  let focused_window_was_just_detached =
+    focused_container.as_window_container().is_ok_and(|window| {
+      windows_to_redraw.contains(&window)
+        && window
+          .prev_state()
+          .is_some_and(|state| matches!(state, WindowState::Tiling))
+    });
 
   let windows_to_update = {
     let mut windows = windows_to_redraw
@@ -372,47 +381,63 @@ fn redraw_containers(
   }
 
   #[cfg(target_os = "windows")]
-  reorder_targeted_floating_focus(state);
+  reorder_focused_workspace_layers(
+    focused_container,
+    focused_window_was_just_detached,
+  );
 
   Ok(())
 }
 
-/// Restores the normal floating/tiling layers after a native focus event.
+/// Restores the normal floating/tiling layers after a focus or state
+/// change.
 ///
-/// Windows activation raises the selected floating window, but it does not
-/// lower floating peers that GlazeWM may have previously grouped above the
-/// tiling layer. Rebuild the relevant order as:
+/// Normal detached windows are individual z-order items. Tiled windows are
+/// treated as one z-order group. Focusing a detached window promotes only
+/// that window, while focusing a tiled window promotes the complete tiled
+/// group. This prevents a detached focus event from pushing its peers
+/// behind the tiled layer.
 ///
-///   selected floating > tiling windows > other normal floating windows
-///
-/// Explicitly always-on-top windows are left untouched.
+/// When a focused tiled window is detached, the newly detached window is
+/// promoted while the remaining tiled group keeps its position relative to
+/// the other detached windows.
 #[cfg(target_os = "windows")]
-fn reorder_targeted_floating_focus(state: &WmState) {
-  for (workspace_id, focused_window_id) in
-    state.pending_sync.focused_windows_to_bring_to_front()
-  {
-    let Some(workspace) = state
-      .workspaces()
-      .into_iter()
-      .find(|workspace| workspace.id() == *workspace_id)
-    else {
-      continue;
-    };
+fn reorder_focused_workspace_layers(
+  focused_container: &Container,
+  focused_window_was_just_detached: bool,
+) {
+  let Some(workspace) = focused_container.workspace() else {
+    return;
+  };
 
-    reorder_targeted_floating_focus_in_workspace(
-      &workspace,
-      *focused_window_id,
-    );
+  if !workspace.is_displayed() {
+    return;
   }
+
+  let Some(focused_window_id) = workspace
+    .descendant_focus_order()
+    .next()
+    .and_then(|container| container.as_window_container().ok())
+    .map(|window| window.id())
+  else {
+    return;
+  };
+
+  reorder_focused_workspace_layers_in_workspace(
+    &workspace,
+    focused_window_id,
+    focused_window_was_just_detached,
+  );
 }
 
 #[cfg(target_os = "windows")]
-fn reorder_targeted_floating_focus_in_workspace(
+fn reorder_focused_workspace_layers_in_workspace(
   workspace: &Workspace,
   focused_window_id: Uuid,
+  focused_window_was_just_detached: bool,
 ) {
-  let windows = workspace
-    .descendants()
+  let ordered_windows = workspace
+    .descendant_focus_order()
     .filter_map(|container| container.as_window_container().ok())
     .filter(|window| {
       matches!(
@@ -420,57 +445,152 @@ fn reorder_targeted_floating_focus_in_workspace(
         DisplayState::Showing | DisplayState::Shown
       )
     })
-    .collect::<Vec<_>>();
+    .filter_map(|window| {
+      let layer = match window.state() {
+        WindowState::Tiling => NormalZOrderLayer::Tiling,
+        WindowState::Floating(config) if !config.shown_on_top => {
+          NormalZOrderLayer::Floating
+        }
+        _ => return None,
+      };
 
-  if !workspace.is_displayed() {
-    return;
-  }
-
-  let Some(focused_window) = windows
-    .iter()
-    .find(|window| window.id() == focused_window_id)
-  else {
-    return;
-  };
-
-  let WindowState::Floating(focused_config) = focused_window.state()
-  else {
-    return;
-  };
-
-  if focused_config.shown_on_top {
-    return;
-  }
-
-  let tiling_windows = windows
-    .iter()
-    .filter(|window| matches!(window.state(), WindowState::Tiling))
-    .collect::<Vec<_>>();
-
-  let other_floating_windows = windows
-    .iter()
-    .filter(|window| {
-      window.id() != focused_window_id
-        && matches!(
-          window.state(),
-          WindowState::Floating(config) if !config.shown_on_top
-        )
+      Some((window.native().id(), window.id(), layer))
     })
     .collect::<Vec<_>>();
 
-  let mut window_ids = vec![focused_window.native().id()];
-  window_ids
-    .extend(tiling_windows.iter().map(|window| window.native().id()));
-  window_ids.extend(
-    other_floating_windows
-      .iter()
-      .map(|window| window.native().id()),
-  );
+  let Some(window_ids) = normal_z_order_chain(
+    ordered_windows,
+    focused_window_id,
+    focused_window_was_just_detached,
+  ) else {
+    return;
+  };
 
   if let Err(err) = reorder_z_order(&window_ids) {
     tracing::warn!(
-      "Failed to reorder natively focused floating window chain: {}",
+      "Failed to reorder focused workspace window layers: {}",
       err
+    );
+  }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NormalZOrderLayer {
+  Tiling,
+  Floating,
+}
+
+/// Builds the normal-window z-order chain while treating all tiled windows
+/// as one group.
+///
+/// `ordered_windows` is in most-recent-focus order. A focused floating
+/// window normally moves ahead of its floating peers, which remain ahead
+/// of the tiled group. A just-detached focused window is the exception:
+/// its former tiled group remains ahead of the other floating peers,
+/// preserving the group's previous position in the stack.
+#[cfg(target_os = "windows")]
+fn normal_z_order_chain(
+  ordered_windows: Vec<(WindowId, Uuid, NormalZOrderLayer)>,
+  focused_window_id: Uuid,
+  focused_window_was_just_detached: bool,
+) -> Option<Vec<WindowId>> {
+  let focused_layer = ordered_windows
+    .iter()
+    .find(|(_, window_id, _)| *window_id == focused_window_id)
+    .map(|(_, _, layer)| *layer)?;
+
+  let mut focused_window = Vec::new();
+  let mut other_same_layer = Vec::new();
+  let mut other_floating = Vec::new();
+  let mut other_tiling = Vec::new();
+
+  for (native_id, window_id, layer) in ordered_windows {
+    if window_id == focused_window_id {
+      focused_window.push(native_id);
+    } else if layer == focused_layer {
+      other_same_layer.push(native_id);
+    } else if layer == NormalZOrderLayer::Floating {
+      other_floating.push(native_id);
+    } else {
+      other_tiling.push(native_id);
+    }
+  }
+
+  match focused_layer {
+    NormalZOrderLayer::Tiling => {
+      focused_window.extend(other_same_layer);
+      focused_window.extend(other_floating);
+      focused_window.extend(other_tiling);
+    }
+    NormalZOrderLayer::Floating if focused_window_was_just_detached => {
+      focused_window.extend(other_tiling);
+      focused_window.extend(other_same_layer);
+    }
+    NormalZOrderLayer::Floating => {
+      focused_window.extend(other_same_layer);
+      focused_window.extend(other_tiling);
+    }
+  }
+
+  Some(focused_window)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+  use super::*;
+
+  fn window(
+    id: isize,
+    layer: NormalZOrderLayer,
+  ) -> (WindowId, Uuid, NormalZOrderLayer) {
+    (
+      WindowId(id),
+      Uuid::from_u128(id.unsigned_abs() as u128),
+      layer,
+    )
+  }
+
+  #[test]
+  fn tiled_windows_are_one_z_order_group() {
+    let d1 = window(1, NormalZOrderLayer::Floating);
+    let d2 = window(2, NormalZOrderLayer::Floating);
+    let w3 = window(3, NormalZOrderLayer::Tiling);
+    let w4 = window(4, NormalZOrderLayer::Tiling);
+
+    // Alt-Tab to detached Window2: only that detached window is promoted.
+    assert_eq!(
+      normal_z_order_chain(vec![d2, d1, w3, w4], d2.1, false,),
+      Some(vec![d2.0, d1.0, w3.0, w4.0])
+    );
+
+    // Alt-Tab to tiled Window3: the complete tiled group is promoted.
+    assert_eq!(
+      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1, false,),
+      Some(vec![w3.0, w4.0, d2.0, d1.0])
+    );
+  }
+
+  #[test]
+  fn detaching_a_tiled_focus_preserves_the_group_position() {
+    let d1 = window(1, NormalZOrderLayer::Floating);
+    let d2 = window(2, NormalZOrderLayer::Floating);
+    let d3 = window(3, NormalZOrderLayer::Floating);
+    let w4 = window(4, NormalZOrderLayer::Tiling);
+
+    // Window3 was the focused tiled window and is now detached. It moves
+    // to the front, while the remaining tiled group stays ahead of old
+    // peers.
+    assert_eq!(
+      normal_z_order_chain(vec![d3, w4, d2, d1], d3.1, true,),
+      Some(vec![d3.0, w4.0, d2.0, d1.0])
+    );
+
+    // Reattaching Window3 makes it part of the tiled group again.
+    let w3 = window(3, NormalZOrderLayer::Tiling);
+    assert_eq!(
+      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1, false,),
+      Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
 }
