@@ -62,6 +62,31 @@ impl PendingSync {
     self
   }
 
+  /// Whether pending work would reassert logical focus or z-order.
+  ///
+  /// Geometry redraws are excluded. Those can still run while an ignored
+  /// window owns native foreground, but they must not change z-order.
+  pub fn has_foreground_assertions(&self) -> bool {
+    !self.workspaces_to_reorder.is_empty()
+      || !self.focused_windows_to_bring_to_front.is_empty()
+      || self.needs_focus_update
+      || self.needs_focused_effect_update
+      || self.needs_cursor_jump
+  }
+
+  /// Drops work that would steal native foreground or rebuild z-order.
+  ///
+  /// Geometry redraws and full effect resets are preserved. The next
+  /// managed focus event queues a fresh reconciliation.
+  pub fn cancel_foreground_assertions(&mut self) -> &mut Self {
+    self.workspaces_to_reorder.clear();
+    self.focused_windows_to_bring_to_front.clear();
+    self.needs_focus_update = false;
+    self.needs_focused_effect_update = false;
+    self.needs_cursor_jump = false;
+    self
+  }
+
   pub fn queue_container_to_redraw<T>(&mut self, container: T) -> &mut Self
   where
     T: Into<Container>,

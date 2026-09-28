@@ -1,7 +1,5 @@
 use anyhow::Context;
 #[cfg(target_os = "windows")]
-use uuid::Uuid;
-#[cfg(target_os = "windows")]
 use wm_common::WindowEffectConfig;
 use wm_common::{
   CursorJumpTrigger, DisplayState, HideCorner, HideMethod, UniqueExt,
@@ -12,9 +10,11 @@ use wm_platform::begin_z_order_batch;
 #[cfg(target_os = "windows")]
 use wm_platform::reorder_z_order;
 #[cfg(target_os = "windows")]
-use wm_platform::NativeWindowWindowsExt;
+use wm_platform::SWP_NOZORDER;
 #[cfg(target_os = "windows")]
 use wm_platform::{CornerStyle, OpacityValue};
+#[cfg(target_os = "windows")]
+use wm_platform::{NativeWindowWindowsExt, WindowId};
 use wm_platform::{Rect, WindowZOrder};
 
 use crate::{
@@ -28,22 +28,24 @@ pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  let suspend_z_order = state.ignored_foreground_suspends_z_order();
   let focused_container = state
     .native_focus_target()
     .context("No focused container.")?;
 
-  if state.pending_sync.needs_focus_update() {
+  if state.pending_sync.needs_focus_update() && !suspend_z_order {
     sync_focus(&focused_container, state)?;
   }
 
   if !state.pending_sync.containers_to_redraw().is_empty()
     || !state.pending_sync.workspaces_to_reorder().is_empty()
   {
-    redraw_containers(&focused_container, state, config)?;
+    redraw_containers(&focused_container, state, config, suspend_z_order)?;
   }
 
   if state.pending_sync.needs_cursor_jump()
     && config.value.general.cursor_jump.enabled
+    && !suspend_z_order
   {
     jump_cursor(focused_container.clone(), state, config)?;
   }
@@ -204,6 +206,7 @@ fn redraw_containers(
   focused_container: &Container,
   state: &mut WmState,
   config: &UserConfig,
+  preserve_z_order: bool,
 ) -> anyhow::Result<()> {
   #[cfg(target_os = "windows")]
   let _ = begin_z_order_batch();
@@ -285,7 +288,10 @@ fn redraw_containers(
     // NOTE: macOS doesn't have a robust public API for setting the z-order
     // of a window. See `NativeWindow::raise` for more details.
     #[cfg(target_os = "windows")]
-    if should_bring_to_front && !windows_to_redraw.contains(window) {
+    if !preserve_z_order
+      && should_bring_to_front
+      && !windows_to_redraw.contains(window)
+    {
       let has_targeted_floating_focus = state
         .pending_sync
         .focused_window_to_bring_to_front(&workspace)
@@ -334,6 +340,7 @@ fn redraw_containers(
       &z_order,
       is_visible,
       is_show_desktop_minimized,
+      preserve_z_order,
       config,
     ) {
       tracing::warn!("Failed to set window position: {}", err);
@@ -381,7 +388,9 @@ fn redraw_containers(
   }
 
   #[cfg(target_os = "windows")]
-  reorder_focused_workspace_layers(focused_container, state);
+  if !preserve_z_order {
+    reorder_focused_workspace_layers(focused_container, state);
+  }
 
   Ok(())
 }
@@ -415,7 +424,7 @@ fn reorder_focused_workspace_layers(
     .descendant_focus_order()
     .next()
     .and_then(|container| container.as_window_container().ok())
-    .map(|window| window.id())
+    .map(|window| window.native().id())
   else {
     return;
   };
@@ -430,10 +439,10 @@ fn reorder_focused_workspace_layers(
 #[cfg(target_os = "windows")]
 fn reorder_focused_workspace_layers_in_workspace(
   workspace: &Workspace,
-  focused_window_id: Uuid,
+  focused_window_id: WindowId,
   state: &mut WmState,
 ) {
-  let ordered_windows = workspace
+  let mut normal_windows = workspace
     .descendant_focus_order()
     .filter_map(|container| container.as_window_container().ok())
     .filter(|window| {
@@ -452,41 +461,65 @@ fn reorder_focused_workspace_layers_in_workspace(
         _ => return None,
       };
 
-      Some((window.native().id(), window.id(), layer))
+      Some((window.native().id(), layer))
     })
     .collect::<Vec<_>>();
 
-  let current_windows = ordered_windows
+  let workspace_monitor_id =
+    workspace.monitor().map(|monitor| monitor.id());
+  let ignored_window_ids = state
+    .ignored_windows
     .iter()
-    .map(|(_, window_id, layer)| (*window_id, *layer))
+    .filter(|window| {
+      window.is_valid()
+        && window.is_visible().unwrap_or(false)
+        && state.nearest_monitor(window).is_some_and(|monitor| {
+          workspace_monitor_id == Some(monitor.id())
+        })
+    })
+    .map(|window| window.id())
     .collect::<Vec<_>>();
+
+  // Ignored windows are native detached windows from the z-order manager's
+  // perspective. Their native focus events are intentionally no-ops, so
+  // they only enter this chain when a managed window owns focus. They
+  // share the Floating layer with detached managed windows and therefore
+  // retain the same relative-order rules.
+  normal_windows.extend(
+    ignored_window_ids
+      .iter()
+      .copied()
+      .map(|window_id| (window_id, NormalZOrderLayer::Floating)),
+  );
+  let focused_layer = normal_windows
+    .iter()
+    .find(|(window_id, _)| *window_id == focused_window_id)
+    .map(|(_, layer)| *layer);
   let previous_order = state
     .normal_z_order_for_workspace(workspace.id())
-    .map(<[Uuid]>::to_vec);
+    .map(<[WindowId]>::to_vec);
 
   let Some(window_ids) = normal_z_order_chain(
-    current_windows,
+    normal_windows,
     focused_window_id,
     previous_order.as_deref(),
   ) else {
     return;
   };
 
-  let native_window_ids = window_ids
-    .iter()
-    .filter_map(|window_id| {
-      ordered_windows
-        .iter()
-        .find(|(_, id, _)| id == window_id)
-        .map(|(native_id, _, _)| *native_id)
-    })
-    .collect::<Vec<_>>();
-
-  if native_window_ids.len() != window_ids.len() {
-    return;
-  }
-
   state.set_normal_z_order_for_workspace(workspace.id(), window_ids);
+  let native_window_ids = state
+    .normal_z_order_for_workspace(workspace.id())
+    .map(<[WindowId]>::to_vec)
+    .unwrap_or_default();
+
+  crate::commands::general::layout_debug_log(format!(
+    "normal z reconcile workspace={:?} focused={:?} layer={:?} chain={:?}",
+    workspace.id(),
+    focused_window_id,
+    focused_layer,
+    native_window_ids,
+  ));
 
   if let Err(err) = reorder_z_order(&native_window_ids) {
     tracing::warn!(
@@ -514,10 +547,10 @@ enum NormalZOrderLayer {
 /// z-order items.
 #[cfg(target_os = "windows")]
 fn normal_z_order_chain(
-  current_windows: Vec<(Uuid, NormalZOrderLayer)>,
-  focused_window_id: Uuid,
-  previous_order: Option<&[Uuid]>,
-) -> Option<Vec<Uuid>> {
+  current_windows: Vec<(WindowId, NormalZOrderLayer)>,
+  focused_window_id: WindowId,
+  previous_order: Option<&[WindowId]>,
+) -> Option<Vec<WindowId>> {
   let focused_layer = current_windows
     .iter()
     .find(|(window_id, _)| *window_id == focused_window_id)
@@ -590,13 +623,14 @@ fn normal_z_order_chain(
     .collect::<Vec<_>>();
 
   normalize_tiled_window_block(&mut chain, &tiled_window_ids);
+
   Some(chain)
 }
 
 #[cfg(target_os = "windows")]
 fn normalize_tiled_window_block(
-  chain: &mut Vec<Uuid>,
-  tiled_window_ids: &[Uuid],
+  chain: &mut Vec<WindowId>,
+  tiled_window_ids: &[WindowId],
 ) {
   let Some(first_tiled_index) = chain
     .iter()
@@ -623,8 +657,8 @@ mod tests {
   fn window(
     id: isize,
     layer: NormalZOrderLayer,
-  ) -> (Uuid, NormalZOrderLayer) {
-    (Uuid::from_u128(id.unsigned_abs() as u128), layer)
+  ) -> (WindowId, NormalZOrderLayer) {
+    (WindowId(id), layer)
   }
 
   #[test]
@@ -659,6 +693,139 @@ mod tests {
         Some(&[d2.0, d1.0, w3.0, w4.0]),
       ),
       Some(vec![w3.0, w4.0, d2.0, d1.0])
+    );
+  }
+
+  #[test]
+  fn e2e_ignored_window_stays_between_detached_and_tiled_after_alt_tab() {
+    let detached = window(1, NormalZOrderLayer::Floating);
+    let ignored = window(2, NormalZOrderLayer::Floating);
+    let tiled_a = window(3, NormalZOrderLayer::Tiling);
+    let tiled_b = window(4, NormalZOrderLayer::Tiling);
+
+    // Native state immediately before Alt-Tab: Snipping Tool was focused
+    // over the tiled group. The detached window is then selected by
+    // Alt-Tab. The required final native order is:
+    //
+    //   detached > ignored > tiled group
+    assert_eq!(
+      normal_z_order_chain(
+        vec![ignored, tiled_a, tiled_b, detached],
+        detached.0,
+        Some(&[ignored.0, tiled_a.0, tiled_b.0, detached.0]),
+      ),
+      Some(vec![detached.0, ignored.0, tiled_a.0, tiled_b.0])
+    );
+  }
+
+  #[test]
+  fn e2e_returning_from_ignored_focus_keeps_ignored_above_tiled_group() {
+    let detached = window(1, NormalZOrderLayer::Floating);
+    let ignored = window(2, NormalZOrderLayer::Floating);
+    let tiled_a = window(3, NormalZOrderLayer::Tiling);
+    let tiled_b = window(4, NormalZOrderLayer::Tiling);
+
+    // Snipping Tool is foreground immediately before Alt-Tab returns to
+    // detached Notepad. The ignored window must remain between Notepad and
+    // the tiled group after the managed focus event is processed.
+    assert_eq!(
+      normal_z_order_chain(
+        vec![ignored, detached, tiled_a, tiled_b],
+        detached.0,
+        Some(&[ignored.0, detached.0, tiled_a.0, tiled_b.0]),
+      ),
+      Some(vec![detached.0, ignored.0, tiled_a.0, tiled_b.0])
+    );
+  }
+
+  #[test]
+  fn e2e_leaving_ignored_focus_rejoins_ignored_before_detached_and_after_tiled(
+  ) {
+    let ignored = window(1, NormalZOrderLayer::Floating);
+    let tiled_a = window(2, NormalZOrderLayer::Tiling);
+    let tiled_b = window(3, NormalZOrderLayer::Tiling);
+    let detached = window(4, NormalZOrderLayer::Floating);
+
+    // Snipping Tool was foreground and may have acquired a native TOPMOST
+    // bit. Once Alt-Tab returns to a tiled window, the ignored HWND must
+    // be present in the reconciliation chain so the native reorder
+    // clears that bit and leaves the ignored window below the tiled
+    // group.
+    assert_eq!(
+      normal_z_order_chain(
+        vec![ignored, tiled_a, tiled_b, detached],
+        tiled_a.0,
+        Some(&[ignored.0, detached.0, tiled_a.0, tiled_b.0]),
+      ),
+      Some(vec![tiled_a.0, tiled_b.0, ignored.0, detached.0])
+    );
+  }
+
+  #[test]
+  fn e2e_ignored_focus_preserves_detached_peer_order() {
+    let notepad_one = window(1, NormalZOrderLayer::Floating);
+    let notepad_two = window(2, NormalZOrderLayer::Floating);
+    let ignored = window(3, NormalZOrderLayer::Floating);
+    let tiled_a = window(4, NormalZOrderLayer::Tiling);
+    let tiled_b = window(5, NormalZOrderLayer::Tiling);
+
+    let initial = [
+      notepad_one.0,
+      notepad_two.0,
+      ignored.0,
+      tiled_a.0,
+      tiled_b.0,
+    ];
+
+    // The ignored focus event is a native-only transition, so it does not
+    // call normal_z_order_chain and leaves both Notepads untouched.
+    let after_ignored_focus = initial.to_vec();
+    assert_eq!(after_ignored_focus, initial);
+
+    // Returning to either detached window promotes only that window. The
+    // other detached/ignored windows retain their existing relative order.
+    let after_notepad_one = normal_z_order_chain(
+      vec![notepad_one, notepad_two, ignored, tiled_a, tiled_b],
+      notepad_one.0,
+      Some(&after_ignored_focus),
+    )
+    .expect("detached focus chain");
+    assert_eq!(after_notepad_one, initial);
+
+    let after_notepad_two = normal_z_order_chain(
+      vec![notepad_two, notepad_one, ignored, tiled_a, tiled_b],
+      notepad_two.0,
+      Some(&after_notepad_one),
+    )
+    .expect("second detached focus chain");
+    assert_eq!(
+      after_notepad_two,
+      vec![
+        notepad_two.0,
+        notepad_one.0,
+        ignored.0,
+        tiled_a.0,
+        tiled_b.0
+      ]
+    );
+
+    // Focusing a tiled window promotes the tiled group as one unit and
+    // preserves the detached/ignored order behind it.
+    let after_tiled = normal_z_order_chain(
+      vec![tiled_a, tiled_b, notepad_two, notepad_one, ignored],
+      tiled_a.0,
+      Some(&after_notepad_two),
+    )
+    .expect("tiled focus chain");
+    assert_eq!(
+      after_tiled,
+      vec![
+        tiled_a.0,
+        tiled_b.0,
+        notepad_two.0,
+        notepad_one.0,
+        ignored.0,
+      ]
     );
   }
 
@@ -722,6 +889,8 @@ fn reposition_window(
   z_order: &WindowZOrder,
   is_visible: bool,
   is_show_desktop_minimized: bool,
+  #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+  preserve_z_order: bool,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
   // Show Desktop minimizes windows natively without changing their WM tree
@@ -812,6 +981,9 @@ fn reposition_window(
         | SWP_NOCOPYBITS
         | SWP_NOSENDCHANGING
         | SWP_ASYNCWINDOWPOS;
+      if preserve_z_order {
+        swp_flags |= SWP_NOZORDER;
+      }
 
       match &window.state() {
         WindowState::Minimized => {

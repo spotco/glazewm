@@ -12,7 +12,7 @@ use wm_common::{
   WindowState, WmEvent,
 };
 use wm_platform::{
-  Direction, Dispatcher, Display, NativeWindow, Point, Rect,
+  Direction, Dispatcher, Display, NativeWindow, Point, Rect, WindowId,
 };
 #[cfg(target_os = "windows")]
 use wm_platform::{NativeWindowWindowsExt, OpacityValue};
@@ -73,7 +73,7 @@ pub struct WmState {
   /// bottom. This is transient native state, not layout state. It lets
   /// focus changes promote only the selected detached window while
   /// preserving the rest of the existing stack.
-  normal_z_order_by_workspace: HashMap<Uuid, Vec<Uuid>>,
+  normal_z_order_by_workspace: HashMap<Uuid, Vec<WindowId>>,
 
   /// Layout captured before Show Desktop temporarily minimizes managed
   /// windows. The snapshot is used to rebuild the exact tree after the
@@ -86,6 +86,15 @@ pub struct WmState {
   /// Windows that the WM should ignore. Windows can be added via the
   /// `ignore` command.
   pub ignored_windows: Vec<NativeWindow>,
+
+  /// Ignored window that currently owns native foreground.
+  ///
+  /// Logical focus stays on the last managed container. While this is
+  /// set, focus enforcement and normal z-order reconciliation are
+  /// suspended so already-queued work cannot cover the ignored window.
+  /// Cleared by the next non-ignored focus event, or when the OS
+  /// foreground is a managed window or the desktop.
+  pub ignored_native_foreground: Option<WindowId>,
 
   /// WM-wide insertion / stack axis for directional moves (spotcobuild).
   pub global_tiling_direction: TilingDirection,
@@ -127,6 +136,7 @@ impl WmState {
       show_desktop_snapshot: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
+      ignored_native_foreground: None,
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
       layout_history: LayoutHistory::default(),
       is_paused: false,
@@ -637,7 +647,7 @@ impl WmState {
   pub fn normal_z_order_for_workspace(
     &self,
     workspace_id: Uuid,
-  ) -> Option<&[Uuid]> {
+  ) -> Option<&[WindowId]> {
     self
       .normal_z_order_by_workspace
       .get(&workspace_id)
@@ -647,7 +657,7 @@ impl WmState {
   pub fn set_normal_z_order_for_workspace(
     &mut self,
     workspace_id: Uuid,
-    window_ids: Vec<Uuid>,
+    window_ids: Vec<WindowId>,
   ) {
     self
       .normal_z_order_by_workspace
@@ -700,6 +710,25 @@ impl WmState {
       .descendant_focus_order()
       .filter(|descendant| descendant.id() != removed_window.id())
       .collect::<Vec<_>>();
+
+    // Windows such as an application's Save As dialog can be created as a
+    // managed floating window even though they are transient popups from
+    // the user's perspective. When one closes, the native owner is the
+    // correct focus target. Otherwise the usual same-state fallback
+    // below can focus a detached peer instead (for example, Notepad),
+    // which then promotes that peer above the tiled owner.
+    #[cfg(target_os = "windows")]
+    if let Some(owner_handle) =
+      removed_window.native().debug_info().owner_handle
+    {
+      if let Some(owner_target) = managed_owner_focus_target(
+        &descendant_focus_order,
+        &workspace,
+        owner_handle,
+      ) {
+        return Some(owner_target);
+      }
+    }
 
     // Get focus target that matches the removed window type. This applies
     // for windows that aren't in a minimized state.
@@ -759,6 +788,89 @@ impl WmState {
       .cloned()
   }
 
+  /// Records that `native_window` owns native foreground and cancels
+  /// pending focus or z-order work.
+  ///
+  /// Also invalidates in-flight Windows z-order retries. A retry scheduled
+  /// before this focus event must not replay a chain whose head is the
+  /// previous managed window.
+  pub fn suspend_z_order_for_ignored_foreground(
+    &mut self,
+    native_window: &NativeWindow,
+  ) {
+    let window_id = native_window.id();
+    let dropped_foreground_work =
+      self.pending_sync.has_foreground_assertions();
+
+    self.ignored_native_foreground = Some(window_id);
+    self.pending_sync.cancel_foreground_assertions();
+    self.invalidate_pending_z_order_retries();
+
+    if dropped_foreground_work {
+      crate::commands::general::layout_debug_log(format!(
+        "ignored foreground suspended z-order handle={window_id:?}"
+      ));
+    }
+  }
+
+  /// Returns whether z-order and focus enforcement must not run.
+  ///
+  /// The suspension flag covers work that is drained immediately after
+  /// the ignored-focus event. The live foreground check covers a
+  /// reconciliation that was already inside `platform_sync` when native
+  /// focus changed, and any later redraw while that window is still
+  /// foreground. An unrelated unmanaged foreground window does not clear
+  /// the flag; only a managed window or the desktop does.
+  pub fn ignored_foreground_suspends_z_order(&mut self) -> bool {
+    if let Ok(foreground) = self.dispatcher.focused_window() {
+      if self
+        .ignored_windows
+        .iter()
+        .any(|window| window == &foreground)
+      {
+        self.suspend_z_order_for_ignored_foreground(&foreground);
+        return true;
+      }
+
+      let foreground_is_managed =
+        self.window_from_native(&foreground).is_some();
+      let foreground_is_desktop =
+        foreground.is_desktop_window().unwrap_or(false);
+
+      if foreground_is_managed || foreground_is_desktop {
+        if self.ignored_native_foreground.take().is_some() {
+          crate::commands::general::layout_debug_log(
+            "ignored foreground suspension cleared by native focus",
+          );
+        }
+        return false;
+      }
+    }
+
+    if self.ignored_native_foreground.is_some() {
+      let dropped_foreground_work =
+        self.pending_sync.has_foreground_assertions();
+      self.pending_sync.cancel_foreground_assertions();
+      self.invalidate_pending_z_order_retries();
+      if dropped_foreground_work {
+        crate::commands::general::layout_debug_log(
+          "skipped z-order reconcile while ignored window owns native foreground",
+        );
+      }
+      return true;
+    }
+
+    false
+  }
+
+  /// Bumps the Windows z-order generation so delayed retries abort.
+  fn invalidate_pending_z_order_retries(&self) {
+    #[cfg(target_os = "windows")]
+    {
+      let _ = wm_platform::begin_z_order_batch();
+    }
+  }
+
   /// Best-effort: manage any currently visible top-level windows that are
   /// not already in the container tree (e.g. after uncloaking orphans).
   pub fn manage_new_visible_windows(
@@ -808,6 +920,29 @@ impl WmState {
   }
 }
 
+/// Finds a managed native owner in the removed window's workspace.
+///
+/// Keeping this selection separate makes the transient-popup behavior
+/// independently testable without depending on a real Win32 owner
+/// relation.
+#[cfg(target_os = "windows")]
+fn managed_owner_focus_target(
+  descendants: &[Container],
+  workspace: &Workspace,
+  owner_handle: isize,
+) -> Option<Container> {
+  descendants
+    .iter()
+    .filter_map(|descendant| descendant.as_window_container().ok())
+    .find(|candidate| {
+      candidate.native().id().0 == owner_handle
+        && candidate.workspace().is_some_and(|candidate_workspace| {
+          candidate_workspace.id() == workspace.id()
+        })
+    })
+    .map(Into::into)
+}
+
 impl Drop for WmState {
   fn drop(&mut self) {
     let managed_windows = self.windows();
@@ -835,5 +970,132 @@ impl Drop for WmState {
           .set_transparency(&OpacityValue::from_alpha(u8::MAX));
       }
     }
+  }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+  use tokio::sync::mpsc;
+  use wm_common::{
+    GapsConfig, TilingDirection, WindowState, WorkspaceConfig,
+  };
+  use wm_platform::{
+    EventLoop, NativeWindow, NativeWindowWindowsExt, Rect, RectDelta,
+  };
+
+  use super::*;
+  use crate::{
+    commands::{container::attach_container, monitor::add_monitor},
+    models::{
+      Container, NativeMonitorProperties, NativeWindowProperties,
+      NonTilingWindow, TilingWindow, Workspace,
+    },
+    traits::CommonGetters,
+  };
+
+  fn test_properties(title: &str) -> NativeWindowProperties {
+    NativeWindowProperties {
+      title: title.into(),
+      class_name: "test".into(),
+      process_name: "test".into(),
+      process_path: None,
+      frame: Rect::from_xy(0, 0, 100, 100),
+      is_minimized: false,
+      is_maximized: false,
+      is_resizable: true,
+      shadow_borders: RectDelta::zero(),
+    }
+  }
+
+  #[test]
+  fn transient_owned_popup_removal_prefers_managed_owner() {
+    let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(dispatcher, event_tx, exit_tx);
+
+    let display = state
+      .dispatcher
+      .sorted_displays()
+      .expect("test display")
+      .into_iter()
+      .next()
+      .expect("at least one display");
+    let monitor_properties = NativeMonitorProperties::try_from(&display)
+      .expect("monitor properties");
+    let monitor = add_monitor(display, monitor_properties, &mut state)
+      .expect("attach test monitor");
+
+    let workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "owned-popup-removal-test".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let workspace_container: Container = workspace.clone().into();
+    attach_container(&workspace_container, &monitor.clone().into(), None)
+      .expect("attach workspace");
+
+    let owner = TilingWindow::new(
+      None,
+      NativeWindow::from_handle(1),
+      test_properties("managed owner"),
+      None,
+      RectDelta::zero(),
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      GapsConfig::default(),
+      Vec::new(),
+      None,
+    );
+    let popup = NonTilingWindow::new(
+      None,
+      NativeWindow::from_handle(3),
+      test_properties("owned popup"),
+      WindowState::Floating(Default::default()),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    );
+    let detached_peer = NonTilingWindow::new(
+      None,
+      NativeWindow::from_handle(2),
+      test_properties("detached peer"),
+      WindowState::Floating(Default::default()),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    );
+
+    attach_container(&owner.clone().into(), &workspace_container, None)
+      .expect("attach owner");
+    attach_container(&popup.clone().into(), &workspace_container, None)
+      .expect("attach popup");
+    attach_container(
+      &detached_peer.clone().into(),
+      &workspace_container,
+      None,
+    )
+    .expect("attach detached peer");
+
+    let descendants =
+      workspace.descendant_focus_order().collect::<Vec<_>>();
+    let target = managed_owner_focus_target(&descendants, &workspace, 1)
+      .expect("managed owner target");
+
+    assert_eq!(target.id(), owner.id());
+    assert_ne!(target.id(), detached_peer.id());
   }
 }

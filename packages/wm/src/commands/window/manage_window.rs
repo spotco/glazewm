@@ -54,6 +54,15 @@ pub fn manage_window(
   if let Some(window) = updated_window {
     state.layout_history.clear("window managed");
     info!("New window managed: {window}");
+    let native_debug = window.native().debug_info();
+    crate::commands::general::layout_debug_log(format!(
+      "window managed handle={:?} title={:?} class={:?} owner={:?} state={:?}",
+      window.native().id(),
+      native_debug.title,
+      native_debug.class_name,
+      native_debug.owner_handle,
+      window.state(),
+    ));
 
     state.emit_event(WmEvent::WindowManaged {
       managed_window: window.to_dto()?,

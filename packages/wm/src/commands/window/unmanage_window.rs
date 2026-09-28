@@ -29,6 +29,16 @@ pub fn unmanage_window(
 
   // Get container to switch focus to after the window has been removed.
   let focus_target = state.focus_target_after_removal(&window.clone());
+  let native_debug = window.native().debug_info();
+  crate::commands::general::layout_debug_log(format!(
+    "window removed handle={:?} title={:?} class={:?} owner={:?} state={:?} focus_target={:?}",
+    window.native().id(),
+    native_debug.title,
+    native_debug.class_name,
+    native_debug.owner_handle,
+    window.state(),
+    focus_target.as_ref().map(|target| target.id()),
+  ));
 
   detach_container(window.clone().into())?;
 
