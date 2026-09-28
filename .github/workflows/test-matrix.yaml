@@ -34,5 +34,8 @@ jobs:
       - name: Test wm-cli (lib)
         run: cargo test -p wm-cli --lib
 
+      - name: Test wm binary
+        run: cargo test -p wm --bin glazewm
+
       - name: Check wm and wm-cli
         run: cargo check -p wm -p wm-cli

@@ -193,6 +193,7 @@ fn windows_to_bring_to_front(
         None => vec![],
       }
     })
+    .filter(|window| !state.is_show_desktop_minimized(window.id()))
     .collect::<Vec<_>>();
 
   Ok(windows_to_bring_to_front)
@@ -324,9 +325,17 @@ fn redraw_containers(
       DisplayState::Showing | DisplayState::Shown
     );
 
-    if let Err(err) =
-      reposition_window(window, *hide_corner, &z_order, is_visible, config)
-    {
+    let is_show_desktop_minimized =
+      state.is_show_desktop_minimized(window.id());
+
+    if let Err(err) = reposition_window(
+      window,
+      *hide_corner,
+      &z_order,
+      is_visible,
+      is_show_desktop_minimized,
+      config,
+    ) {
       tracing::warn!("Failed to set window position: {}", err);
     }
 
@@ -433,6 +442,7 @@ fn reorder_focused_workspace_layers_in_workspace(
         DisplayState::Showing | DisplayState::Shown
       )
     })
+    .filter(|window| !state.is_show_desktop_minimized(window.id()))
     .filter_map(|window| {
       let layer = match window.state() {
         WindowState::Tiling => NormalZOrderLayer::Tiling,
@@ -542,7 +552,7 @@ fn normal_z_order_chain(
     }
   }
 
-  match focused_layer {
+  let mut chain = match focused_layer {
     NormalZOrderLayer::Tiling => {
       let mut tiled_windows = current_windows
         .iter()
@@ -567,7 +577,43 @@ fn normal_z_order_chain(
       previous_or_focus_order.insert(0, focused_window_id);
       Some(previous_or_focus_order)
     }
-  }
+  }?;
+
+  // A non-focused window can change layers while another window has focus.
+  // Normalize the result in that case too, otherwise a floating window
+  // that used to sit inside the tiled block can split the remaining
+  // tiled windows.
+  let tiled_window_ids = current_windows
+    .iter()
+    .filter(|(_, layer)| *layer == NormalZOrderLayer::Tiling)
+    .map(|(window_id, _)| *window_id)
+    .collect::<Vec<_>>();
+
+  normalize_tiled_window_block(&mut chain, &tiled_window_ids);
+  Some(chain)
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_tiled_window_block(
+  chain: &mut Vec<Uuid>,
+  tiled_window_ids: &[Uuid],
+) {
+  let Some(first_tiled_index) = chain
+    .iter()
+    .position(|window_id| tiled_window_ids.contains(window_id))
+  else {
+    return;
+  };
+
+  let tiled_windows = chain
+    .iter()
+    .filter(|window_id| tiled_window_ids.contains(window_id))
+    .copied()
+    .collect::<Vec<_>>();
+
+  chain.retain(|window_id| !tiled_window_ids.contains(window_id));
+  let insertion_index = first_tiled_index.min(chain.len());
+  chain.splice(insertion_index..insertion_index, tiled_windows);
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -646,6 +692,26 @@ mod tests {
       Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
+
+  #[test]
+  fn nonfocused_layer_change_keeps_tiled_windows_contiguous() {
+    let d1 = window(1, NormalZOrderLayer::Floating);
+    let d2 = window(2, NormalZOrderLayer::Floating);
+    let t1 = window(3, NormalZOrderLayer::Tiling);
+    let t2 = window(4, NormalZOrderLayer::Tiling);
+
+    // The old order has one tiled block followed by two detached windows.
+    // Detached2 becomes tiled while Detached1 remains focused. Without
+    // normalization this would leave Detached1 between the tiled windows.
+    assert_eq!(
+      normal_z_order_chain(
+        vec![d1, t1, t2, window(2, NormalZOrderLayer::Tiling)],
+        d1.0,
+        Some(&[t1.0, t2.0, d1.0, d2.0]),
+      ),
+      Some(vec![d1.0, t1.0, t2.0, d2.0])
+    );
+  }
 }
 
 fn reposition_window(
@@ -655,8 +721,16 @@ fn reposition_window(
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   z_order: &WindowZOrder,
   is_visible: bool,
+  is_show_desktop_minimized: bool,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  // Show Desktop minimizes windows natively without changing their WM tree
+  // state. A redraw must not restore or reposition those windows, or the
+  // next focus/layout sync would undo Show Desktop.
+  if is_show_desktop_minimized {
+    return Ok(());
+  }
+
   let rect = window
     .to_rect()?
     .apply_delta(&window.total_border_delta()?, None);
