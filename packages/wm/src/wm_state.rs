@@ -714,9 +714,7 @@ impl WmState {
     // Windows such as an application's Save As dialog can be created as a
     // managed floating window even though they are transient popups from
     // the user's perspective. When one closes, the native owner is the
-    // correct focus target. Otherwise the usual same-state fallback
-    // below can focus a detached peer instead (for example, Notepad),
-    // which then promotes that peer above the tiled owner.
+    // correct focus target.
     #[cfg(target_os = "windows")]
     if let Some(owner_handle) =
       removed_window.native().debug_info().owner_handle
@@ -728,6 +726,24 @@ impl WmState {
       ) {
         return Some(owner_target);
       }
+    }
+
+    // A floating window is often a tool opened over the tiled workspace
+    // (P4Merge / P4Diff from a tiled P4V). The previous focus may be
+    // tiled. Prefer that window over an older floating peer such as
+    // Visual Studio, which would otherwise match the same-state rule
+    // and be raised above the tiles.
+    if matches!(removed_window.state(), WindowState::Floating(_)) {
+      let previous_focus =
+        descendant_focus_order.iter().find(|descendant| {
+          descendant
+            .as_window_container()
+            .map(|window| window.state() != WindowState::Minimized)
+            .unwrap_or(true)
+        });
+      return previous_focus
+        .cloned()
+        .or_else(|| Some(workspace.clone().into()));
     }
 
     // Get focus target that matches the removed window type. This applies
@@ -985,10 +1001,13 @@ mod tests {
 
   use super::*;
   use crate::{
-    commands::{container::attach_container, monitor::add_monitor},
+    commands::{
+      container::{attach_container, set_focused_descendant},
+      monitor::add_monitor,
+    },
     models::{
       Container, NativeMonitorProperties, NativeWindowProperties,
-      NonTilingWindow, TilingWindow, Workspace,
+      NonTilingWindow, TilingWindow, WindowContainer, Workspace,
     },
     traits::CommonGetters,
   };
@@ -1097,5 +1116,103 @@ mod tests {
 
     assert_eq!(target.id(), owner.id());
     assert_ne!(target.id(), detached_peer.id());
+  }
+
+  #[test]
+  fn closing_floating_diff_returns_to_previous_tiled_focus() {
+    let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state = WmState::new(dispatcher, event_tx, exit_tx);
+
+    let display = state
+      .dispatcher
+      .sorted_displays()
+      .expect("test display")
+      .into_iter()
+      .next()
+      .expect("at least one display");
+    let monitor_properties = NativeMonitorProperties::try_from(&display)
+      .expect("monitor properties");
+    let monitor = add_monitor(display, monitor_properties, &mut state)
+      .expect("attach test monitor");
+
+    let workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "p4diff-close-focus".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let workspace_container: Container = workspace.clone().into();
+    attach_container(&workspace_container, &monitor.clone().into(), None)
+      .expect("attach workspace");
+
+    let p4v = TilingWindow::new(
+      None,
+      NativeWindow::from_handle(1),
+      test_properties("p4v"),
+      None,
+      RectDelta::zero(),
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      GapsConfig::default(),
+      Vec::new(),
+      None,
+    );
+    let visual_studio = NonTilingWindow::new(
+      None,
+      NativeWindow::from_handle(2),
+      test_properties("devenv"),
+      WindowState::Floating(Default::default()),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    );
+    let p4merge = NonTilingWindow::new(
+      None,
+      NativeWindow::from_handle(3),
+      test_properties("p4merge"),
+      WindowState::Floating(Default::default()),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    );
+
+    attach_container(&p4v.clone().into(), &workspace_container, None)
+      .expect("attach p4v");
+    attach_container(
+      &visual_studio.clone().into(),
+      &workspace_container,
+      None,
+    )
+    .expect("attach visual studio");
+    attach_container(&p4merge.clone().into(), &workspace_container, None)
+      .expect("attach p4merge");
+
+    // Visual Studio was focused earlier. P4V is focused, then P4Merge
+    // opens on top. Closing P4Merge must return to P4V, not Visual Studio.
+    set_focused_descendant(&visual_studio.clone().into(), None);
+    set_focused_descendant(&p4v.clone().into(), None);
+    set_focused_descendant(&p4merge.clone().into(), None);
+
+    let removed: WindowContainer = p4merge.into();
+    let target = state
+      .focus_target_after_removal(&removed)
+      .expect("focus target");
+
+    assert_eq!(target.id(), p4v.id());
+    assert_ne!(target.id(), visual_studio.id());
   }
 }
