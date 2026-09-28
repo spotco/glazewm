@@ -88,7 +88,6 @@ pub fn wm_event_kind_name(event: &WmEvent) -> &'static str {
     WmEvent::MonitorAdded { .. } => "MonitorAdded",
     WmEvent::MonitorRemoved { .. } => "MonitorRemoved",
     WmEvent::MonitorUpdated { .. } => "MonitorUpdated",
-    WmEvent::TilingDirectionChanged { .. } => "TilingDirectionChanged",
     WmEvent::GlobalTilingDirectionChanged { .. } => {
       "GlobalTilingDirectionChanged"
     }
@@ -170,7 +169,6 @@ pub fn wm_event_affects_layout_snapshot(event: &WmEvent) -> bool {
       | WmEvent::WorkspaceActivated { .. }
       | WmEvent::WorkspaceDeactivated { .. }
       | WmEvent::WorkspaceUpdated { .. }
-      | WmEvent::TilingDirectionChanged { .. }
       | WmEvent::GlobalTilingDirectionChanged { .. }
       | WmEvent::MonitorAdded { .. }
       | WmEvent::MonitorRemoved { .. }
@@ -641,6 +639,31 @@ mod tests {
     assert!(!wm_event_affects_layout_snapshot(&WmEvent::PauseChanged {
       is_paused: true
     }));
+  }
+
+  #[test]
+  fn workspace_update_arms_snapshot_gate() {
+    let workspace = wm_common::WorkspaceDto {
+      id: uuid::Uuid::new_v4(),
+      name: "wks1".into(),
+      display_name: None,
+      parent_id: None,
+      children: Vec::new(),
+      child_focus_order: Vec::new(),
+      has_focus: true,
+      is_displayed: true,
+      width: 0,
+      height: 0,
+      x: 0,
+      y: 0,
+      tiling_direction: wm_common::TilingDirection::Horizontal,
+    };
+
+    assert!(wm_event_affects_layout_snapshot(
+      &WmEvent::WorkspaceUpdated {
+        updated_workspace: wm_common::ContainerDto::Workspace(workspace),
+      }
+    ));
   }
 
   #[test]

@@ -20,5 +20,11 @@ pub struct SplitContainerDto {
   pub height: i32,
   pub x: i32,
   pub y: i32,
+  /// Structural axis of this nested split. This is not the current
+  /// user-facing WM orientation.
+  #[serde(
+    rename = "structuralTilingDirection",
+    alias = "tilingDirection"
+  )]
   pub tiling_direction: TilingDirection,
 }

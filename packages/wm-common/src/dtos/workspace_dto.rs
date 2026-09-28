@@ -22,5 +22,12 @@ pub struct WorkspaceDto {
   pub height: i32,
   pub x: i32,
   pub y: i32,
+  /// Structural root axis for this workspace tree. This is not the
+  /// current user-facing WM orientation; use `query tiling-direction`
+  /// for that.
+  #[serde(
+    rename = "structuralTilingDirection",
+    alias = "tilingDirection"
+  )]
   pub tiling_direction: TilingDirection,
 }

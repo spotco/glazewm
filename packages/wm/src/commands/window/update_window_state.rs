@@ -58,10 +58,9 @@ fn set_tiling(
     .filter(|state| matches!(state, WindowState::Tiling))
     .and_then(|_| window.insertion_target())
     .filter(|insertion_target| {
-      insertion_target
-        .target_parent
-        .workspace()
-        .is_some_and(|workspace| workspace.is_displayed())
+      insertion_target.target_parent.workspace().is_some_and(
+        |target_workspace| target_workspace.id() == workspace.id(),
+      )
     });
 
   // Get the position in the tree to insert the new tiling window. This

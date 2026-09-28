@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 use anyhow::Context;
 use tokio::sync::mpsc::{self};
@@ -59,6 +59,10 @@ pub struct WmState {
   /// Used to decide whether to override incoming focus events.
   pub unmanaged_or_minimized_timestamp: Option<Instant>,
 
+  /// Windows natively minimized by Show Desktop while their WM tree state
+  /// is intentionally preserved.
+  show_desktop_minimized: HashSet<Uuid>,
+
   /// Configs of currently enabled binding modes.
   pub binding_modes: Vec<BindingModeConfig>,
 
@@ -101,6 +105,7 @@ impl WmState {
       prev_effects_window: None,
       recent_workspace_name: None,
       unmanaged_or_minimized_timestamp: None,
+      show_desktop_minimized: HashSet::new(),
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
@@ -556,23 +561,38 @@ impl WmState {
       .collect()
   }
 
-  /// Gets the currently focused container. This can either be a window or
+  /// Gets the logically focused container. This can either be a window or
   /// a workspace without any descendant windows.
   pub fn focused_container(&self) -> Option<Container> {
-    let focused_container =
-      self.root_container.descendant_focus_order().next()?;
+    self.root_container.descendant_focus_order().next()
+  }
 
-    // A minimized window must never be treated as the native focus target.
-    // When every window in the focused workspace is minimized, retain
-    // focus at the workspace level so platform_sync resets focus to
-    // the desktop instead of restoring one of those minimized windows.
+  /// Gets the container that is safe to focus natively.
+  ///
+  /// Logical focus remains on a minimized window so minimize/removal logic
+  /// can identify the window that was focused. Native focus must instead
+  /// go to its workspace, which resets focus to the desktop without
+  /// restoring the minimized window.
+  pub fn native_focus_target(&self) -> Option<Container> {
+    let focused_container = self.focused_container()?;
     if let Ok(window) = focused_container.as_window_container() {
       if window.state() == WindowState::Minimized {
         return window.workspace().map(Into::into);
       }
     }
-
     Some(focused_container)
+  }
+
+  pub fn mark_show_desktop_minimized(&mut self, window_id: Uuid) {
+    self.show_desktop_minimized.insert(window_id);
+  }
+
+  pub fn is_show_desktop_minimized(&self, window_id: Uuid) -> bool {
+    self.show_desktop_minimized.contains(&window_id)
+  }
+
+  pub fn clear_show_desktop_minimized(&mut self, window_id: Uuid) {
+    self.show_desktop_minimized.remove(&window_id);
   }
 
   /// Emits a WM event through an MSPC channel.

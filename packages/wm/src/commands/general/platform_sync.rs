@@ -8,6 +8,8 @@ use wm_common::{
   WindowState, WmEvent,
 };
 #[cfg(target_os = "windows")]
+use wm_platform::begin_z_order_batch;
+#[cfg(target_os = "windows")]
 use wm_platform::reorder_z_order;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
@@ -26,8 +28,9 @@ pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  let focused_container =
-    state.focused_container().context("No focused container.")?;
+  let focused_container = state
+    .native_focus_target()
+    .context("No focused container.")?;
 
   if state.pending_sync.needs_focus_update() {
     sync_focus(&focused_container, state)?;
@@ -134,6 +137,7 @@ fn windows_to_bring_to_front(
     .pending_sync
     .workspaces_to_reorder()
     .iter()
+    .filter(|workspace| workspace.is_displayed())
     .chain(
       state
         .pending_sync
@@ -200,6 +204,9 @@ fn redraw_containers(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  #[cfg(target_os = "windows")]
+  let _ = begin_z_order_batch();
+
   let windows_to_redraw = state.windows_to_redraw();
   let windows_to_bring_to_front =
     windows_to_bring_to_front(focused_container, state)?;

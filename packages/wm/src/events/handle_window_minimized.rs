@@ -6,7 +6,7 @@ use crate::{
   commands::{
     container::set_focused_descendant, window::update_window_state,
   },
-  traits::WindowGetters,
+  traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
 };
@@ -26,7 +26,10 @@ pub fn handle_window_minimized(
       properties.is_minimized = is_minimized;
     });
 
-    if is_minimized && window.state() != WindowState::Minimized {
+    if is_minimized
+      && !state.is_show_desktop_minimized(window.id())
+      && window.state() != WindowState::Minimized
+    {
       info!("Window minimized: {window}");
 
       let window = update_window_state(

@@ -3,8 +3,10 @@ use wm_common::{try_warn, WindowState};
 use wm_platform::NativeWindow;
 
 use crate::{
-  commands::window::update_window_state, traits::WindowGetters,
-  user_config::UserConfig, wm_state::WmState,
+  commands::window::update_window_state,
+  traits::{CommonGetters, WindowGetters},
+  user_config::UserConfig,
+  wm_state::WmState,
 };
 
 pub fn handle_window_minimize_ended(
@@ -22,7 +24,9 @@ pub fn handle_window_minimize_ended(
       properties.is_minimized = is_minimized;
     });
 
-    if !is_minimized && window.state() == WindowState::Minimized {
+    if !is_minimized && state.is_show_desktop_minimized(window.id()) {
+      state.clear_show_desktop_minimized(window.id());
+    } else if !is_minimized && window.state() == WindowState::Minimized {
       info!("Window minimize ended: {window}");
 
       let target_state = window

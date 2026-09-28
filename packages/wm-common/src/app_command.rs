@@ -223,7 +223,6 @@ pub enum SubscribableEvent {
   MonitorAdded,
   MonitorUpdated,
   MonitorRemoved,
-  TilingDirectionChanged,
   GlobalTilingDirectionChanged,
   UserConfigChanged,
   WindowManaged,

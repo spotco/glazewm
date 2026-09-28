@@ -1,6 +1,6 @@
 use anyhow::Context;
 use tracing::info;
-use wm_common::WindowState;
+use wm_common::{WindowState, WmEvent};
 
 use crate::{
   commands::{
@@ -231,6 +231,20 @@ pub fn move_all_windows_to_workspace(
     }
   }
 
+  // Non-tiling windows keep the insertion target from their previous tiled
+  // state. If that target was the old workspace root, it must travel with
+  // the window tree during the swap. Targets into split containers are
+  // left untouched because those containers travel with the tree as
+  // well.
+  rebind_workspace_root_insertion_targets(
+    current_workspace,
+    &target_workspace,
+  );
+  rebind_workspace_root_insertion_targets(
+    &target_workspace,
+    current_workspace,
+  );
+
   current_workspace.swap_contents(&target_workspace);
 
   state
@@ -239,6 +253,13 @@ pub fn move_all_windows_to_workspace(
     .queue_container_to_redraw(target_workspace.clone())
     .queue_workspace_to_reorder(current_workspace.clone())
     .queue_workspace_to_reorder(target_workspace.clone());
+
+  state.emit_event(WmEvent::WorkspaceUpdated {
+    updated_workspace: current_workspace.to_dto()?,
+  });
+  state.emit_event(WmEvent::WorkspaceUpdated {
+    updated_workspace: target_workspace.to_dto()?,
+  });
 
   // Move focus to the destination workspace after the contents have been
   // exchanged. Its swapped-in focus order selects the source's prior
@@ -250,4 +271,121 @@ pub fn move_all_windows_to_workspace(
   )?;
 
   Ok(())
+}
+
+fn rebind_workspace_root_insertion_targets(
+  source: &Workspace,
+  destination: &Workspace,
+) {
+  let source_root: crate::models::Container = source.clone().into();
+  let destination_root: crate::models::Container =
+    destination.clone().into();
+
+  for window in source
+    .descendants()
+    .filter_map(|container| container.as_window_container().ok())
+  {
+    let WindowContainer::NonTilingWindow(window) = window else {
+      continue;
+    };
+
+    let Some(mut insertion_target) = window.insertion_target() else {
+      continue;
+    };
+
+    if insertion_target.target_parent.id() == source_root.id() {
+      insertion_target.target_parent = destination_root.clone();
+      window.set_insertion_target(Some(insertion_target));
+    }
+  }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+  use wm_common::{
+    FloatingStateConfig, GapsConfig, TilingDirection, WindowState,
+    WorkspaceConfig,
+  };
+  use wm_platform::{
+    NativeWindow, NativeWindowWindowsExt, Rect, RectDelta,
+  };
+
+  use super::*;
+  use crate::{
+    commands::container::attach_container,
+    models::{
+      Container, InsertionTarget, NativeWindowProperties, NonTilingWindow,
+    },
+  };
+
+  fn workspace(name: &str) -> Workspace {
+    Workspace::new(
+      WorkspaceConfig {
+        name: name.into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    )
+  }
+
+  fn window_with_target(target_parent: Container) -> NonTilingWindow {
+    NonTilingWindow::new(
+      None,
+      NativeWindow::from_handle(0),
+      NativeWindowProperties {
+        title: "test".into(),
+        #[cfg(target_os = "windows")]
+        class_name: "test".into(),
+        process_name: "test".into(),
+        process_path: None,
+        frame: Rect::from_xy(0, 0, 100, 100),
+        is_minimized: false,
+        is_maximized: false,
+        is_resizable: true,
+        #[cfg(target_os = "windows")]
+        shadow_borders: RectDelta::zero(),
+      },
+      WindowState::Floating(FloatingStateConfig {
+        centered: false,
+        shown_on_top: false,
+      }),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      Some(InsertionTarget {
+        target_parent,
+        target_index: 0,
+        prev_tiling_size: 1.0,
+        prev_sibling_count: 1,
+      }),
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    )
+  }
+
+  #[test]
+  fn workspace_root_insertion_target_follows_bulk_swap() {
+    let source = workspace("source");
+    let destination = workspace("destination");
+    let window = window_with_target(source.clone().into());
+    let window_container: Container = window.clone().into();
+
+    attach_container(&window_container, &source.clone().into(), None)
+      .expect("attach window");
+
+    rebind_workspace_root_insertion_targets(&source, &destination);
+
+    assert_eq!(
+      window
+        .insertion_target()
+        .expect("insertion target")
+        .target_parent
+        .id(),
+      destination.id()
+    );
+  }
 }

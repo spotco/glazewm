@@ -28,7 +28,7 @@ use crate::{
     inspect_layout_snapshot, load_layout_snapshot,
     read_layout_snapshot_file,
   },
-  traits::{CommonGetters, TilingDirectionGetters, WindowGetters},
+  traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
   wm::WindowManager,
 };
@@ -321,18 +321,8 @@ impl IpcServer {
           })
         }
         QueryCommand::TilingDirection => {
-          let direction_container = wm
-            .state
-            .focused_container()
-            .and_then(|focused| focused.direction_container())
-            .context("No direction container.")?;
-
           ClientResponseData::TilingDirection(TilingDirectionData {
-            direction_container: direction_container.to_dto()?,
-            tiling_direction: direction_container.tiling_direction(),
-            global_tiling_direction: Some(
-              wm.state.global_tiling_direction.clone(),
-            ),
+            tiling_direction: wm.state.global_tiling_direction.clone(),
           })
         }
         QueryCommand::GlobalTilingDirection => {
@@ -582,9 +572,6 @@ impl IpcServer {
       WmEvent::MonitorAdded { .. } => SubscribableEvent::MonitorAdded,
       WmEvent::MonitorUpdated { .. } => SubscribableEvent::MonitorUpdated,
       WmEvent::MonitorRemoved { .. } => SubscribableEvent::MonitorRemoved,
-      WmEvent::TilingDirectionChanged { .. } => {
-        SubscribableEvent::TilingDirectionChanged
-      }
       WmEvent::GlobalTilingDirectionChanged { .. } => {
         SubscribableEvent::GlobalTilingDirectionChanged
       }

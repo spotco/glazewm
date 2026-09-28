@@ -175,12 +175,8 @@ pub struct MonitorsData {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TilingDirectionData {
+  /// The single user-facing WM-wide insertion/stack orientation.
   pub tiling_direction: TilingDirection,
-  pub direction_container: ContainerDto,
-  /// Spotcobuild WM-wide stack axis (also available via `query
-  /// global-tiling-direction`).
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub global_tiling_direction: Option<TilingDirection>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -248,4 +244,22 @@ pub struct EventSubscriptionMessage {
   pub error: Option<String>,
   pub subscription_id: Uuid,
   pub success: bool,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::TilingDirectionData;
+  use crate::TilingDirection;
+
+  #[test]
+  fn tiling_direction_response_is_global_only() {
+    let response = TilingDirectionData {
+      tiling_direction: TilingDirection::Vertical,
+    };
+    let json = serde_json::to_value(response).expect("serialize response");
+
+    assert_eq!(json["tilingDirection"], "vertical");
+    assert!(json.get("directionContainer").is_none());
+    assert!(json.get("globalTilingDirection").is_none());
+  }
 }

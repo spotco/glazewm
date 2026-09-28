@@ -37,12 +37,12 @@ use windows::{
         LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
         SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
         SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
-        SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA,
-        WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-        WPF_ASYNCWINDOWPLACEMENT, WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_POPUP, WS_THICKFRAME,
+        SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+        SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT,
+        WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+        WS_THICKFRAME,
       },
     },
   },
@@ -575,14 +575,14 @@ impl NativeWindow {
     let flags = SWP_NOACTIVATE
       | SWP_NOCOPYBITS
       | SWP_ASYNCWINDOWPOS
-      | SWP_SHOWWINDOW
+      | SWP_NOOWNERZORDER
       | SWP_NOMOVE
       | SWP_NOSIZE;
 
     // Z-order can sometimes still be incorrect after the above call. Make
     // the retry generation-aware so an older focus transition cannot
     // replay after a newer z-order repair has completed.
-    let generation = next_z_order_generation();
+    let generation = current_or_new_z_order_generation();
     let expected_foreground = (!matches!(z_order, WindowZOrder::TopMost))
       .then(|| unsafe { GetForegroundWindow() });
     unsafe { SetWindowPos(self.hwnd(), z_order_hwnd, 0, 0, 0, 0, flags) }?;
@@ -891,11 +891,25 @@ fn next_z_order_generation() -> u64 {
   Z_ORDER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+pub(crate) fn begin_z_order_batch() -> u64 {
+  next_z_order_generation()
+}
+
+fn current_or_new_z_order_generation() -> u64 {
+  let generation = Z_ORDER_GENERATION.load(Ordering::SeqCst);
+  if generation == 0 {
+    next_z_order_generation()
+  } else {
+    generation
+  }
+}
+
 fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
     | SWP_NOSIZE
+    | SWP_ASYNCWINDOWPOS
     | SWP_NOOWNERZORDER;
 
   // A normal WM window must not retain a native TOPMOST bit from a

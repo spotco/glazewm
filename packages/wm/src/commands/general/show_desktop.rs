@@ -1,12 +1,11 @@
 use std::time::Instant;
 
-use wm_common::WindowState;
 use wm_platform::NativeWindow;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
 
 use crate::{
-  commands::window::update_window_state,
+  commands::container::set_focused_descendant,
   models::WindowContainer,
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
@@ -74,7 +73,7 @@ pub fn show_desktop(
   let mut minimized = 0;
   let mut failed = 0;
   for window in managed_windows {
-    match minimize_managed_window(&window, state, config) {
+    match minimize_managed_window(&window, state) {
       Ok(true) => minimized += 1,
       Ok(false) => {}
       Err(err) => {
@@ -114,6 +113,8 @@ pub fn show_desktop(
   // window from another workspace. Keep the WM on the desktop instead of
   // allowing that fallback activation to switch workspaces.
   if minimized > 0 {
+    let workspace_container = current_workspace.clone().into();
+    set_focused_descendant(&workspace_container, None);
     state.pending_sync.queue_focus_change();
     super::platform_sync::platform_sync(state, config)?;
   }
@@ -121,30 +122,28 @@ pub fn show_desktop(
   Ok(())
 }
 
-/// Minimizes a managed window while synchronously applying GlazeWM's
-/// minimized state transition. The native minimize event arrives later and
-/// is then only a cache update, rather than a second tree mutation.
+/// Minimizes a managed window without changing its WM tree state.
+///
+/// Show Desktop is transient: the native window is minimized, but a tiled
+/// window remains in its split tree so restoring it cannot depend on a
+/// stale insertion target pointing at a detached split container.
 fn minimize_managed_window(
   window: &WindowContainer,
   state: &mut WmState,
-  config: &UserConfig,
 ) -> anyhow::Result<bool> {
   let was_minimized = window.native().is_minimized()?;
 
   if !was_minimized {
-    window.native().minimize()?;
+    state.mark_show_desktop_minimized(window.id());
+    if let Err(err) = window.native().minimize() {
+      state.clear_show_desktop_minimized(window.id());
+      return Err(err.into());
+    }
   }
 
   window.update_native_properties(|properties| {
     properties.is_minimized = true;
   });
-
-  update_window_state(
-    window.clone(),
-    WindowState::Minimized,
-    state,
-    config,
-  )?;
 
   Ok(!was_minimized)
 }
@@ -181,9 +180,9 @@ fn is_zebar_window(window: &NativeWindow) -> bool {
 fn is_input_method_window(window: &NativeWindow) -> bool {
   #[cfg(target_os = "windows")]
   {
-    return window.class_name().is_ok_and(|class_name| {
+    window.class_name().is_ok_and(|class_name| {
       matches!(class_name.as_str(), "MSCTFIME UI" | "IME")
-    });
+    })
   }
 
   #[cfg(not(target_os = "windows"))]

@@ -105,6 +105,13 @@ pub fn reorder_z_order(window_ids: &[WindowId]) -> crate::Result<()> {
   platform_impl::reorder_z_order(window_ids)
 }
 
+/// Starts one generation for a logical z-order reconciliation batch.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn begin_z_order_batch() -> u64 {
+  platform_impl::begin_z_order_batch()
+}
+
 /// macOS-specific extension trait for [`NativeWindow`].
 #[cfg(target_os = "macos")]
 pub trait NativeWindowExtMacOs {

@@ -34,10 +34,6 @@ pub enum WmEvent {
   MonitorUpdated {
     updated_monitor: ContainerDto,
   },
-  TilingDirectionChanged {
-    direction_container: ContainerDto,
-    new_tiling_direction: TilingDirection,
-  },
   /// Spotcobuild: WM-wide stack axis changed (Super+J /
   /// set-tiling-direction).
   GlobalTilingDirectionChanged {

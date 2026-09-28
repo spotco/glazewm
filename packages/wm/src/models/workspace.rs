@@ -66,11 +66,12 @@ impl Workspace {
   /// Swaps the window/container contents of two workspaces while
   /// preserving each workspace's tree and focus order.
   ///
-  /// The workspace configuration, monitor assignment, and tiling direction
-  /// remain attached to their original workspaces. Root containers are
-  /// rebound to their new workspace so saved insertion targets inside
-  /// those trees remain valid when a window is later restored from
-  /// fullscreen.
+  /// The workspace configuration and monitor assignment remain attached to
+  /// their original workspaces. The root tiling direction travels with the
+  /// exchanged tree because it is structural geometry, not user-facing
+  /// global policy. Root containers are rebound to their new workspace so
+  /// saved insertion targets inside those trees remain valid when a window
+  /// is later restored from fullscreen.
   pub fn swap_contents(&self, other: &Self) {
     if self.id() == other.id() {
       return;
@@ -84,6 +85,10 @@ impl Workspace {
       std::mem::swap(
         &mut this.child_focus_order,
         &mut other.child_focus_order,
+      );
+      std::mem::swap(
+        &mut this.tiling_direction,
+        &mut other.tiling_direction,
       );
     }
 
@@ -227,5 +232,34 @@ impl std::fmt::Display for Workspace {
       self.config().name,
       self.tiling_direction(),
     )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn workspace(name: &str, direction: TilingDirection) -> Workspace {
+    Workspace::new(
+      WorkspaceConfig {
+        name: name.to_string(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      direction,
+    )
+  }
+
+  #[test]
+  fn swap_contents_transfers_structural_root_direction() {
+    let horizontal = workspace("horizontal", TilingDirection::Horizontal);
+    let vertical = workspace("vertical", TilingDirection::Vertical);
+
+    horizontal.swap_contents(&vertical);
+
+    assert_eq!(horizontal.tiling_direction(), TilingDirection::Vertical);
+    assert_eq!(vertical.tiling_direction(), TilingDirection::Horizontal);
   }
 }
