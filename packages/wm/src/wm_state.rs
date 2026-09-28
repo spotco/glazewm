@@ -1,4 +1,7 @@
-use std::{collections::HashSet, time::Instant};
+use std::{
+  collections::{HashMap, HashSet},
+  time::Instant,
+};
 
 use anyhow::Context;
 use tokio::sync::mpsc::{self};
@@ -63,6 +66,12 @@ pub struct WmState {
   /// is intentionally preserved.
   show_desktop_minimized: HashSet<Uuid>,
 
+  /// Last intended normal-window z-order for each workspace, top to
+  /// bottom. This is transient native state, not layout state. It lets
+  /// focus changes promote only the selected detached window while
+  /// preserving the rest of the existing stack.
+  normal_z_order_by_workspace: HashMap<Uuid, Vec<Uuid>>,
+
   /// Configs of currently enabled binding modes.
   pub binding_modes: Vec<BindingModeConfig>,
 
@@ -106,6 +115,7 @@ impl WmState {
       recent_workspace_name: None,
       unmanaged_or_minimized_timestamp: None,
       show_desktop_minimized: HashSet::new(),
+      normal_z_order_by_workspace: HashMap::new(),
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
@@ -593,6 +603,26 @@ impl WmState {
 
   pub fn clear_show_desktop_minimized(&mut self, window_id: Uuid) {
     self.show_desktop_minimized.remove(&window_id);
+  }
+
+  pub fn normal_z_order_for_workspace(
+    &self,
+    workspace_id: Uuid,
+  ) -> Option<&[Uuid]> {
+    self
+      .normal_z_order_by_workspace
+      .get(&workspace_id)
+      .map(Vec::as_slice)
+  }
+
+  pub fn set_normal_z_order_for_workspace(
+    &mut self,
+    workspace_id: Uuid,
+    window_ids: Vec<Uuid>,
+  ) {
+    self
+      .normal_z_order_by_workspace
+      .insert(workspace_id, window_ids);
   }
 
   /// Emits a WM event through an MSPC channel.

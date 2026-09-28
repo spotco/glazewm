@@ -14,8 +14,6 @@ use wm_platform::reorder_z_order;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
 #[cfg(target_os = "windows")]
-use wm_platform::WindowId;
-#[cfg(target_os = "windows")]
 use wm_platform::{CornerStyle, OpacityValue};
 use wm_platform::{Rect, WindowZOrder};
 
@@ -374,7 +372,7 @@ fn redraw_containers(
   }
 
   #[cfg(target_os = "windows")]
-  reorder_focused_workspace_layers(focused_container);
+  reorder_focused_workspace_layers(focused_container, state);
 
   Ok(())
 }
@@ -392,7 +390,10 @@ fn redraw_containers(
 /// promoted while the remaining tiled group keeps its position relative to
 /// the other detached windows.
 #[cfg(target_os = "windows")]
-fn reorder_focused_workspace_layers(focused_container: &Container) {
+fn reorder_focused_workspace_layers(
+  focused_container: &Container,
+  state: &mut WmState,
+) {
   let Some(workspace) = focused_container.workspace() else {
     return;
   };
@@ -413,6 +414,7 @@ fn reorder_focused_workspace_layers(focused_container: &Container) {
   reorder_focused_workspace_layers_in_workspace(
     &workspace,
     focused_window_id,
+    state,
   );
 }
 
@@ -420,6 +422,7 @@ fn reorder_focused_workspace_layers(focused_container: &Container) {
 fn reorder_focused_workspace_layers_in_workspace(
   workspace: &Workspace,
   focused_window_id: Uuid,
+  state: &mut WmState,
 ) {
   let ordered_windows = workspace
     .descendant_focus_order()
@@ -443,13 +446,39 @@ fn reorder_focused_workspace_layers_in_workspace(
     })
     .collect::<Vec<_>>();
 
-  let Some(window_ids) =
-    normal_z_order_chain(ordered_windows, focused_window_id)
-  else {
+  let current_windows = ordered_windows
+    .iter()
+    .map(|(_, window_id, layer)| (*window_id, *layer))
+    .collect::<Vec<_>>();
+  let previous_order = state
+    .normal_z_order_for_workspace(workspace.id())
+    .map(<[Uuid]>::to_vec);
+
+  let Some(window_ids) = normal_z_order_chain(
+    current_windows,
+    focused_window_id,
+    previous_order.as_deref(),
+  ) else {
     return;
   };
 
-  if let Err(err) = reorder_z_order(&window_ids) {
+  let native_window_ids = window_ids
+    .iter()
+    .filter_map(|window_id| {
+      ordered_windows
+        .iter()
+        .find(|(_, id, _)| id == window_id)
+        .map(|(native_id, _, _)| *native_id)
+    })
+    .collect::<Vec<_>>();
+
+  if native_window_ids.len() != window_ids.len() {
+    return;
+  }
+
+  state.set_normal_z_order_for_workspace(workspace.id(), window_ids);
+
+  if let Err(err) = reorder_z_order(&native_window_ids) {
     tracing::warn!(
       "Failed to reorder focused workspace window layers: {}",
       err
@@ -467,50 +496,78 @@ enum NormalZOrderLayer {
 /// Builds the normal-window z-order chain while treating all tiled windows
 /// as one group.
 ///
-/// `ordered_windows` is in most-recent-focus order. A focused floating
-/// window moves ahead of the tiled group, but its floating peers remain
-/// below the tiled group. Only tiled windows are grouped together;
-/// detached windows must remain individual z-order items.
+/// `current_windows` is in most-recent-focus order, while `previous_order`
+/// is the last intended native order from top to bottom. Focus promotion
+/// is applied to the previous order so non-selected detached windows
+/// retain their existing relationship to the tiled group. Only tiled
+/// windows are grouped together; detached windows remain individual
+/// z-order items.
 #[cfg(target_os = "windows")]
 fn normal_z_order_chain(
-  ordered_windows: Vec<(WindowId, Uuid, NormalZOrderLayer)>,
+  current_windows: Vec<(Uuid, NormalZOrderLayer)>,
   focused_window_id: Uuid,
-) -> Option<Vec<WindowId>> {
-  let focused_layer = ordered_windows
+  previous_order: Option<&[Uuid]>,
+) -> Option<Vec<Uuid>> {
+  let focused_layer = current_windows
     .iter()
-    .find(|(_, window_id, _)| *window_id == focused_window_id)
-    .map(|(_, _, layer)| *layer)?;
+    .find(|(window_id, _)| *window_id == focused_window_id)
+    .map(|(_, layer)| *layer)?;
 
-  let mut focused_window = Vec::new();
-  let mut other_same_layer = Vec::new();
-  let mut other_floating = Vec::new();
-  let mut other_tiling = Vec::new();
+  // On the first reconciliation there is no prior native order to modify.
+  // Preserve the WM's current focus order as the initial order, then use
+  // that saved order for subsequent focus promotions.
+  let Some(previous_order) = previous_order else {
+    return Some(
+      current_windows
+        .into_iter()
+        .map(|(window_id, _)| window_id)
+        .collect(),
+    );
+  };
 
-  for (native_id, window_id, layer) in ordered_windows {
-    if window_id == focused_window_id {
-      focused_window.push(native_id);
-    } else if layer == focused_layer {
-      other_same_layer.push(native_id);
-    } else if layer == NormalZOrderLayer::Floating {
-      other_floating.push(native_id);
-    } else {
-      other_tiling.push(native_id);
+  let mut previous_or_focus_order = Vec::new();
+  for window_id in previous_order {
+    if current_windows
+      .iter()
+      .any(|(current_id, _)| current_id == window_id)
+      && !previous_or_focus_order.contains(window_id)
+    {
+      previous_or_focus_order.push(*window_id);
+    }
+  }
+
+  for (window_id, _) in &current_windows {
+    if !previous_or_focus_order.contains(window_id) {
+      previous_or_focus_order.push(*window_id);
     }
   }
 
   match focused_layer {
     NormalZOrderLayer::Tiling => {
-      focused_window.extend(other_same_layer);
-      focused_window.extend(other_floating);
-      focused_window.extend(other_tiling);
+      let mut tiled_windows = current_windows
+        .iter()
+        .filter(|(_, layer)| *layer == NormalZOrderLayer::Tiling)
+        .map(|(window_id, _)| *window_id)
+        .collect::<Vec<_>>();
+
+      let other_windows =
+        previous_or_focus_order.into_iter().filter(|window_id| {
+          current_windows
+            .iter()
+            .find(|(current_id, _)| current_id == window_id)
+            .is_some_and(|(_, layer)| *layer != NormalZOrderLayer::Tiling)
+        });
+
+      tiled_windows.extend(other_windows);
+      Some(tiled_windows)
     }
     NormalZOrderLayer::Floating => {
-      focused_window.extend(other_tiling);
-      focused_window.extend(other_same_layer);
+      previous_or_focus_order
+        .retain(|window_id| *window_id != focused_window_id);
+      previous_or_focus_order.insert(0, focused_window_id);
+      Some(previous_or_focus_order)
     }
   }
-
-  Some(focused_window)
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -520,12 +577,8 @@ mod tests {
   fn window(
     id: isize,
     layer: NormalZOrderLayer,
-  ) -> (WindowId, Uuid, NormalZOrderLayer) {
-    (
-      WindowId(id),
-      Uuid::from_u128(id.unsigned_abs() as u128),
-      layer,
-    )
+  ) -> (Uuid, NormalZOrderLayer) {
+    (Uuid::from_u128(id.unsigned_abs() as u128), layer)
   }
 
   #[test]
@@ -535,15 +588,30 @@ mod tests {
     let w3 = window(3, NormalZOrderLayer::Tiling);
     let w4 = window(4, NormalZOrderLayer::Tiling);
 
+    // Bootstrap the saved order from the initial stack:
+    // Detached1 > Detached2 > GlazeWM.
+    assert_eq!(
+      normal_z_order_chain(vec![d1, d2, w3, w4], d1.0, None),
+      Some(vec![d1.0, d2.0, w3.0, w4.0])
+    );
+
     // Alt-Tab to detached Window2: only that detached window is promoted.
     assert_eq!(
-      normal_z_order_chain(vec![d2, d1, w3, w4], d2.1,),
-      Some(vec![d2.0, w3.0, w4.0, d1.0])
+      normal_z_order_chain(
+        vec![d2, d1, w3, w4],
+        d2.0,
+        Some(&[d1.0, d2.0, w3.0, w4.0]),
+      ),
+      Some(vec![d2.0, d1.0, w3.0, w4.0])
     );
 
     // Alt-Tab to tiled Window3: the complete tiled group is promoted.
     assert_eq!(
-      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1,),
+      normal_z_order_chain(
+        vec![w3, w4, d2, d1],
+        w3.0,
+        Some(&[d2.0, d1.0, w3.0, w4.0]),
+      ),
       Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
@@ -559,14 +627,22 @@ mod tests {
     // to the front, while the remaining tiled group stays ahead of old
     // peers.
     assert_eq!(
-      normal_z_order_chain(vec![d3, w4, d2, d1], d3.1,),
+      normal_z_order_chain(
+        vec![d3, w4, d2, d1],
+        d3.0,
+        Some(&[d3.0, w4.0, d2.0, d1.0]),
+      ),
       Some(vec![d3.0, w4.0, d2.0, d1.0])
     );
 
     // Reattaching Window3 makes it part of the tiled group again.
     let w3 = window(3, NormalZOrderLayer::Tiling);
     assert_eq!(
-      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1,),
+      normal_z_order_chain(
+        vec![w3, w4, d2, d1],
+        w3.0,
+        Some(&[d3.0, w4.0, d2.0, d1.0]),
+      ),
       Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
