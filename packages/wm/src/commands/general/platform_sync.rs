@@ -212,13 +212,6 @@ fn redraw_containers(
   let windows_to_redraw = state.windows_to_redraw();
   let windows_to_bring_to_front =
     windows_to_bring_to_front(focused_container, state)?;
-  let focused_window_was_just_detached =
-    focused_container.as_window_container().is_ok_and(|window| {
-      windows_to_redraw.contains(&window)
-        && window
-          .prev_state()
-          .is_some_and(|state| matches!(state, WindowState::Tiling))
-    });
 
   let windows_to_update = {
     let mut windows = windows_to_redraw
@@ -381,10 +374,7 @@ fn redraw_containers(
   }
 
   #[cfg(target_os = "windows")]
-  reorder_focused_workspace_layers(
-    focused_container,
-    focused_window_was_just_detached,
-  );
+  reorder_focused_workspace_layers(focused_container);
 
   Ok(())
 }
@@ -402,10 +392,7 @@ fn redraw_containers(
 /// promoted while the remaining tiled group keeps its position relative to
 /// the other detached windows.
 #[cfg(target_os = "windows")]
-fn reorder_focused_workspace_layers(
-  focused_container: &Container,
-  focused_window_was_just_detached: bool,
-) {
+fn reorder_focused_workspace_layers(focused_container: &Container) {
   let Some(workspace) = focused_container.workspace() else {
     return;
   };
@@ -426,7 +413,6 @@ fn reorder_focused_workspace_layers(
   reorder_focused_workspace_layers_in_workspace(
     &workspace,
     focused_window_id,
-    focused_window_was_just_detached,
   );
 }
 
@@ -434,7 +420,6 @@ fn reorder_focused_workspace_layers(
 fn reorder_focused_workspace_layers_in_workspace(
   workspace: &Workspace,
   focused_window_id: Uuid,
-  focused_window_was_just_detached: bool,
 ) {
   let ordered_windows = workspace
     .descendant_focus_order()
@@ -458,11 +443,9 @@ fn reorder_focused_workspace_layers_in_workspace(
     })
     .collect::<Vec<_>>();
 
-  let Some(window_ids) = normal_z_order_chain(
-    ordered_windows,
-    focused_window_id,
-    focused_window_was_just_detached,
-  ) else {
+  let Some(window_ids) =
+    normal_z_order_chain(ordered_windows, focused_window_id)
+  else {
     return;
   };
 
@@ -485,15 +468,13 @@ enum NormalZOrderLayer {
 /// as one group.
 ///
 /// `ordered_windows` is in most-recent-focus order. A focused floating
-/// window normally moves ahead of its floating peers, which remain ahead
-/// of the tiled group. A just-detached focused window is the exception:
-/// its former tiled group remains ahead of the other floating peers,
-/// preserving the group's previous position in the stack.
+/// window moves ahead of the tiled group, but its floating peers remain
+/// below the tiled group. Only tiled windows are grouped together;
+/// detached windows must remain individual z-order items.
 #[cfg(target_os = "windows")]
 fn normal_z_order_chain(
   ordered_windows: Vec<(WindowId, Uuid, NormalZOrderLayer)>,
   focused_window_id: Uuid,
-  focused_window_was_just_detached: bool,
 ) -> Option<Vec<WindowId>> {
   let focused_layer = ordered_windows
     .iter()
@@ -523,13 +504,9 @@ fn normal_z_order_chain(
       focused_window.extend(other_floating);
       focused_window.extend(other_tiling);
     }
-    NormalZOrderLayer::Floating if focused_window_was_just_detached => {
-      focused_window.extend(other_tiling);
-      focused_window.extend(other_same_layer);
-    }
     NormalZOrderLayer::Floating => {
-      focused_window.extend(other_same_layer);
       focused_window.extend(other_tiling);
+      focused_window.extend(other_same_layer);
     }
   }
 
@@ -552,7 +529,7 @@ mod tests {
   }
 
   #[test]
-  fn tiled_windows_are_one_z_order_group() {
+  fn detached_focus_only_promotes_selected_window() {
     let d1 = window(1, NormalZOrderLayer::Floating);
     let d2 = window(2, NormalZOrderLayer::Floating);
     let w3 = window(3, NormalZOrderLayer::Tiling);
@@ -560,13 +537,13 @@ mod tests {
 
     // Alt-Tab to detached Window2: only that detached window is promoted.
     assert_eq!(
-      normal_z_order_chain(vec![d2, d1, w3, w4], d2.1, false,),
-      Some(vec![d2.0, d1.0, w3.0, w4.0])
+      normal_z_order_chain(vec![d2, d1, w3, w4], d2.1,),
+      Some(vec![d2.0, w3.0, w4.0, d1.0])
     );
 
     // Alt-Tab to tiled Window3: the complete tiled group is promoted.
     assert_eq!(
-      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1, false,),
+      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1,),
       Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
@@ -582,14 +559,14 @@ mod tests {
     // to the front, while the remaining tiled group stays ahead of old
     // peers.
     assert_eq!(
-      normal_z_order_chain(vec![d3, w4, d2, d1], d3.1, true,),
+      normal_z_order_chain(vec![d3, w4, d2, d1], d3.1,),
       Some(vec![d3.0, w4.0, d2.0, d1.0])
     );
 
     // Reattaching Window3 makes it part of the tiled group again.
     let w3 = window(3, NormalZOrderLayer::Tiling);
     assert_eq!(
-      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1, false,),
+      normal_z_order_chain(vec![w3, w4, d2, d1], w3.1,),
       Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
