@@ -1,5 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+  sync::atomic::{AtomicU64, Ordering},
+  time::Duration,
+};
 
+use tokio::runtime::Handle;
 use tracing::warn;
 use windows::{
   core::PWSTR,
@@ -570,11 +574,35 @@ impl NativeWindow {
 
     let flags = SWP_NOACTIVATE
       | SWP_NOCOPYBITS
+      | SWP_ASYNCWINDOWPOS
       | SWP_NOOWNERZORDER
       | SWP_NOMOVE
       | SWP_NOSIZE;
 
+    // A cross-process z-order request must not wait for a foreign GUI
+    // thread. Keep the retry generation-aware so an older focus transition
+    // cannot replay after a newer z-order repair has completed.
+    let generation = current_or_new_z_order_generation();
+    let expected_foreground = (!matches!(z_order, WindowZOrder::TopMost))
+      .then(|| unsafe { GetForegroundWindow() });
     unsafe { SetWindowPos(self.hwnd(), z_order_hwnd, 0, 0, 0, 0, flags) }?;
+
+    let handle = self.handle;
+    if let Ok(runtime) = Handle::try_current() {
+      runtime.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+          || expected_foreground.is_some_and(|foreground| {
+            (unsafe { GetForegroundWindow() }) != foreground
+          })
+        {
+          return;
+        }
+        let _ = unsafe {
+          SetWindowPos(HWND(handle), z_order_hwnd, 0, 0, 0, 0, flags)
+        };
+      });
+    }
 
     Ok(())
   }
@@ -831,9 +859,10 @@ pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
 /// The first window is placed at the top of the normal z-order. Each
-/// subsequent window is placed immediately after the previous one.
-/// Placement is synchronous so a later call cannot be overtaken by an
-/// older one.
+/// subsequent window is placed immediately after the previous one. Native
+/// requests are asynchronous so a suspended foreign GUI thread cannot
+/// block the WM loop; the generation-aware retry reconciles ordering after
+/// the target threads process their queued requests.
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -841,8 +870,26 @@ pub(crate) fn reorder_z_order(
     return Ok(());
   }
 
-  let _ = next_z_order_generation();
-  apply_z_order_chain(window_ids)
+  let generation = next_z_order_generation();
+  apply_z_order_chain(window_ids)?;
+
+  let window_ids = window_ids.to_vec();
+  let focused_window = window_ids[0];
+  if let Ok(runtime) = Handle::try_current() {
+    runtime.spawn(async move {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+
+      if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+        || unsafe { GetForegroundWindow() } != HWND(focused_window.0)
+      {
+        return;
+      }
+
+      let _ = apply_z_order_chain(&window_ids);
+    });
+  }
+
+  Ok(())
 }
 
 #[cfg(test)]
@@ -960,6 +1007,70 @@ mod reorder_z_order_tests {
       "chain must be applied top-to-bottom, with the topmost ignored window sunk"
     );
   }
+
+  fn assert_foreign_z_order_call_is_bounded(mode: &str) {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+      time::{Duration, Instant},
+    };
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut window_helper = Command::new(&current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "window")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn non-pumping window helper");
+    let stdout = window_helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let hwnd = lines
+      .next()
+      .expect("window helper HWND")
+      .expect("read window helper HWND")
+      .parse::<isize>()
+      .expect("parse window helper HWND");
+
+    let mut z_order_call = Command::new(&current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", mode)
+      .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
+      .stdout(Stdio::null())
+      .spawn()
+      .expect("spawn bounded z-order caller");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let completed = loop {
+      if z_order_call
+        .try_wait()
+        .expect("poll z-order caller")
+        .is_some()
+      {
+        break true;
+      }
+      if Instant::now() >= deadline {
+        break false;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    };
+
+    if !completed {
+      let _ = z_order_call.kill();
+      let _ = z_order_call.wait();
+    }
+    let _ = window_helper.kill();
+    let _ = window_helper.wait();
+
+    assert!(completed, "{mode} blocked on a non-pumping foreign HWND");
+  }
+
+  #[test]
+  fn set_z_order_does_not_wait_for_a_non_pumping_foreign_window() {
+    assert_foreign_z_order_call_is_bounded("set-z-order");
+  }
+
+  #[test]
+  fn reorder_z_order_does_not_wait_for_a_non_pumping_foreign_window() {
+    assert_foreign_z_order_call_is_bounded("reorder-z-order");
+  }
 }
 
 fn next_z_order_generation() -> u64 {
@@ -970,14 +1081,23 @@ pub(crate) fn begin_z_order_batch() -> u64 {
   next_z_order_generation()
 }
 
+fn current_or_new_z_order_generation() -> u64 {
+  let generation = Z_ORDER_GENERATION.load(Ordering::SeqCst);
+  if generation == 0 {
+    next_z_order_generation()
+  } else {
+    generation
+  }
+}
+
 fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
-  // Synchronous. `SWP_ASYNCWINDOWPOS` lets the HWND_NOTOPMOST pass
-  // complete after the placement pass and park a previously topmost
-  // window (Snipping Tool after a restart) above the tiled group.
+  // Always use asynchronous cross-thread requests. A debugger-suspended or
+  // otherwise hung target GUI thread must not block GlazeWM's event loop.
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
     | SWP_NOSIZE
+    | SWP_ASYNCWINDOWPOS
     | SWP_NOOWNERZORDER;
 
   for (index, window_id) in window_ids.iter().enumerate() {
