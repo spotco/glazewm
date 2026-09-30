@@ -87,9 +87,10 @@ window_effects:
     corner_style:
       enabled: false
       style: 'square'
-    # Very subtle dim on unfocused windows.
+    # Disabled. A 100% opacity effect is visually a no-op, but applying
+    # it still mutates window styles on every focus change.
     transparency:
-      enabled: true
+      enabled: false
       opacity: '100%'
 
 window_behavior:

@@ -1,14 +1,19 @@
 use std::{
-  sync::atomic::{AtomicU64, Ordering},
-  time::Duration,
+  cell::RefCell,
+  collections::HashMap,
+  sync::{
+    atomic::{AtomicU64, Ordering},
+    LazyLock, Mutex,
+  },
+  time::{Duration, Instant},
 };
 
 use tokio::runtime::Handle;
-use tracing::warn;
+use tracing::{debug, warn};
 use windows::{
   core::PWSTR,
   Win32::{
-    Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
+    Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT, WPARAM},
     Graphics::Dwm::{
       DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
       DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_COLOR_NONE,
@@ -16,8 +21,8 @@ use windows::{
       DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
     },
     System::Threading::{
-      OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-      PROCESS_QUERY_LIMITED_INFORMATION,
+      GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+      PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::{
       Input::KeyboardAndMouse::{
@@ -29,17 +34,18 @@ use windows::{
         GetForegroundWindow, GetLayeredWindowAttributes, GetParent,
         GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-        IsWindowVisible, IsZoomed, SendNotifyMessageW,
-        SetForegroundWindow, SetLayeredWindowAttributes,
-        SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-        ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-        GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
-        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
-        SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
-        SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-        SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT,
+        IsWindowVisible, IsZoomed, SendMessageTimeoutW,
+        SendNotifyMessageW, SetForegroundWindow,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
+        SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
+        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
+        HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
+        LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG, SMTO_NORMAL,
+        SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
+        SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE,
+        SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_CLOSE, WM_NULL, WPF_ASYNCWINDOWPLACEMENT,
         WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_LAYERED,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         WS_THICKFRAME,
@@ -60,6 +66,138 @@ use crate::{
 pub(crate) const FOREGROUND_INPUT_IDENTIFIER: u32 = 6379;
 
 static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Cross-thread `WM_NULL` budget.
+///
+/// A debugger break suspends the GUI thread immediately.
+/// `IsHungAppWindow` does not notice that for several seconds, so it
+/// cannot protect the WM loop. `SendMessageTimeoutW` can.
+const FOREIGN_GUI_PROBE_TIMEOUT_MS: u32 = 50;
+
+/// Per-HWND record of layered-window changes GlazeWM itself made.
+///
+/// Application-owned `WS_EX_LAYERED` state is not stored here and is
+/// left untouched by a fully opaque reset.
+#[derive(Clone, Copy)]
+struct LayeredEffectState {
+  added_layered: bool,
+  original_alpha: Option<u8>,
+}
+
+static LAYERED_EFFECTS: LazyLock<
+  Mutex<HashMap<isize, LayeredEffectState>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static NATIVE_OP_LOGGER: Mutex<Option<fn(&str)>> = Mutex::new(None);
+
+thread_local! {
+  static NATIVE_OP_RESULTS: RefCell<Vec<Option<&'static str>>> =
+    RefCell::new(Vec::new());
+}
+
+/// Registers the sink for `native-op` timing lines.
+///
+/// The WM points this at `layout.log`. An unmatched `native-op begin`
+/// is the call that blocked the WM thread.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_native_op_logger(logger: fn(&str)) {
+  if let Ok(mut guard) = NATIVE_OP_LOGGER.lock() {
+    *guard = Some(logger);
+  }
+}
+
+fn log_native_op(line: &str) {
+  debug!("{line}");
+  let logger = NATIVE_OP_LOGGER.lock().ok().and_then(|guard| *guard);
+  if let Some(logger) = logger {
+    logger(line);
+  }
+}
+
+fn hwnd_token(hwnd: HWND) -> String {
+  #[allow(clippy::cast_sign_loss)]
+  let value = hwnd.0 as usize;
+  format!("{value:#x}")
+}
+
+struct NativeOpSpan {
+  hwnd: String,
+  op: &'static str,
+  started: Instant,
+}
+
+impl Drop for NativeOpSpan {
+  fn drop(&mut self) {
+    let label = NATIVE_OP_RESULTS
+      .with(|stack| stack.borrow_mut().pop().flatten().unwrap_or("ok"));
+    log_native_op(&format!(
+      "native-op end hwnd={} op={} elapsed_ms={} result={label}",
+      self.hwnd,
+      self.op,
+      self.started.elapsed().as_millis()
+    ));
+  }
+}
+
+/// Logs a paired begin/end line around `body`.
+///
+/// The end line is written when `body` returns. A missing end in
+/// `layout.log` means `body` is still blocked in a foreign call.
+fn timed_native_op<T>(
+  hwnd: HWND,
+  op: &'static str,
+  body: impl FnOnce() -> T,
+) -> T {
+  let hwnd = hwnd_token(hwnd);
+  log_native_op(&format!("native-op begin hwnd={hwnd} op={op}"));
+  NATIVE_OP_RESULTS.with(|stack| stack.borrow_mut().push(None));
+  let _span = NativeOpSpan {
+    hwnd,
+    op,
+    started: Instant::now(),
+  };
+  body()
+}
+
+fn mark_native_op_result(label: &'static str) {
+  NATIVE_OP_RESULTS.with(|stack| {
+    if let Some(slot) = stack.borrow_mut().last_mut() {
+      *slot = Some(label);
+    }
+  });
+}
+
+fn with_layered_effects<T>(
+  body: impl FnOnce(&mut HashMap<isize, LayeredEffectState>) -> T,
+) -> T {
+  let mut guard = LAYERED_EFFECTS
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  if guard.len() >= 64 {
+    guard.retain(|handle, _| {
+      // SAFETY: `handle` is an HWND value previously observed by
+      // GlazeWM. `IsWindow` accepts stale handles and returns false.
+      unsafe { IsWindow(HWND(*handle)) }.as_bool()
+    });
+  }
+  body(&mut guard)
+}
+
+/// Reads the layered alpha, if the window currently has one.
+fn current_layered_alpha(hwnd: HWND) -> crate::Result<u8> {
+  let mut alpha = u8::MAX;
+  let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+  // SAFETY: `alpha` and `flag` are valid out-parameters.
+  unsafe {
+    GetLayeredWindowAttributes(
+      hwnd,
+      None,
+      Some(&raw mut alpha),
+      Some(&raw mut flag),
+    )?;
+  }
+  Ok(alpha)
+}
 
 /// Platform-specific implementation of [`NativeWindow`].
 #[derive(Clone, Debug)]
@@ -295,29 +433,91 @@ impl NativeWindow {
     Ok(())
   }
 
-  /// Implements [`NativeWindow::focus`].
-  pub(crate) fn focus(&self) -> crate::Result<()> {
-    let input = [INPUT {
-      r#type: INPUT_MOUSE,
-      Anonymous: INPUT_0 {
-        mi: MOUSEINPUT {
-          dwExtraInfo: FOREGROUND_INPUT_IDENTIFIER as usize,
-          ..Default::default()
-        },
-      },
-    }];
+  /// Whether the window's GUI thread can accept a synchronous message.
+  ///
+  /// Same-thread windows are treated as responsive. A cross-thread
+  /// target must answer `WM_NULL` within
+  /// [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. A debugger-suspended thread
+  /// does not, and the caller must skip the mutation.
+  fn foreign_gui_responsive(&self) -> bool {
+    let hwnd = self.hwnd();
+    // SAFETY: `IsWindow` accepts any bit pattern and reports whether
+    // it is still a window.
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+      return false;
+    }
 
-    // Bypass restriction for setting the foreground window by sending an
-    // input to our own process first.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    unsafe {
-      SendInput(&input, std::mem::size_of::<INPUT>() as i32)
+    let mut process_id = 0u32;
+    // SAFETY: `process_id` is a valid out-parameter.
+    let thread_id =
+      unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    if thread_id == 0 {
+      return false;
+    }
+    // SAFETY: `GetCurrentThreadId` has no parameters.
+    if thread_id == unsafe { GetCurrentThreadId() } {
+      return true;
+    }
+
+    let mut result = 0usize;
+    // SAFETY: `WM_NULL` carries no payload. The timeout keeps a
+    // suspended foreign GUI thread from stalling this thread.
+    let returned = unsafe {
+      SendMessageTimeoutW(
+        hwnd,
+        WM_NULL,
+        WPARAM(0),
+        LPARAM(0),
+        SMTO_ABORTIFHUNG | SMTO_NORMAL,
+        FOREIGN_GUI_PROBE_TIMEOUT_MS,
+        Some(&raw mut result),
+      )
     };
+    returned.0 != 0
+  }
 
-    // Set as the foreground window.
-    unsafe { SetForegroundWindow(self.hwnd()) }.ok()?;
+  /// Implements [`NativeWindow::focus`].
+  ///
+  /// Skips `SetForegroundWindow` when the target GUI thread does not
+  /// answer `WM_NULL`. A stale foreground window is preferable to
+  /// freezing the WM thread on a suspended debuggee.
+  pub(crate) fn focus(&self) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "focus", || {
+      if !self.foreign_gui_responsive() {
+        mark_native_op_result("skip-unresponsive");
+        warn!(
+          "Skipped focus for unresponsive hwnd={}.",
+          hwnd_token(self.hwnd())
+        );
+        return Ok(());
+      }
 
-    Ok(())
+      let input = [INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+          mi: MOUSEINPUT {
+            dwExtraInfo: FOREGROUND_INPUT_IDENTIFIER as usize,
+            ..Default::default()
+          },
+        },
+      }];
+
+      // Bypass restriction for setting the foreground window by
+      // sending an input to our own process first.
+      #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+      )]
+      unsafe {
+        SendInput(&input, std::mem::size_of::<INPUT>() as i32)
+      };
+
+      // SAFETY: `hwnd` was probed above and is still a window handle
+      // from the caller's point of view. The target thread answered
+      // `WM_NULL`, so this synchronous focus request can complete.
+      unsafe { SetForegroundWindow(self.hwnd()) }.ok()?;
+      Ok(())
+    })
   }
 
   /// Implements [`NativeWindow::close`].
@@ -477,7 +677,24 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_cloaked`].
+  ///
+  /// # Shell COM
+  ///
+  /// `set_cloaked`, `mark_fullscreen`, and `set_taskbar_visibility` are
+  /// synchronous RPC into Explorer / Immersive Shell. They do not wait
+  /// on the target window's GUI thread, so a debugger-suspended
+  /// debuggee does not block them. A wedged Explorer still can.
+  ///
+  /// They stay on the WM thread. A singleton worker would only move the
+  /// stall, and abandoning an in-flight Shell call leaks a thread stuck
+  /// in COM. The `native-op` begin/end lines identify that stall.
   pub(crate) fn set_cloaked(&self, cloaked: bool) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_cloaked", || {
+      self.set_cloaked_inner(cloaked)
+    })
+  }
+
+  fn set_cloaked_inner(&self, cloaked: bool) -> crate::Result<()> {
     COM_INIT.with(|com_init| -> crate::Result<()> {
       com_init.borrow_mut().with_retry(|com| {
         let view_collection = com.application_view_collection()?;
@@ -505,10 +722,19 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::mark_fullscreen`].
+  ///
+  /// See [`NativeWindow::set_cloaked`] for why this Shell RPC stays on
+  /// the WM thread and how a hang shows up in `layout.log`.
   pub(crate) fn mark_fullscreen(
     &self,
     fullscreen: bool,
   ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "mark_fullscreen", || {
+      self.mark_fullscreen_inner(fullscreen)
+    })
+  }
+
+  fn mark_fullscreen_inner(&self, fullscreen: bool) -> crate::Result<()> {
     COM_INIT.with(|com_init| -> crate::Result<()> {
       com_init.borrow_mut().with_retry(|com| {
         let taskbar_list = com.taskbar_list()?;
@@ -523,7 +749,19 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_taskbar_visibility`].
+  ///
+  /// See [`NativeWindow::set_cloaked`] for why this Shell RPC stays on
+  /// the WM thread and how a hang shows up in `layout.log`.
   pub(crate) fn set_taskbar_visibility(
+    &self,
+    visible: bool,
+  ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_taskbar_visibility", || {
+      self.set_taskbar_visibility_inner(visible)
+    })
+  }
+
+  fn set_taskbar_visibility_inner(
     &self,
     visible: bool,
   ) -> crate::Result<()> {
@@ -548,16 +786,94 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::add_window_style_ex`].
+  ///
+  /// Does nothing when the foreign GUI thread is not answering
+  /// messages. `SetWindowLongPtrW` delivers `WM_STYLECHANGING`
+  /// synchronously and would freeze the WM thread on a suspended
+  /// debuggee.
   pub(crate) fn add_window_style_ex(&self, style: WINDOW_EX_STYLE) {
+    timed_native_op(self.hwnd(), "add_window_style_ex", || {
+      let current_style =
+        unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) };
+
+      #[allow(clippy::cast_possible_wrap)]
+      let bit = style.0 as isize;
+      if current_style & bit != 0 {
+        mark_native_op_result("unchanged");
+        return;
+      }
+      if !self.foreign_gui_responsive() {
+        mark_native_op_result("skip-unresponsive");
+        warn!(
+          "Skipped extended style {:#x} for unresponsive hwnd={}.",
+          style.0,
+          hwnd_token(self.hwnd())
+        );
+        return;
+      }
+
+      // SAFETY: The target thread answered `WM_NULL`. Style changes
+      // still send `WM_STYLECHANGING` to that thread.
+      unsafe {
+        SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, current_style | bit);
+      }
+    });
+  }
+
+  /// Clears an extended style bit when the target GUI thread is
+  /// responsive.
+  ///
+  /// Returns `false` when the mutation was skipped. The caller keeps
+  /// any ownership record so a later responsive call can retry.
+  fn remove_window_style_ex(&self, style: WINDOW_EX_STYLE) -> bool {
+    if !self.foreign_gui_responsive() {
+      return false;
+    }
+
     let current_style =
       unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) };
-
     #[allow(clippy::cast_possible_wrap)]
-    if current_style & style.0 as isize == 0 {
-      let new_style = current_style | style.0 as isize;
-
-      unsafe { SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, new_style) };
+    let bit = style.0 as isize;
+    if current_style & bit == 0 {
+      return true;
     }
+
+    // SAFETY: The target thread answered `WM_NULL` immediately above.
+    unsafe {
+      SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, current_style & !bit);
+    }
+
+    // Clearing `WS_EX_LAYERED` is ignored until the window thread
+    // applies `SWP_FRAMECHANGED`. The caller already proved that
+    // thread answers messages, so this flush is synchronous. An
+    // asynchronous flush leaves `GetWindowLongPtrW` reporting the
+    // old bit.
+    let flushed = unsafe {
+      SetWindowPos(
+        self.hwnd(),
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED
+          | SWP_NOMOVE
+          | SWP_NOSIZE
+          | SWP_NOZORDER
+          | SWP_NOOWNERZORDER
+          | SWP_NOACTIVATE
+          | SWP_NOCOPYBITS
+          | SWP_NOSENDCHANGING,
+      )
+    };
+    if let Err(err) = flushed {
+      warn!(
+        "Failed to flush cleared extended style on hwnd={}: {err}",
+        hwnd_token(self.hwnd())
+      );
+      return false;
+    }
+    !self.has_window_style_ex(style)
   }
 
   /// Implements [`NativeWindowWindowsExt::set_z_order`].
@@ -608,20 +924,39 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_title_bar_visibility`].
+  ///
+  /// Skips the style write when the foreign GUI thread is not
+  /// answering messages. The following `SetWindowPos` is already
+  /// asynchronous; `SetWindowLongPtrW` is not.
   pub(crate) fn set_title_bar_visibility(
     &self,
     visible: bool,
   ) -> crate::Result<()> {
-    let style = unsafe { GetWindowLongPtrW(self.hwnd(), GWL_STYLE) };
+    timed_native_op(self.hwnd(), "set_title_bar_visibility", || {
+      let style = unsafe { GetWindowLongPtrW(self.hwnd(), GWL_STYLE) };
 
-    #[allow(clippy::cast_possible_wrap)]
-    let new_style = if visible {
-      style | (WS_DLGFRAME.0 as isize)
-    } else {
-      style & !(WS_DLGFRAME.0 as isize)
-    };
+      #[allow(clippy::cast_possible_wrap)]
+      let new_style = if visible {
+        style | (WS_DLGFRAME.0 as isize)
+      } else {
+        style & !(WS_DLGFRAME.0 as isize)
+      };
 
-    if new_style != style {
+      if new_style == style {
+        mark_native_op_result("unchanged");
+        return Ok(());
+      }
+      if !self.foreign_gui_responsive() {
+        mark_native_op_result("skip-unresponsive");
+        warn!(
+          "Skipped title-bar style for unresponsive hwnd={}.",
+          hwnd_token(self.hwnd())
+        );
+        return Ok(());
+      }
+
+      // SAFETY: The target thread answered `WM_NULL`. `SWP_ASYNCWINDOWPOS`
+      // keeps the frame refresh off this thread.
       unsafe {
         SetWindowLongPtrW(self.hwnd(), GWL_STYLE, new_style);
         SetWindowPos(
@@ -642,9 +977,8 @@ impl NativeWindow {
             | SWP_ASYNCWINDOWPOS,
         )?;
       }
-    }
-
-    Ok(())
+      Ok(())
+    })
   }
 
   /// Implements [`NativeWindowWindowsExt::set_border_color`].
@@ -696,22 +1030,111 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_transparency`].
+  ///
+  /// A fully opaque request does not add `WS_EX_LAYERED`. If GlazeWM
+  /// added that bit, the opaque request removes it. An
+  /// application-owned layered window keeps its style and, on reset,
+  /// the alpha it had before GlazeWM changed it.
+  ///
+  /// Style and layered-attribute writes are skipped when the foreign
+  /// GUI thread is not answering messages.
   pub(crate) fn set_transparency(
     &self,
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
-    // Make the window layered if it isn't already.
-    self.add_window_style_ex(WS_EX_LAYERED);
+    timed_native_op(self.hwnd(), "set_transparency", || {
+      self.set_transparency_inner(opacity_value)
+    })
+  }
 
-    unsafe {
-      SetLayeredWindowAttributes(
-        self.hwnd(),
-        None,
-        opacity_value.to_alpha(),
-        LWA_ALPHA,
-      )?;
+  fn set_transparency_inner(
+    &self,
+    opacity_value: &OpacityValue,
+  ) -> crate::Result<()> {
+    let alpha = opacity_value.to_alpha();
+    let handle = self.handle;
+
+    if alpha == u8::MAX {
+      return self.reset_transparency(handle);
     }
 
+    if !self.foreign_gui_responsive() {
+      mark_native_op_result("skip-unresponsive");
+      warn!(
+        "Skipped transparency for unresponsive hwnd={}.",
+        hwnd_token(self.hwnd())
+      );
+      return Ok(());
+    }
+
+    let layered = self.has_window_style_ex(WS_EX_LAYERED);
+    if !layered {
+      self.add_window_style_ex(WS_EX_LAYERED);
+      if !self.has_window_style_ex(WS_EX_LAYERED) {
+        mark_native_op_result("skip-unresponsive");
+        return Ok(());
+      }
+      with_layered_effects(|effects| {
+        effects.insert(
+          handle,
+          LayeredEffectState {
+            added_layered: true,
+            original_alpha: None,
+          },
+        );
+      });
+    } else {
+      with_layered_effects(|effects| {
+        if !effects.contains_key(&handle) {
+          let original = current_layered_alpha(self.hwnd()).ok();
+          effects.insert(
+            handle,
+            LayeredEffectState {
+              added_layered: false,
+              original_alpha: original,
+            },
+          );
+        }
+      });
+    }
+
+    self.apply_layered_alpha(alpha)
+  }
+
+  /// Restores the pre-GlazeWM layered state for a fully opaque value.
+  fn reset_transparency(&self, handle: isize) -> crate::Result<()> {
+    let state =
+      with_layered_effects(|effects| effects.get(&handle).copied());
+    let Some(state) = state else {
+      mark_native_op_result("noop");
+      return Ok(());
+    };
+
+    if state.added_layered {
+      if !self.remove_window_style_ex(WS_EX_LAYERED) {
+        mark_native_op_result("skip-unresponsive");
+        return Ok(());
+      }
+    } else if let Some(original) = state.original_alpha {
+      if !self.foreign_gui_responsive() {
+        mark_native_op_result("skip-unresponsive");
+        return Ok(());
+      }
+      self.apply_layered_alpha(original)?;
+    }
+
+    with_layered_effects(|effects| {
+      effects.remove(&handle);
+    });
+    Ok(())
+  }
+
+  fn apply_layered_alpha(&self, alpha: u8) -> crate::Result<()> {
+    // SAFETY: Caller has established that the GUI thread is
+    // responsive, or this window's thread is the caller.
+    unsafe {
+      SetLayeredWindowAttributes(self.hwnd(), None, alpha, LWA_ALPHA)?;
+    }
     Ok(())
   }
 
@@ -902,16 +1325,21 @@ mod reorder_z_order_tests {
       Foundation::{HWND, LPARAM, LRESULT, WPARAM},
       UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, GetTopWindow, GetWindow, GetWindowLongPtrW,
-        RegisterClassW, TranslateMessage, UnregisterClassW, GWL_EXSTYLE,
-        GW_HWNDNEXT, MSG, WINDOW_EX_STYLE, WM_WINDOWPOSCHANGING,
-        WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        GetLayeredWindowAttributes, GetMessageW, GetTopWindow, GetWindow,
+        GetWindowLongPtrW, RegisterClassW, SetLayeredWindowAttributes,
+        TranslateMessage, UnregisterClassW, GWL_EXSTYLE, GWL_STYLE,
+        GW_HWNDNEXT, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG,
+        WINDOW_EX_STYLE, WM_WINDOWPOSCHANGING, WNDCLASSW, WS_DLGFRAME,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
       },
     },
   };
 
   use super::reorder_z_order;
-  use crate::{WindowId, WindowZOrder};
+  use crate::{
+    Color, CornerStyle, OpacityValue, Rect, WindowId, WindowZOrder,
+  };
 
   unsafe extern "system" fn reorder_test_wnd_proc(
     hwnd: HWND,
@@ -975,6 +1403,19 @@ mod reorder_z_order_tests {
   }
 
   fn create_non_pumping_window() {
+    create_non_pumping_window_with(false);
+  }
+
+  fn create_layered_non_pumping_window() {
+    create_non_pumping_window_with(true);
+  }
+
+  /// Creates a visible top-level window and then stops pumping.
+  ///
+  /// `layered` sets `WS_EX_LAYERED` and an alpha on this thread before
+  /// the pump stops, so a later cross-thread call sees an
+  /// application-owned layered window.
+  fn create_non_pumping_window_with(layered: bool) {
     use std::{io::Write, thread, time::Duration};
 
     let class_name =
@@ -987,10 +1428,16 @@ mod reorder_z_order_tests {
     let atom = unsafe { RegisterClassW(&raw const class) };
     assert_ne!(atom, 0, "register non-pumping helper class");
 
-    let title = wide("GlazeWM non-pumping z-order helper");
+    let title = wide("GlazeWM non-pumping foreign helper");
+    // Tool + no-activate keeps a running GlazeWM from managing the
+    // helper and racing these assertions.
+    let mut ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    if layered {
+      ex_style |= WS_EX_LAYERED;
+    }
     let hwnd = unsafe {
       CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        ex_style,
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -1005,8 +1452,23 @@ mod reorder_z_order_tests {
       )
     };
     assert_ne!(hwnd.0, 0, "create non-pumping helper window");
+    if layered {
+      unsafe {
+        SetLayeredWindowAttributes(hwnd, None, 200, LWA_ALPHA)
+          .expect("seed layered alpha");
+      }
+    }
     println!("GLAZEWM_Z_ORDER_HWND:{}", hwnd.0);
     std::io::stdout().flush().expect("flush helper HWND");
+    // `Sleep` leaves the thread schedulable. `SuspendThread` matches a
+    // debugger break: the GUI thread cannot run at all. The parent
+    // kills this process.
+    unsafe {
+      windows::Win32::System::Threading::SuspendThread(
+        windows::Win32::System::Threading::GetCurrentThread(),
+      );
+    }
+    // Unreachable unless another thread resumes us.
     loop {
       thread::sleep(Duration::from_secs(60));
     }
@@ -1076,11 +1538,16 @@ mod reorder_z_order_tests {
 
     let topmost = std::env::var("GLAZEWM_Z_ORDER_TOPMOST").ok().as_deref()
       == Some("1");
-    let ex_style = if topmost {
+    let mut ex_style = if topmost {
       WS_EX_TOPMOST
     } else {
       WINDOW_EX_STYLE::default()
     };
+    if std::env::var("GLAZEWM_FOREIGN_IGNORED").ok().as_deref()
+      == Some("1")
+    {
+      ex_style |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+    }
     let title = wide("GlazeWM independent z-order helper");
     let hwnd = unsafe {
       CreateWindowExW(
@@ -1135,6 +1602,20 @@ mod reorder_z_order_tests {
   fn z_order_test_helper_window() {
     if helper_mode("window") {
       create_non_pumping_window();
+    }
+  }
+
+  #[test]
+  fn foreign_hwnd_test_helper_layered_window() {
+    if helper_mode("layered-window") {
+      create_layered_non_pumping_window();
+    }
+  }
+
+  #[test]
+  fn foreign_hwnd_test_helper_call() {
+    if helper_mode("call") {
+      run_foreign_hwnd_op();
     }
   }
 
@@ -1346,6 +1827,18 @@ mod reorder_z_order_tests {
     topmost: bool,
     delay_ms: u64,
   ) -> (std::process::Child, HWND) {
+    spawn_single_pumping_window_helper_ex(topmost, delay_ms, false)
+  }
+
+  fn spawn_ignored_pumping_window_helper() -> (std::process::Child, HWND) {
+    spawn_single_pumping_window_helper_ex(false, 0, true)
+  }
+
+  fn spawn_single_pumping_window_helper_ex(
+    topmost: bool,
+    delay_ms: u64,
+    ignored: bool,
+  ) -> (std::process::Child, HWND) {
     use std::{
       io::{BufRead, BufReader},
       process::{Command, Stdio},
@@ -1356,6 +1849,7 @@ mod reorder_z_order_tests {
       .env("GLAZEWM_Z_ORDER_HELPER", "single-pumping-window")
       .env("GLAZEWM_Z_ORDER_TOPMOST", if topmost { "1" } else { "0" })
       .env("GLAZEWM_Z_ORDER_DELAY_MS", delay_ms.to_string())
+      .env("GLAZEWM_FOREIGN_IGNORED", if ignored { "1" } else { "0" })
       .arg("z_order_test_helper_single_pumping_window")
       .arg("--nocapture")
       .stdout(Stdio::piped())
@@ -1440,6 +1934,477 @@ mod reorder_z_order_tests {
   #[test]
   fn reorder_z_order_does_not_wait_for_a_non_pumping_foreign_window() {
     assert_foreign_z_order_call_is_bounded("reorder-z-order");
+  }
+
+  fn run_foreign_hwnd_op() {
+    let hwnd = std::env::var("GLAZEWM_Z_ORDER_HWND")
+      .expect("helper HWND")
+      .parse::<isize>()
+      .expect("parse helper HWND");
+    let op = std::env::var("GLAZEWM_FOREIGN_OP").expect("foreign op");
+    let window = super::NativeWindow::new(hwnd);
+    match op.as_str() {
+      "focus" => window.focus().expect("focus"),
+      "set-transparency" => window
+        .set_transparency(&OpacityValue::from_alpha(180))
+        .expect("set transparency"),
+      "set-transparency-opaque" => window
+        .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+        .expect("set opaque transparency"),
+      "set-title-bar" => window
+        .set_title_bar_visibility(false)
+        .expect("hide title bar"),
+      "set-border-color" => window
+        .set_border_color(Some(&Color {
+          r: 0x6c,
+          g: 0xb6,
+          b: 0xff,
+          a: 255,
+        }))
+        .expect("set border color"),
+      "set-corner-style" => window
+        .set_corner_style(&CornerStyle::Square)
+        .expect("set corner style"),
+      "restore" => window
+        .restore(Some(&Rect::from_xy(40, 40, 200, 120)))
+        .expect("restore"),
+      "set-window-pos" => window
+        .set_frame(&Rect::from_xy(50, 50, 220, 140))
+        .expect("set frame"),
+      "show" => window.show().expect("show"),
+      "hide" => window.hide().expect("hide"),
+      "minimize" => window.minimize().expect("minimize"),
+      "maximize" => window.maximize().expect("maximize"),
+      "focus-transition" => run_focus_transition(&window),
+      _ => panic!("unknown foreign HWND op: {op}"),
+    }
+  }
+
+  /// Mirrors `platform_sync` on a focus change: focus the newly active
+  /// window, then apply border, corner, title-bar, and transparency
+  /// effects to both the new window and the previous one.
+  fn run_focus_transition(old_window: &super::NativeWindow) {
+    let new_hwnd = std::env::var("GLAZEWM_FOREIGN_NEW_HWND")
+      .expect("new HWND")
+      .parse::<isize>()
+      .expect("parse new HWND");
+    let new_window = super::NativeWindow::new(new_hwnd);
+    new_window.focus().expect("focus replacement window");
+    let color = Color {
+      r: 0x6c,
+      g: 0xb6,
+      b: 0xff,
+      a: 255,
+    };
+    for target in [&new_window, old_window] {
+      target
+        .set_border_color(Some(&color))
+        .expect("border effect");
+      target
+        .set_corner_style(&CornerStyle::Square)
+        .expect("corner effect");
+      target
+        .set_title_bar_visibility(false)
+        .expect("title-bar effect");
+      target
+        .set_transparency(&OpacityValue::from_alpha(180))
+        .expect("transparency effect");
+    }
+  }
+
+  struct KillOnDrop(Option<std::process::Child>);
+
+  impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+      if let Some(child) = self.0.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+      }
+    }
+  }
+
+  fn read_helper_hwnd(
+    line_prefix: &str,
+    child: &mut std::process::Child,
+  ) -> isize {
+    use std::io::{BufRead, BufReader};
+
+    let stdout = child.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+      let line = lines
+        .next()
+        .expect("helper HWND line")
+        .expect("read helper HWND line");
+      if let Some(hwnd) = line.strip_prefix(line_prefix) {
+        return hwnd.parse::<isize>().expect("parse helper HWND");
+      }
+    }
+  }
+
+  fn spawn_non_pumping_helper(layered: bool) -> (KillOnDrop, isize) {
+    use std::process::{Command, Stdio};
+
+    let mode = if layered { "layered-window" } else { "window" };
+    let test_name = if layered {
+      "foreign_hwnd_test_helper_layered_window"
+    } else {
+      "z_order_test_helper_window"
+    };
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut helper = Command::new(current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", mode)
+      .arg(test_name)
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn non-pumping window helper");
+    let hwnd = read_helper_hwnd("GLAZEWM_Z_ORDER_HWND:", &mut helper);
+    (KillOnDrop(Some(helper)), hwnd)
+  }
+
+  /// Runs one production native call in a child process.
+  ///
+  /// The child is killed if it is still running after two seconds, so a
+  /// blocked foreign-HWND call fails the test without stalling CI.
+  fn foreign_call_finished(
+    op: &str,
+    hwnd: isize,
+    new_hwnd: Option<isize>,
+  ) -> bool {
+    use std::{
+      process::{Command, Stdio},
+      time::{Duration, Instant},
+    };
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut command = Command::new(current_exe);
+    command
+      .env("GLAZEWM_Z_ORDER_HELPER", "call")
+      .env("GLAZEWM_FOREIGN_OP", op)
+      .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
+      .arg("foreign_hwnd_test_helper_call")
+      .arg("--nocapture")
+      .stdout(Stdio::null())
+      .stderr(Stdio::inherit());
+    if let Some(new_hwnd) = new_hwnd {
+      command.env("GLAZEWM_FOREIGN_NEW_HWND", new_hwnd.to_string());
+    }
+    let mut caller = command.spawn().expect("spawn foreign HWND caller");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+      if let Some(status) = caller.try_wait().expect("poll foreign caller")
+      {
+        break Some(status);
+      }
+      if Instant::now() >= deadline {
+        break None;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    };
+    match status {
+      Some(status) => status.success(),
+      None => {
+        let _ = caller.kill();
+        let _ = caller.wait();
+        false
+      }
+    }
+  }
+
+  fn ex_style_bit(hwnd: isize, bit: u32) -> bool {
+    #[allow(clippy::cast_possible_wrap)]
+    let bit = bit as isize;
+    let style = unsafe { GetWindowLongPtrW(HWND(hwnd), GWL_EXSTYLE) };
+    style & bit != 0
+  }
+
+  fn has_dlg_frame(hwnd: isize) -> bool {
+    #[allow(clippy::cast_possible_wrap)]
+    let bit = WS_DLGFRAME.0 as isize;
+    let style = unsafe { GetWindowLongPtrW(HWND(hwnd), GWL_STYLE) };
+    style & bit != 0
+  }
+
+  fn layered_alpha(hwnd: isize) -> u8 {
+    let mut alpha = 0u8;
+    let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+    unsafe {
+      GetLayeredWindowAttributes(
+        HWND(hwnd),
+        None,
+        Some(&raw mut alpha),
+        Some(&raw mut flag),
+      )
+      .expect("read layered alpha");
+    }
+    alpha
+  }
+
+  fn assert_bounded_foreign_op(op: &str, layered: bool) {
+    let (helper, hwnd) = spawn_non_pumping_helper(layered);
+    let completed = foreign_call_finished(op, hwnd, None);
+    drop(helper);
+    assert!(
+      completed,
+      "{op} blocked on a non-pumping foreign HWND (layered={layered})"
+    );
+  }
+
+  #[test]
+  fn foreign_hwnd_focus_is_bounded() {
+    assert_bounded_foreign_op("focus", false);
+  }
+
+  #[test]
+  fn foreign_hwnd_set_transparency_does_not_mutate_non_layered() {
+    let (helper, hwnd) = spawn_non_pumping_helper(false);
+    let completed = foreign_call_finished("set-transparency", hwnd, None);
+    let layered = ex_style_bit(hwnd, WS_EX_LAYERED.0);
+    drop(helper);
+    assert!(
+      completed,
+      "set_transparency blocked on a non-pumping foreign HWND"
+    );
+    assert!(
+      !layered,
+      "set_transparency added WS_EX_LAYERED on a non-pumping window"
+    );
+  }
+
+  #[test]
+  fn foreign_hwnd_opaque_transparency_does_not_layer() {
+    let (helper, hwnd) = spawn_non_pumping_helper(false);
+    let completed =
+      foreign_call_finished("set-transparency-opaque", hwnd, None);
+    let layered = ex_style_bit(hwnd, WS_EX_LAYERED.0);
+    drop(helper);
+    assert!(
+      completed,
+      "opaque set_transparency blocked on a non-pumping foreign HWND"
+    );
+    assert!(!layered, "opaque set_transparency added WS_EX_LAYERED");
+  }
+
+  #[test]
+  fn foreign_hwnd_set_transparency_keeps_layered_alpha() {
+    let (helper, hwnd) = spawn_non_pumping_helper(true);
+    let before = layered_alpha(hwnd);
+    let completed = foreign_call_finished("set-transparency", hwnd, None);
+    let after = layered_alpha(hwnd);
+    let still_layered = ex_style_bit(hwnd, WS_EX_LAYERED.0);
+    drop(helper);
+    assert!(
+      completed,
+      "set_transparency blocked on a layered non-pumping foreign HWND"
+    );
+    assert!(still_layered, "application WS_EX_LAYERED was cleared");
+    assert_eq!(
+      before, after,
+      "set_transparency changed alpha on a non-pumping layered window"
+    );
+  }
+
+  #[test]
+  fn foreign_hwnd_set_title_bar_visibility_is_bounded() {
+    let (helper, hwnd) = spawn_non_pumping_helper(false);
+    assert!(has_dlg_frame(hwnd), "helper window should have a title bar");
+    let completed = foreign_call_finished("set-title-bar", hwnd, None);
+    let still_framed = has_dlg_frame(hwnd);
+    drop(helper);
+    assert!(
+      completed,
+      "set_title_bar_visibility blocked on a non-pumping foreign HWND"
+    );
+    assert!(
+      still_framed,
+      "title-bar style changed on a non-pumping window"
+    );
+  }
+
+  #[test]
+  fn foreign_hwnd_remaining_native_mutations_are_bounded() {
+    for op in [
+      "set-border-color",
+      "set-corner-style",
+      "restore",
+      "set-window-pos",
+      "show",
+      "hide",
+      "minimize",
+      "maximize",
+    ] {
+      assert_bounded_foreign_op(op, false);
+    }
+  }
+
+  #[test]
+  fn foreign_hwnd_focus_transition_effects_are_bounded() {
+    let (old_helper, old_hwnd) = spawn_non_pumping_helper(false);
+    let (mut new_helper, new_hwnd) = spawn_ignored_pumping_window_helper();
+    let had_frame = has_dlg_frame(old_hwnd);
+    let completed = foreign_call_finished(
+      "focus-transition",
+      old_hwnd,
+      Some(new_hwnd.0),
+    );
+    let layered = ex_style_bit(old_hwnd, WS_EX_LAYERED.0);
+    let still_framed = has_dlg_frame(old_hwnd);
+    drop(old_helper);
+    let _ = new_helper.kill();
+    let _ = new_helper.wait();
+    assert!(had_frame, "suspended window should start with a title bar");
+    assert!(
+      completed,
+      "focus-transition effects blocked on a non-pumping foreign HWND"
+    );
+    assert!(!layered, "focus transition layered the suspended window");
+    assert!(
+      still_framed,
+      "focus transition changed the suspended window title bar"
+    );
+  }
+
+  #[test]
+  fn foreign_hwnd_opaque_transparency_skips_responsive_window() {
+    let class_name =
+      wide(&format!("GlazeWmOpacityNoop{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register opacity class");
+    let title = wide("glazewm-opacity-noop");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        40,
+        40,
+        160,
+        80,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create opacity window");
+    let window = super::NativeWindow::new(hwnd.0);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      .expect("opaque noop");
+    assert!(
+      !ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
+      "100% transparency must not add WS_EX_LAYERED"
+    );
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(80))
+      .expect("partial transparency");
+    assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
+    assert_eq!(layered_alpha(hwnd.0), 80);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      .expect("reset transparency");
+    assert!(
+      !ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
+      "reset must remove WS_EX_LAYERED that GlazeWM added"
+    );
+
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn foreign_hwnd_transparency_reset_preserves_app_layered_state() {
+    let class_name =
+      wide(&format!("GlazeWmOpacityOwned{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register owned layered class");
+    let title = wide("glazewm-owned-layered");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        40,
+        40,
+        160,
+        80,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create app-layered window");
+    unsafe {
+      SetLayeredWindowAttributes(hwnd, None, 100, LWA_ALPHA)
+        .expect("seed app alpha");
+    }
+    let window = super::NativeWindow::new(hwnd.0);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      .expect("opaque request");
+    assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
+    assert_eq!(layered_alpha(hwnd.0), 100);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(80))
+      .expect("glazewm alpha");
+    assert_eq!(layered_alpha(hwnd.0), 80);
+    assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      .expect("restore app alpha");
+    assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
+    assert_eq!(layered_alpha(hwnd.0), 100);
+
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn foreign_hwnd_set_transparency_updates_pumping_window() {
+    let (mut helper, hwnd) = spawn_ignored_pumping_window_helper();
+    let window = super::NativeWindow::new(hwnd.0);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(80))
+      .expect("foreign partial transparency");
+    assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
+    assert_eq!(layered_alpha(hwnd.0), 80);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      .expect("foreign transparency reset");
+    assert!(
+      !ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
+      "reset must clear the layered bit GlazeWM added on a foreign window"
+    );
+
+    let _ = helper.kill();
+    let _ = helper.wait();
   }
 }
 
