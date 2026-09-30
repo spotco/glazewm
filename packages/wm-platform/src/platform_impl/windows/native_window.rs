@@ -901,10 +901,11 @@ mod reorder_z_order_tests {
     Win32::{
       Foundation::{HWND, LPARAM, LRESULT, WPARAM},
       UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GetTopWindow,
-        GetWindow, RegisterClassW, UnregisterClassW, GW_HWNDNEXT,
-        WINDOW_EX_STYLE, WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        GetMessageW, GetTopWindow, GetWindow, GetWindowLongPtrW,
+        RegisterClassW, TranslateMessage, UnregisterClassW, GWL_EXSTYLE,
+        GW_HWNDNEXT, MSG, WINDOW_EX_STYLE, WNDCLASSW, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
       },
     },
   };
@@ -1011,6 +1012,39 @@ mod reorder_z_order_tests {
     }
   }
 
+  fn create_pumping_window_pair() {
+    use std::{io::Write, time::Duration};
+
+    let class_name =
+      wide(&format!("GlazeWmPumpingHelper{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register pumping helper class");
+
+    let topmost = create_test_window(&class_name, true);
+    let peer = create_test_window(&class_name, false);
+    println!("GLAZEWM_Z_ORDER_PUMPING_HWND:{}:{}", topmost.0, peer.0);
+    std::io::stdout()
+      .flush()
+      .expect("flush pumping helper HWNDs");
+
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {
+      unsafe {
+        TranslateMessage(&raw const message);
+        DispatchMessageW(&raw const message);
+      }
+    }
+
+    // Keep the helper alive if it receives a quit message before the
+    // parent has finished polling the windows.
+    std::thread::sleep(Duration::from_secs(60));
+  }
+
   fn run_z_order_helper_call(mode: &str) {
     let hwnd = std::env::var("GLAZEWM_Z_ORDER_HWND")
       .expect("helper HWND")
@@ -1033,6 +1067,13 @@ mod reorder_z_order_tests {
   fn z_order_test_helper_window() {
     if helper_mode("window") {
       create_non_pumping_window();
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_pumping_window() {
+    if helper_mode("pumping-window") {
+      create_pumping_window_pair();
     }
   }
 
@@ -1148,6 +1189,102 @@ mod reorder_z_order_tests {
     let _ = window_helper.wait();
 
     assert!(completed, "{mode} blocked on a non-pumping foreign HWND");
+  }
+
+  fn foreign_windows_have_order(expected: &[HWND]) -> bool {
+    let order = relative_order(expected);
+    #[allow(clippy::cast_possible_wrap)]
+    let topmost_style = WS_EX_TOPMOST.0 as isize;
+    let all_not_topmost = expected.iter().all(|window| {
+      let style = unsafe { GetWindowLongPtrW(*window, GWL_EXSTYLE) };
+      style & topmost_style == 0
+    });
+    let expected_order =
+      expected.iter().map(|window| window.0).collect::<Vec<_>>();
+    order == expected_order && all_not_topmost
+  }
+
+  fn assert_foreign_z_order_converges(expected: &[HWND]) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+      if foreign_windows_have_order(expected) {
+        return;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let order = relative_order(expected);
+    #[allow(clippy::cast_possible_wrap)]
+    let topmost_style = WS_EX_TOPMOST.0 as isize;
+    let topmost_states = expected
+      .iter()
+      .map(|window| {
+        (unsafe { GetWindowLongPtrW(*window, GWL_EXSTYLE) }
+          & topmost_style)
+          != 0
+      })
+      .collect::<Vec<_>>();
+    let expected_order =
+      expected.iter().map(|window| window.0).collect::<Vec<_>>();
+    panic!("foreign z-order did not converge: expected={expected_order:?}, actual={order:?}, topmost={topmost_states:?}");
+  }
+
+  fn spawn_pumping_window_helper() -> (std::process::Child, [HWND; 2]) {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+    };
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut helper = Command::new(current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "pumping-window")
+      .arg("z_order_test_helper_pumping_window")
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn pumping window helper");
+    let stdout = helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let handles = loop {
+      let line = lines
+        .next()
+        .expect("pumping helper HWNDs")
+        .expect("read pumping helper HWNDs");
+      if let Some(handles) =
+        line.strip_prefix("GLAZEWM_Z_ORDER_PUMPING_HWND:")
+      {
+        break handles
+          .split(':')
+          .map(|handle| {
+            handle.parse::<isize>().expect("parse pumping helper HWND")
+          })
+          .collect::<Vec<_>>();
+      }
+    };
+    assert_eq!(handles.len(), 2, "pumping helper must expose two HWNDs");
+    (helper, [HWND(handles[0]), HWND(handles[1])])
+  }
+
+  #[test]
+  fn reorder_z_order_converges_for_foreign_pumping_windows() {
+    let (mut helper, [topmost, peer]) = spawn_pumping_window_helper();
+
+    reorder_z_order(&[WindowId(topmost.0), WindowId(peer.0)])
+      .expect("reorder foreign pumping windows");
+    assert_foreign_z_order_converges(&[topmost, peer]);
+
+    // Queue two successive desired chains before polling. The final chain
+    // must win without restoring TOPMOST on the foreign window.
+    reorder_z_order(&[WindowId(peer.0), WindowId(topmost.0)])
+      .expect("queue first rapid foreign reorder");
+    reorder_z_order(&[WindowId(topmost.0), WindowId(peer.0)])
+      .expect("queue second rapid foreign reorder");
+    assert_foreign_z_order_converges(&[topmost, peer]);
+
+    let _ = helper.kill();
+    let _ = helper.wait();
   }
 
   #[test]
