@@ -1,5 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+  sync::atomic::{AtomicU64, Ordering},
+  time::Duration,
+};
 
+use tokio::runtime::Handle;
 use tracing::warn;
 use windows::{
   core::PWSTR,
@@ -570,11 +574,35 @@ impl NativeWindow {
 
     let flags = SWP_NOACTIVATE
       | SWP_NOCOPYBITS
+      | SWP_ASYNCWINDOWPOS
       | SWP_NOOWNERZORDER
       | SWP_NOMOVE
       | SWP_NOSIZE;
 
+    // A cross-process z-order request must not wait for a foreign GUI
+    // thread. Keep the retry generation-aware so an older focus transition
+    // cannot replay after a newer z-order repair has completed.
+    let generation = current_or_new_z_order_generation();
+    let expected_foreground = (!matches!(z_order, WindowZOrder::TopMost))
+      .then(|| unsafe { GetForegroundWindow() });
     unsafe { SetWindowPos(self.hwnd(), z_order_hwnd, 0, 0, 0, 0, flags) }?;
+
+    let handle = self.handle;
+    if let Ok(runtime) = Handle::try_current() {
+      runtime.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+          || expected_foreground.is_some_and(|foreground| {
+            (unsafe { GetForegroundWindow() }) != foreground
+          })
+        {
+          return;
+        }
+        let _ = unsafe {
+          SetWindowPos(HWND(handle), z_order_hwnd, 0, 0, 0, 0, flags)
+        };
+      });
+    }
 
     Ok(())
   }
@@ -831,9 +859,10 @@ pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
 /// The first window is placed at the top of the normal z-order. Each
-/// subsequent window is placed immediately after the previous one.
-/// Placement is synchronous so a later call cannot be overtaken by an
-/// older one.
+/// subsequent window is placed immediately after the previous one. Native
+/// requests are asynchronous so a suspended foreign GUI thread cannot
+/// block the WM loop; the generation-aware retry reconciles ordering after
+/// the target threads process their queued requests.
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -841,8 +870,26 @@ pub(crate) fn reorder_z_order(
     return Ok(());
   }
 
-  let _ = next_z_order_generation();
-  apply_z_order_chain(window_ids)
+  let generation = next_z_order_generation();
+  apply_z_order_chain(window_ids)?;
+
+  let window_ids = window_ids.to_vec();
+  let focused_window = window_ids[0];
+  if let Ok(runtime) = Handle::try_current() {
+    runtime.spawn(async move {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+
+      if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+        || unsafe { GetForegroundWindow() } != HWND(focused_window.0)
+      {
+        return;
+      }
+
+      let _ = apply_z_order_chain(&window_ids);
+    });
+  }
+
+  Ok(())
 }
 
 #[cfg(test)]
@@ -854,16 +901,17 @@ mod reorder_z_order_tests {
     Win32::{
       Foundation::{HWND, LPARAM, LRESULT, WPARAM},
       UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GetTopWindow,
-        GetWindow, RegisterClassW, UnregisterClassW, GW_HWNDNEXT,
-        WINDOW_EX_STYLE, WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+        GetMessageW, GetTopWindow, GetWindow, GetWindowLongPtrW,
+        RegisterClassW, TranslateMessage, UnregisterClassW, GWL_EXSTYLE,
+        GW_HWNDNEXT, MSG, WINDOW_EX_STYLE, WM_WINDOWPOSCHANGING,
+        WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
       },
     },
   };
 
   use super::reorder_z_order;
-  use crate::WindowId;
+  use crate::{WindowId, WindowZOrder};
 
   unsafe extern "system" fn reorder_test_wnd_proc(
     hwnd: HWND,
@@ -882,7 +930,7 @@ mod reorder_z_order_tests {
   }
 
   /// Creates a visible top-level window. `topmost` reproduces a Snipping
-  /// Tool window left WS_EX_TOPMOST by a previous GlazeWM session.
+  /// Tool window left `WS_EX_TOPMOST` by a previous GlazeWM session.
   fn create_test_window(class: &[u16], topmost: bool) -> HWND {
     let title = wide("glazewm-z-order-test");
     let ex_style = if topmost {
@@ -922,6 +970,202 @@ mod reorder_z_order_tests {
     order
   }
 
+  fn helper_mode(mode: &str) -> bool {
+    std::env::var("GLAZEWM_Z_ORDER_HELPER").ok().as_deref() == Some(mode)
+  }
+
+  fn create_non_pumping_window() {
+    use std::{io::Write, thread, time::Duration};
+
+    let class_name =
+      wide(&format!("GlazeWmNonPumpingHelper{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register non-pumping helper class");
+
+    let title = wide("GlazeWM non-pumping z-order helper");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        80,
+        80,
+        240,
+        120,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create non-pumping helper window");
+    println!("GLAZEWM_Z_ORDER_HWND:{}", hwnd.0);
+    std::io::stdout().flush().expect("flush helper HWND");
+    loop {
+      thread::sleep(Duration::from_secs(60));
+    }
+  }
+
+  fn create_pumping_window_pair() {
+    use std::{io::Write, time::Duration};
+
+    let class_name =
+      wide(&format!("GlazeWmPumpingHelper{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register pumping helper class");
+
+    let topmost = create_test_window(&class_name, true);
+    let peer = create_test_window(&class_name, false);
+    println!("GLAZEWM_Z_ORDER_PUMPING_HWND:{}:{}", topmost.0, peer.0);
+    std::io::stdout()
+      .flush()
+      .expect("flush pumping helper HWNDs");
+
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {
+      unsafe {
+        TranslateMessage(&raw const message);
+        DispatchMessageW(&raw const message);
+      }
+    }
+
+    // Keep the helper alive if it receives a quit message before the
+    // parent has finished polling the windows.
+    std::thread::sleep(Duration::from_secs(60));
+  }
+
+  unsafe extern "system" fn delayed_reorder_test_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+  ) -> LRESULT {
+    if msg == WM_WINDOWPOSCHANGING {
+      let delay_ms = std::env::var("GLAZEWM_Z_ORDER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+      std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+  }
+
+  fn create_single_pumping_window() {
+    use std::io::Write;
+
+    let class_name =
+      wide(&format!("GlazeWmSinglePumpingHelper{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(delayed_reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register single pumping helper class");
+
+    let topmost = std::env::var("GLAZEWM_Z_ORDER_TOPMOST").ok().as_deref()
+      == Some("1");
+    let ex_style = if topmost {
+      WS_EX_TOPMOST
+    } else {
+      WINDOW_EX_STYLE::default()
+    };
+    let title = wide("GlazeWM independent z-order helper");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        ex_style,
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        80,
+        80,
+        240,
+        120,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create single pumping helper window");
+    println!("GLAZEWM_Z_ORDER_SINGLE_HWND:{}", hwnd.0);
+    std::io::stdout()
+      .flush()
+      .expect("flush single pumping helper HWND");
+
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {
+      unsafe {
+        TranslateMessage(&raw const message);
+        DispatchMessageW(&raw const message);
+      }
+    }
+  }
+
+  fn run_z_order_helper_call(mode: &str) {
+    let hwnd = std::env::var("GLAZEWM_Z_ORDER_HWND")
+      .expect("helper HWND")
+      .parse::<isize>()
+      .expect("parse helper HWND");
+    match mode {
+      "set-z-order" => {
+        super::NativeWindow::new(hwnd)
+          .set_z_order(&WindowZOrder::Normal)
+          .expect("set z-order");
+      }
+      "reorder-z-order" => {
+        reorder_z_order(&[WindowId(hwnd)]).expect("reorder z-order");
+      }
+      _ => panic!("unknown z-order helper mode: {mode}"),
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_window() {
+    if helper_mode("window") {
+      create_non_pumping_window();
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_pumping_window() {
+    if helper_mode("pumping-window") {
+      create_pumping_window_pair();
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_single_pumping_window() {
+    if helper_mode("single-pumping-window") {
+      create_single_pumping_window();
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_set_z_order() {
+    if helper_mode("set-z-order") {
+      run_z_order_helper_call("set-z-order");
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_reorder_z_order() {
+    if helper_mode("reorder-z-order") {
+      run_z_order_helper_call("reorder-z-order");
+    }
+  }
+
   #[test]
   fn reorder_z_order_sinks_a_topmost_window_to_the_bottom_of_the_chain() {
     let class_name =
@@ -931,7 +1175,7 @@ mod reorder_z_order_tests {
       lpszClassName: PCWSTR(class_name.as_ptr()),
       ..Default::default()
     };
-    let atom = unsafe { RegisterClassW(&class) };
+    let atom = unsafe { RegisterClassW(&raw const class) };
     assert_ne!(atom, 0, "register z-order test class");
 
     let visual_studio = create_test_window(&class_name, false);
@@ -960,6 +1204,243 @@ mod reorder_z_order_tests {
       "chain must be applied top-to-bottom, with the topmost ignored window sunk"
     );
   }
+
+  fn assert_foreign_z_order_call_is_bounded(mode: &str) {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+      time::{Duration, Instant},
+    };
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut window_helper = Command::new(&current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "window")
+      .arg("z_order_test_helper_window")
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn non-pumping window helper");
+    let stdout = window_helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let hwnd = loop {
+      let line = lines
+        .next()
+        .expect("window helper HWND")
+        .expect("read window helper HWND");
+      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
+        break hwnd.parse::<isize>().expect("parse window helper HWND");
+      }
+    };
+
+    let mut z_order_call = Command::new(&current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", mode)
+      .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
+      .arg(format!("z_order_test_helper_{mode}"))
+      .arg("--nocapture")
+      .stdout(Stdio::null())
+      .spawn()
+      .expect("spawn bounded z-order caller");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let completed = loop {
+      if z_order_call
+        .try_wait()
+        .expect("poll z-order caller")
+        .is_some()
+      {
+        break true;
+      }
+      if Instant::now() >= deadline {
+        break false;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    };
+
+    if !completed {
+      let _ = z_order_call.kill();
+      let _ = z_order_call.wait();
+    }
+    let _ = window_helper.kill();
+    let _ = window_helper.wait();
+
+    assert!(completed, "{mode} blocked on a non-pumping foreign HWND");
+  }
+
+  fn foreign_windows_have_order(expected: &[HWND]) -> bool {
+    let order = relative_order(expected);
+    #[allow(clippy::cast_possible_wrap)]
+    let topmost_style = WS_EX_TOPMOST.0 as isize;
+    let all_not_topmost = expected.iter().all(|window| {
+      let style = unsafe { GetWindowLongPtrW(*window, GWL_EXSTYLE) };
+      style & topmost_style == 0
+    });
+    let expected_order =
+      expected.iter().map(|window| window.0).collect::<Vec<_>>();
+    order == expected_order && all_not_topmost
+  }
+
+  fn assert_foreign_z_order_converges(expected: &[HWND]) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+      if foreign_windows_have_order(expected) {
+        return;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let order = relative_order(expected);
+    #[allow(clippy::cast_possible_wrap)]
+    let topmost_style = WS_EX_TOPMOST.0 as isize;
+    let topmost_states = expected
+      .iter()
+      .map(|window| {
+        (unsafe { GetWindowLongPtrW(*window, GWL_EXSTYLE) }
+          & topmost_style)
+          != 0
+      })
+      .collect::<Vec<_>>();
+    let expected_order =
+      expected.iter().map(|window| window.0).collect::<Vec<_>>();
+    panic!("foreign z-order did not converge: expected={expected_order:?}, actual={order:?}, topmost={topmost_states:?}");
+  }
+
+  fn spawn_pumping_window_helper() -> (std::process::Child, [HWND; 2]) {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+    };
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut helper = Command::new(current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "pumping-window")
+      .arg("z_order_test_helper_pumping_window")
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn pumping window helper");
+    let stdout = helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let handles = loop {
+      let line = lines
+        .next()
+        .expect("pumping helper HWNDs")
+        .expect("read pumping helper HWNDs");
+      if let Some(handles) =
+        line.strip_prefix("GLAZEWM_Z_ORDER_PUMPING_HWND:")
+      {
+        break handles
+          .split(':')
+          .map(|handle| {
+            handle.parse::<isize>().expect("parse pumping helper HWND")
+          })
+          .collect::<Vec<_>>();
+      }
+    };
+    assert_eq!(handles.len(), 2, "pumping helper must expose two HWNDs");
+    (helper, [HWND(handles[0]), HWND(handles[1])])
+  }
+
+  fn spawn_single_pumping_window_helper(
+    topmost: bool,
+    delay_ms: u64,
+  ) -> (std::process::Child, HWND) {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+    };
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut helper = Command::new(current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "single-pumping-window")
+      .env("GLAZEWM_Z_ORDER_TOPMOST", if topmost { "1" } else { "0" })
+      .env("GLAZEWM_Z_ORDER_DELAY_MS", delay_ms.to_string())
+      .arg("z_order_test_helper_single_pumping_window")
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn single pumping window helper");
+    let stdout = helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let hwnd = loop {
+      let line = lines
+        .next()
+        .expect("single pumping helper HWND")
+        .expect("read single pumping helper HWND");
+      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_SINGLE_HWND:")
+      {
+        break hwnd
+          .parse::<isize>()
+          .expect("parse single pumping helper HWND");
+      }
+    };
+    (helper, HWND(hwnd))
+  }
+
+  #[test]
+  fn reorder_z_order_converges_for_foreign_pumping_windows() {
+    let (mut helper, [topmost, peer]) = spawn_pumping_window_helper();
+
+    reorder_z_order(&[WindowId(topmost.0), WindowId(peer.0)])
+      .expect("reorder foreign pumping windows");
+    assert_foreign_z_order_converges(&[topmost, peer]);
+
+    // Queue two successive desired chains before polling. The final chain
+    // must win without restoring TOPMOST on the foreign window.
+    reorder_z_order(&[WindowId(peer.0), WindowId(topmost.0)])
+      .expect("queue first rapid foreign reorder");
+    reorder_z_order(&[WindowId(topmost.0), WindowId(peer.0)])
+      .expect("queue second rapid foreign reorder");
+    assert_foreign_z_order_converges(&[topmost, peer]);
+
+    let _ = helper.kill();
+    let _ = helper.wait();
+  }
+
+  #[test]
+  fn reorder_z_order_retries_across_independent_foreign_gui_queues() {
+    use std::time::Duration;
+
+    // The first process deliberately stalls its queue while the second
+    // process services its requests immediately. This forces the
+    // production retry to run after the initial requests have been
+    // serviced out of order.
+    let (mut delayed_helper, delayed_topmost) =
+      spawn_single_pumping_window_helper(true, 100);
+    let (mut prompt_helper, prompt_peer) =
+      spawn_single_pumping_window_helper(false, 0);
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+      reorder_z_order(&[
+        WindowId(delayed_topmost.0),
+        WindowId(prompt_peer.0),
+      ])
+      .expect("reorder independently serviced foreign windows");
+
+      // Let the generation-aware 10 ms retry execute while the delayed
+      // foreign queue is still processing its first request.
+      tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+
+    assert_foreign_z_order_converges(&[delayed_topmost, prompt_peer]);
+
+    let _ = delayed_helper.kill();
+    let _ = delayed_helper.wait();
+    let _ = prompt_helper.kill();
+    let _ = prompt_helper.wait();
+  }
+
+  #[test]
+  fn set_z_order_does_not_wait_for_a_non_pumping_foreign_window() {
+    assert_foreign_z_order_call_is_bounded("set-z-order");
+  }
+
+  #[test]
+  fn reorder_z_order_does_not_wait_for_a_non_pumping_foreign_window() {
+    assert_foreign_z_order_call_is_bounded("reorder-z-order");
+  }
 }
 
 fn next_z_order_generation() -> u64 {
@@ -970,14 +1451,23 @@ pub(crate) fn begin_z_order_batch() -> u64 {
   next_z_order_generation()
 }
 
+fn current_or_new_z_order_generation() -> u64 {
+  let generation = Z_ORDER_GENERATION.load(Ordering::SeqCst);
+  if generation == 0 {
+    next_z_order_generation()
+  } else {
+    generation
+  }
+}
+
 fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
-  // Synchronous. `SWP_ASYNCWINDOWPOS` lets the HWND_NOTOPMOST pass
-  // complete after the placement pass and park a previously topmost
-  // window (Snipping Tool after a restart) above the tiled group.
+  // Always use asynchronous cross-thread requests. A debugger-suspended or
+  // otherwise hung target GUI thread must not block GlazeWM's event loop.
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
     | SWP_NOSIZE
+    | SWP_ASYNCWINDOWPOS
     | SWP_NOOWNERZORDER;
 
   for (index, window_id) in window_ids.iter().enumerate() {
