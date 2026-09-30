@@ -910,7 +910,7 @@ mod reorder_z_order_tests {
   };
 
   use super::reorder_z_order;
-  use crate::WindowId;
+  use crate::{WindowId, WindowZOrder};
 
   unsafe extern "system" fn reorder_test_wnd_proc(
     hwnd: HWND,
@@ -929,7 +929,7 @@ mod reorder_z_order_tests {
   }
 
   /// Creates a visible top-level window. `topmost` reproduces a Snipping
-  /// Tool window left WS_EX_TOPMOST by a previous GlazeWM session.
+  /// Tool window left `WS_EX_TOPMOST` by a previous GlazeWM session.
   fn create_test_window(class: &[u16], topmost: bool) -> HWND {
     let title = wide("glazewm-z-order-test");
     let ex_style = if topmost {
@@ -969,6 +969,87 @@ mod reorder_z_order_tests {
     order
   }
 
+  fn helper_mode(mode: &str) -> bool {
+    std::env::var("GLAZEWM_Z_ORDER_HELPER").ok().as_deref() == Some(mode)
+  }
+
+  fn create_non_pumping_window() {
+    use std::{io::Write, thread, time::Duration};
+
+    let class_name =
+      wide(&format!("GlazeWmNonPumpingHelper{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register non-pumping helper class");
+
+    let title = wide("GlazeWM non-pumping z-order helper");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        80,
+        80,
+        240,
+        120,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create non-pumping helper window");
+    println!("GLAZEWM_Z_ORDER_HWND:{}", hwnd.0);
+    std::io::stdout().flush().expect("flush helper HWND");
+    loop {
+      thread::sleep(Duration::from_secs(60));
+    }
+  }
+
+  fn run_z_order_helper_call(mode: &str) {
+    let hwnd = std::env::var("GLAZEWM_Z_ORDER_HWND")
+      .expect("helper HWND")
+      .parse::<isize>()
+      .expect("parse helper HWND");
+    match mode {
+      "set-z-order" => {
+        super::NativeWindow::new(hwnd)
+          .set_z_order(&WindowZOrder::Normal)
+          .expect("set z-order");
+      }
+      "reorder-z-order" => {
+        reorder_z_order(&[WindowId(hwnd)]).expect("reorder z-order");
+      }
+      _ => panic!("unknown z-order helper mode: {mode}"),
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_window() {
+    if helper_mode("window") {
+      create_non_pumping_window();
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_set_z_order() {
+    if helper_mode("set-z-order") {
+      run_z_order_helper_call("set-z-order");
+    }
+  }
+
+  #[test]
+  fn z_order_test_helper_reorder_z_order() {
+    if helper_mode("reorder-z-order") {
+      run_z_order_helper_call("reorder-z-order");
+    }
+  }
+
   #[test]
   fn reorder_z_order_sinks_a_topmost_window_to_the_bottom_of_the_chain() {
     let class_name =
@@ -978,7 +1059,7 @@ mod reorder_z_order_tests {
       lpszClassName: PCWSTR(class_name.as_ptr()),
       ..Default::default()
     };
-    let atom = unsafe { RegisterClassW(&class) };
+    let atom = unsafe { RegisterClassW(&raw const class) };
     assert_ne!(atom, 0, "register z-order test class");
 
     let visual_studio = create_test_window(&class_name, false);
@@ -1018,21 +1099,28 @@ mod reorder_z_order_tests {
     let current_exe = std::env::current_exe().expect("test executable");
     let mut window_helper = Command::new(&current_exe)
       .env("GLAZEWM_Z_ORDER_HELPER", "window")
+      .arg("z_order_test_helper_window")
+      .arg("--nocapture")
       .stdout(Stdio::piped())
       .spawn()
       .expect("spawn non-pumping window helper");
     let stdout = window_helper.stdout.take().expect("helper stdout");
     let mut lines = BufReader::new(stdout).lines();
-    let hwnd = lines
-      .next()
-      .expect("window helper HWND")
-      .expect("read window helper HWND")
-      .parse::<isize>()
-      .expect("parse window helper HWND");
+    let hwnd = loop {
+      let line = lines
+        .next()
+        .expect("window helper HWND")
+        .expect("read window helper HWND");
+      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
+        break hwnd.parse::<isize>().expect("parse window helper HWND");
+      }
+    };
 
     let mut z_order_call = Command::new(&current_exe)
       .env("GLAZEWM_Z_ORDER_HELPER", mode)
       .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
+      .arg(format!("z_order_test_helper_{mode}"))
+      .arg("--nocapture")
       .stdout(Stdio::null())
       .spawn()
       .expect("spawn bounded z-order caller");
