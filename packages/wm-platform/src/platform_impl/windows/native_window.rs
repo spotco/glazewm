@@ -1,9 +1,8 @@
 use std::{
   cell::RefCell,
-  collections::HashMap,
   sync::{
     atomic::{AtomicU64, Ordering},
-    LazyLock, Mutex,
+    Mutex,
   },
   time::{Duration, Instant},
 };
@@ -73,20 +72,6 @@ static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// `IsHungAppWindow` does not notice that for several seconds, so it
 /// cannot protect the WM loop. `SendMessageTimeoutW` can.
 const FOREIGN_GUI_PROBE_TIMEOUT_MS: u32 = 50;
-
-/// Per-HWND record of layered-window changes GlazeWM itself made.
-///
-/// Application-owned `WS_EX_LAYERED` state is not stored here and is
-/// left untouched by a fully opaque reset.
-#[derive(Clone, Copy)]
-struct LayeredEffectState {
-  added_layered: bool,
-  original_alpha: Option<u8>,
-}
-
-static LAYERED_EFFECTS: LazyLock<
-  Mutex<HashMap<isize, LayeredEffectState>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static NATIVE_OP_LOGGER: Mutex<Option<fn(&str)>> = Mutex::new(None);
 
@@ -165,38 +150,6 @@ fn mark_native_op_result(label: &'static str) {
       *slot = Some(label);
     }
   });
-}
-
-fn with_layered_effects<T>(
-  body: impl FnOnce(&mut HashMap<isize, LayeredEffectState>) -> T,
-) -> T {
-  let mut guard = LAYERED_EFFECTS
-    .lock()
-    .unwrap_or_else(std::sync::PoisonError::into_inner);
-  if guard.len() >= 64 {
-    guard.retain(|handle, _| {
-      // SAFETY: `handle` is an HWND value previously observed by
-      // GlazeWM. `IsWindow` accepts stale handles and returns false.
-      unsafe { IsWindow(HWND(*handle)) }.as_bool()
-    });
-  }
-  body(&mut guard)
-}
-
-/// Reads the layered alpha, if the window currently has one.
-fn current_layered_alpha(hwnd: HWND) -> crate::Result<u8> {
-  let mut alpha = u8::MAX;
-  let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
-  // SAFETY: `alpha` and `flag` are valid out-parameters.
-  unsafe {
-    GetLayeredWindowAttributes(
-      hwnd,
-      None,
-      Some(&raw mut alpha),
-      Some(&raw mut flag),
-    )?;
-  }
-  Ok(alpha)
 }
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -478,20 +431,11 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::focus`].
   ///
-  /// Skips `SetForegroundWindow` when the target GUI thread does not
-  /// answer `WM_NULL`. A stale foreground window is preferable to
-  /// freezing the WM thread on a suspended debuggee.
+  /// `SetForegroundWindow` does not wait on a suspended foreign GUI
+  /// thread. Style and layered-attribute writes do, and those are
+  /// skipped separately.
   pub(crate) fn focus(&self) -> crate::Result<()> {
     timed_native_op(self.hwnd(), "focus", || {
-      if !self.foreign_gui_responsive() {
-        mark_native_op_result("skip-unresponsive");
-        warn!(
-          "Skipped focus for unresponsive hwnd={}.",
-          hwnd_token(self.hwnd())
-        );
-        return Ok(());
-      }
-
       let input = [INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -512,9 +456,6 @@ impl NativeWindow {
         SendInput(&input, std::mem::size_of::<INPUT>() as i32)
       };
 
-      // SAFETY: `hwnd` was probed above and is still a window handle
-      // from the caller's point of view. The target thread answered
-      // `WM_NULL`, so this synchronous focus request can complete.
       unsafe { SetForegroundWindow(self.hwnd()) }.ok()?;
       Ok(())
     })
@@ -820,62 +761,6 @@ impl NativeWindow {
     });
   }
 
-  /// Clears an extended style bit when the target GUI thread is
-  /// responsive.
-  ///
-  /// Returns `false` when the mutation was skipped. The caller keeps
-  /// any ownership record so a later responsive call can retry.
-  fn remove_window_style_ex(&self, style: WINDOW_EX_STYLE) -> bool {
-    if !self.foreign_gui_responsive() {
-      return false;
-    }
-
-    let current_style =
-      unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) };
-    #[allow(clippy::cast_possible_wrap)]
-    let bit = style.0 as isize;
-    if current_style & bit == 0 {
-      return true;
-    }
-
-    // SAFETY: The target thread answered `WM_NULL` immediately above.
-    unsafe {
-      SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, current_style & !bit);
-    }
-
-    // Clearing `WS_EX_LAYERED` is ignored until the window thread
-    // applies `SWP_FRAMECHANGED`. The caller already proved that
-    // thread answers messages, so this flush is synchronous. An
-    // asynchronous flush leaves `GetWindowLongPtrW` reporting the
-    // old bit.
-    let flushed = unsafe {
-      SetWindowPos(
-        self.hwnd(),
-        HWND_NOTOPMOST,
-        0,
-        0,
-        0,
-        0,
-        SWP_FRAMECHANGED
-          | SWP_NOMOVE
-          | SWP_NOSIZE
-          | SWP_NOZORDER
-          | SWP_NOOWNERZORDER
-          | SWP_NOACTIVATE
-          | SWP_NOCOPYBITS
-          | SWP_NOSENDCHANGING,
-      )
-    };
-    if let Err(err) = flushed {
-      warn!(
-        "Failed to flush cleared extended style on hwnd={}: {err}",
-        hwnd_token(self.hwnd())
-      );
-      return false;
-    }
-    !self.has_window_style_ex(style)
-  }
-
   /// Implements [`NativeWindowWindowsExt::set_z_order`].
   pub(crate) fn set_z_order(
     &self,
@@ -1031,111 +916,47 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::set_transparency`].
   ///
-  /// A fully opaque request does not add `WS_EX_LAYERED`. If GlazeWM
-  /// added that bit, the opaque request removes it. An
-  /// application-owned layered window keeps its style and, on reset,
-  /// the alpha it had before GlazeWM changed it.
-  ///
-  /// Style and layered-attribute writes are skipped when the foreign
-  /// GUI thread is not answering messages.
+  /// A responsive window is layered and given `opacity_value`, including
+  /// a fully opaque value. The same writes are skipped when the foreign
+  /// GUI thread is not answering messages, because
+  /// `SetWindowLongPtrW` and `SetLayeredWindowAttributes` would freeze
+  /// the WM thread on a suspended debuggee.
   pub(crate) fn set_transparency(
     &self,
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
     timed_native_op(self.hwnd(), "set_transparency", || {
-      self.set_transparency_inner(opacity_value)
-    })
-  }
+      if !self.foreign_gui_responsive() {
+        mark_native_op_result("skip-unresponsive");
+        warn!(
+          "Skipped transparency for unresponsive hwnd={}.",
+          hwnd_token(self.hwnd())
+        );
+        return Ok(());
+      }
 
-  fn set_transparency_inner(
-    &self,
-    opacity_value: &OpacityValue,
-  ) -> crate::Result<()> {
-    let alpha = opacity_value.to_alpha();
-    let handle = self.handle;
-
-    if alpha == u8::MAX {
-      return self.reset_transparency(handle);
-    }
-
-    if !self.foreign_gui_responsive() {
-      mark_native_op_result("skip-unresponsive");
-      warn!(
-        "Skipped transparency for unresponsive hwnd={}.",
-        hwnd_token(self.hwnd())
-      );
-      return Ok(());
-    }
-
-    let layered = self.has_window_style_ex(WS_EX_LAYERED);
-    if !layered {
+      // Make the window layered if it isn't already. The style helper
+      // probes again and does not call `SetWindowLongPtrW` if the
+      // thread stopped answering.
       self.add_window_style_ex(WS_EX_LAYERED);
       if !self.has_window_style_ex(WS_EX_LAYERED) {
         mark_native_op_result("skip-unresponsive");
         return Ok(());
       }
-      with_layered_effects(|effects| {
-        effects.insert(
-          handle,
-          LayeredEffectState {
-            added_layered: true,
-            original_alpha: None,
-          },
-        );
-      });
-    } else {
-      with_layered_effects(|effects| {
-        if !effects.contains_key(&handle) {
-          let original = current_layered_alpha(self.hwnd()).ok();
-          effects.insert(
-            handle,
-            LayeredEffectState {
-              added_layered: false,
-              original_alpha: original,
-            },
-          );
-        }
-      });
-    }
 
-    self.apply_layered_alpha(alpha)
-  }
-
-  /// Restores the pre-GlazeWM layered state for a fully opaque value.
-  fn reset_transparency(&self, handle: isize) -> crate::Result<()> {
-    let state =
-      with_layered_effects(|effects| effects.get(&handle).copied());
-    let Some(state) = state else {
-      mark_native_op_result("noop");
-      return Ok(());
-    };
-
-    if state.added_layered {
-      if !self.remove_window_style_ex(WS_EX_LAYERED) {
-        mark_native_op_result("skip-unresponsive");
-        return Ok(());
+      // SAFETY: The target thread answered `WM_NULL`, and the window
+      // has `WS_EX_LAYERED`. `SetLayeredWindowAttributes` sends to
+      // that thread.
+      unsafe {
+        SetLayeredWindowAttributes(
+          self.hwnd(),
+          None,
+          opacity_value.to_alpha(),
+          LWA_ALPHA,
+        )?;
       }
-    } else if let Some(original) = state.original_alpha {
-      if !self.foreign_gui_responsive() {
-        mark_native_op_result("skip-unresponsive");
-        return Ok(());
-      }
-      self.apply_layered_alpha(original)?;
-    }
-
-    with_layered_effects(|effects| {
-      effects.remove(&handle);
-    });
-    Ok(())
-  }
-
-  fn apply_layered_alpha(&self, alpha: u8) -> crate::Result<()> {
-    // SAFETY: Caller has established that the GUI thread is
-    // responsive, or this window's thread is the caller.
-    unsafe {
-      SetLayeredWindowAttributes(self.hwnd(), None, alpha, LWA_ALPHA)?;
-    }
-    Ok(())
+      Ok(())
+    })
   }
 
   /// Implements [`NativeWindowWindowsExt::adjust_transparency`].
@@ -2267,7 +2088,7 @@ mod reorder_z_order_tests {
   }
 
   #[test]
-  fn foreign_hwnd_opaque_transparency_skips_responsive_window() {
+  fn foreign_hwnd_opaque_transparency_applies_on_responsive_window() {
     let class_name =
       wide(&format!("GlazeWmOpacityNoop{}", std::process::id()));
     let class = WNDCLASSW {
@@ -2299,11 +2120,12 @@ mod reorder_z_order_tests {
 
     window
       .set_transparency(&OpacityValue::from_alpha(u8::MAX))
-      .expect("opaque noop");
+      .expect("opaque transparency");
     assert!(
-      !ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
-      "100% transparency must not add WS_EX_LAYERED"
+      ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
+      "a responsive opaque request still layers the window"
     );
+    assert_eq!(layered_alpha(hwnd.0), u8::MAX);
 
     window
       .set_transparency(&OpacityValue::from_alpha(80))
@@ -2313,11 +2135,9 @@ mod reorder_z_order_tests {
 
     window
       .set_transparency(&OpacityValue::from_alpha(u8::MAX))
-      .expect("reset transparency");
-    assert!(
-      !ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
-      "reset must remove WS_EX_LAYERED that GlazeWM added"
-    );
+      .expect("opaque transparency again");
+    assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
+    assert_eq!(layered_alpha(hwnd.0), u8::MAX);
 
     unsafe {
       let _ = DestroyWindow(hwnd);
@@ -2326,7 +2146,7 @@ mod reorder_z_order_tests {
   }
 
   #[test]
-  fn foreign_hwnd_transparency_reset_preserves_app_layered_state() {
+  fn foreign_hwnd_opaque_transparency_applies_on_app_layered_window() {
     let class_name =
       wide(&format!("GlazeWmOpacityOwned{}", std::process::id()));
     let class = WNDCLASSW {
@@ -2364,7 +2184,7 @@ mod reorder_z_order_tests {
       .set_transparency(&OpacityValue::from_alpha(u8::MAX))
       .expect("opaque request");
     assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
-    assert_eq!(layered_alpha(hwnd.0), 100);
+    assert_eq!(layered_alpha(hwnd.0), u8::MAX);
 
     window
       .set_transparency(&OpacityValue::from_alpha(80))
@@ -2374,9 +2194,9 @@ mod reorder_z_order_tests {
 
     window
       .set_transparency(&OpacityValue::from_alpha(u8::MAX))
-      .expect("restore app alpha");
+      .expect("opaque request again");
     assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
-    assert_eq!(layered_alpha(hwnd.0), 100);
+    assert_eq!(layered_alpha(hwnd.0), u8::MAX);
 
     unsafe {
       let _ = DestroyWindow(hwnd);
@@ -2397,11 +2217,12 @@ mod reorder_z_order_tests {
 
     window
       .set_transparency(&OpacityValue::from_alpha(u8::MAX))
-      .expect("foreign transparency reset");
+      .expect("foreign opaque transparency");
     assert!(
-      !ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
-      "reset must clear the layered bit GlazeWM added on a foreign window"
+      ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
+      "opaque transparency keeps WS_EX_LAYERED on a responsive window"
     );
+    assert_eq!(layered_alpha(hwnd.0), u8::MAX);
 
     let _ = helper.kill();
     let _ = helper.wait();
