@@ -102,7 +102,7 @@ const FOREIGN_GUI_MAX_BLOCKED_THREADS: usize = 32;
 /// Windows reuses numeric handle values. The pair distinguishes the
 /// window that created the cache from a later window that received the
 /// same value.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 struct ForeignWindowOwner {
   process_id: u32,
   thread_id: u32,
@@ -328,10 +328,30 @@ fn release_foreign_style_worker(
   }
 }
 
+/// Drops cached foreign style for a destroyed `HWND`.
+///
+/// `WindowListener` calls this from `EVENT_OBJECT_DESTROY` before the
+/// event is forwarded. That includes ignored and unmanaged windows.
+/// The numeric handle can be reused by the same process and GUI
+/// thread, which process id and thread id do not distinguish. An
+/// in-flight worker is detached, not dropped: its ticket still counts
+/// toward [`FOREIGN_GUI_MAX_BLOCKED_THREADS`] until that thread
+/// returns, and it must not clear a later entry for the same handle.
+/// Process id and thread id checks remain as a backstop when this
+/// event is missed.
+pub(super) fn invalidate_foreign_style_state(hwnd: HWND) {
+  let mut state = lock_foreign_gui();
+  state.intents.remove(&hwnd.0);
+  detach_foreign_style_worker(&mut state, hwnd.0);
+  foreign_gui_sync().1.notify_all();
+}
+
 /// Drops cached style when `hwnd` is gone or belongs to another window.
 ///
 /// Returns the live owner. A detached worker remains counted until its
-/// thread returns, and it no longer applies this `HWND`.
+/// thread returns, and it no longer applies this `HWND`. Destroy
+/// invalidation is the primary reset. This check covers a missed
+/// destroy event when the new window has a different owner.
 fn reclaim_foreign_style_owner(
   state: &mut ForeignGuiState,
   hwnd: isize,
@@ -648,6 +668,92 @@ fn foreign_style_intent_clone(hwnd: isize) -> Option<ForeignStyleIntent> {
 #[cfg(test)]
 fn replace_foreign_style_intent(hwnd: isize, intent: ForeignStyleIntent) {
   lock_foreign_gui().intents.insert(hwnd, intent);
+}
+
+/// Cached foreign-style bookkeeping for one `HWND`.
+#[cfg(test)]
+struct ForeignStyleCacheView {
+  intent: Option<ForeignStyleIntent>,
+  in_flight_ticket: Option<u64>,
+  detached_tickets: HashSet<u64>,
+  thread_count: usize,
+}
+
+/// Reads the foreign-style bookkeeping for `hwnd`.
+#[cfg(test)]
+fn foreign_style_cache_view(hwnd: isize) -> ForeignStyleCacheView {
+  let state = lock_foreign_gui();
+  ForeignStyleCacheView {
+    intent: state.intents.get(&hwnd).cloned(),
+    in_flight_ticket: state
+      .in_flight
+      .get(&hwnd)
+      .map(|worker| worker.ticket),
+    detached_tickets: state.detached_tickets.clone(),
+    thread_count: foreign_style_thread_count(&state),
+  }
+}
+
+/// Inserts an in-flight claim without starting a thread.
+#[cfg(test)]
+fn plant_foreign_style_worker(
+  hwnd: isize,
+  ticket: u64,
+  owner: ForeignWindowOwner,
+) {
+  lock_foreign_gui()
+    .in_flight
+    .insert(hwnd, ForeignStyleWorker { ticket, owner });
+}
+
+/// Removes test-only bookkeeping for `hwnd`.
+///
+/// A planted replacement ticket is not a real thread. Leaving it in
+/// the table would consume a slot in later tests in this process.
+#[cfg(test)]
+fn forget_foreign_style_hwnd(hwnd: isize) {
+  let mut state = lock_foreign_gui();
+  state.intents.remove(&hwnd);
+  if let Some(worker) = state.in_flight.remove(&hwnd) {
+    state.detached_tickets.remove(&worker.ticket);
+  }
+}
+
+/// Waits until `ticket` is neither detached nor in flight.
+#[cfg(test)]
+fn wait_until_foreign_style_ticket_released(
+  ticket: u64,
+  timeout: Duration,
+) -> bool {
+  let (lock, cvar) = foreign_gui_sync();
+  let guard = lock
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let still_held = |state: &mut ForeignGuiState| {
+    state.detached_tickets.contains(&ticket)
+      || state
+        .in_flight
+        .values()
+        .any(|worker| worker.ticket == ticket)
+  };
+  match cvar.wait_timeout_while(guard, timeout, still_held) {
+    Ok((guard, wait)) => {
+      !wait.timed_out()
+        && !guard.detached_tickets.contains(&ticket)
+        && !guard
+          .in_flight
+          .values()
+          .any(|worker| worker.ticket == ticket)
+    }
+    Err(poisoned) => {
+      let guard = poisoned.into_inner().0;
+      !guard.detached_tickets.contains(&ticket)
+        && !guard
+          .in_flight
+          .values()
+          .any(|worker| worker.ticket == ticket)
+    }
+  }
 }
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -2087,17 +2193,20 @@ mod reorder_z_order_tests {
         GetLayeredWindowAttributes, GetMessageW, GetTopWindow, GetWindow,
         GetWindowLongPtrW, InSendMessage, RegisterClassW,
         SetLayeredWindowAttributes, SetWindowLongPtrW, TranslateMessage,
-        UnregisterClassW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
-        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG, WINDOW_EX_STYLE,
-        WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW, WS_DLGFRAME,
-        WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        UnregisterClassW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
+        GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG, OBJID_WINDOW,
+        WINDOW_EX_STYLE, WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW,
+        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        WS_VISIBLE,
       },
     },
   };
 
   use super::reorder_z_order;
   use crate::{
-    Color, CornerStyle, OpacityValue, Rect, WindowId, WindowZOrder,
+    Color, CornerStyle, OpacityValue, Rect, WindowEvent, WindowId,
+    WindowZOrder,
   };
 
   unsafe extern "system" fn reorder_test_wnd_proc(
@@ -3663,6 +3772,180 @@ mod reorder_z_order_tests {
     unsafe {
       let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
     }
+  }
+
+  /// Drops planted foreign-style rows when the test returns.
+  struct ForeignStyleCleanup(isize);
+
+  impl Drop for ForeignStyleCleanup {
+    fn drop(&mut self) {
+      super::forget_foreign_style_hwnd(self.0);
+    }
+  }
+
+  #[test]
+  fn destroy_event_drops_cached_style_for_the_same_owner() {
+    let (class_name, hwnd) = hidden_style_window("destroy-event");
+    let _cleanup = ForeignStyleCleanup(hwnd.0);
+    let window = super::NativeWindow::new(hwnd.0);
+    window
+      .set_transparency(&OpacityValue::from_alpha(90))
+      .expect("seed alpha");
+    window
+      .set_title_bar_visibility(false)
+      .expect("seed hidden title bar");
+    let before =
+      super::foreign_style_intent_clone(hwnd.0).expect("seeded intent");
+    assert_eq!(before.alpha, Some(90));
+    assert_eq!(before.layered, Some(true));
+    assert_eq!(before.title_bar_visible, Some(false));
+
+    let child = super::super::window_listener::classify_win_event(
+      EVENT_OBJECT_DESTROY,
+      hwnd,
+      OBJID_WINDOW.0,
+      1,
+    );
+    assert!(child.is_none(), "a child control is not a window");
+    assert!(
+      super::foreign_style_intent_clone(hwnd.0).is_some(),
+      "a child-control event cleared the window cache"
+    );
+
+    let shown = super::super::window_listener::classify_win_event(
+      EVENT_OBJECT_SHOW,
+      hwnd,
+      OBJID_WINDOW.0,
+      0,
+    );
+    assert!(matches!(shown, Some(WindowEvent::Shown { .. })));
+    assert_eq!(
+      super::foreign_style_intent_clone(hwnd.0)
+        .expect("intent after show")
+        .alpha,
+      Some(90),
+      "a show event cleared cached style"
+    );
+
+    let destroyed = super::super::window_listener::classify_win_event(
+      EVENT_OBJECT_DESTROY,
+      hwnd,
+      OBJID_WINDOW.0,
+      0,
+    );
+    assert!(matches!(
+      destroyed,
+      Some(WindowEvent::Destroyed { window_id, .. }) if window_id == WindowId(hwnd.0)
+    ));
+    assert!(
+      super::foreign_style_intent_clone(hwnd.0).is_none(),
+      "destroy event left the cached style in place"
+    );
+
+    window
+      .set_title_bar_visibility(true)
+      .expect("fresh title bar");
+    let fresh =
+      super::foreign_style_intent_clone(hwnd.0).expect("fresh intent");
+    assert_eq!(fresh.owner, before.owner);
+    assert_eq!(fresh.alpha, None, "old alpha survived destroy");
+    assert_eq!(fresh.layered, None, "old layered bit survived destroy");
+    assert_eq!(fresh.title_bar_visible, Some(true));
+    let frame = super::dlg_frame_bit();
+    assert!(
+      (unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) }) & frame != 0,
+      "fresh title-bar request left the frame hidden"
+    );
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn detached_worker_does_not_clear_replacement_after_destroy() {
+    let gate = spawn_resume_gate(false);
+    let _cleanup = ForeignStyleCleanup(gate.hwnd);
+    let window = super::NativeWindow::new(gate.hwnd);
+    window
+      .set_transparency(&OpacityValue::from_alpha(180))
+      .expect("blocked layered request");
+    assert!(
+      super::foreign_style_in_flight(gate.hwnd),
+      "layered request did not stay in the worker"
+    );
+    window
+      .set_title_bar_visibility(false)
+      .expect("title-bar hide while blocked");
+    let blocked = super::foreign_style_cache_view(gate.hwnd);
+    let old_ticket =
+      blocked.in_flight_ticket.expect("blocked worker ticket");
+    let blocked_intent = blocked.intent.expect("blocked intent");
+    assert_eq!(blocked_intent.title_bar_visible, Some(false));
+    let owner = blocked_intent.owner;
+    let threads_while_blocked = blocked.thread_count;
+
+    super::invalidate_foreign_style_state(HWND(gate.hwnd));
+    let cleared = super::foreign_style_cache_view(gate.hwnd);
+    assert!(cleared.intent.is_none(), "destroy left the intent");
+    assert!(
+      cleared.in_flight_ticket.is_none(),
+      "destroy left the worker attached"
+    );
+    assert!(
+      cleared.detached_tickets.contains(&old_ticket),
+      "detached worker was dropped instead of counted"
+    );
+    assert_eq!(
+      cleared.thread_count, threads_while_blocked,
+      "detaching the worker freed its cap slot"
+    );
+
+    let replacement_ticket = old_ticket.wrapping_add(1_000_000);
+    super::replace_foreign_style_intent(
+      gate.hwnd,
+      super::ForeignStyleIntent {
+        generation: 50,
+        applied_generation: 0,
+        owner,
+        layered: Some(false),
+        ex_style_or: 0,
+        title_bar_visible: Some(true),
+        alpha: None,
+      },
+    );
+    super::plant_foreign_style_worker(
+      gate.hwnd,
+      replacement_ticket,
+      owner,
+    );
+    gate.release();
+    assert!(
+      super::wait_until_foreign_style_ticket_released(
+        old_ticket,
+        std::time::Duration::from_secs(2),
+      ),
+      "detached worker did not release its ticket"
+    );
+    let after = super::foreign_style_cache_view(gate.hwnd);
+    let intent = after.intent.expect("replacement intent");
+    assert_eq!(intent.generation, 50);
+    assert_eq!(intent.applied_generation, 0);
+    assert_eq!(intent.owner, owner);
+    assert_eq!(intent.layered, Some(false));
+    assert_eq!(intent.alpha, None);
+    assert_eq!(intent.title_bar_visible, Some(true));
+    assert_eq!(after.in_flight_ticket, Some(replacement_ticket));
+    assert!(
+      !after.detached_tickets.contains(&old_ticket),
+      "old ticket was still detached after the worker returned"
+    );
+    let frame = super::dlg_frame_bit();
+    assert!(
+      (unsafe { GetWindowLongPtrW(HWND(gate.hwnd), GWL_STYLE) }) & frame
+        != 0,
+      "detached worker hid the title bar after destroy"
+    );
   }
 
   struct TimedCall {
