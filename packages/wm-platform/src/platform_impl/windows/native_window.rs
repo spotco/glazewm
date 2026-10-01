@@ -1,9 +1,9 @@
 use std::{
   cell::RefCell,
-  collections::HashSet,
+  collections::{HashMap, HashSet},
   sync::{
     atomic::{AtomicU64, Ordering},
-    mpsc, Mutex, OnceLock,
+    Condvar, Mutex, OnceLock,
   },
   thread,
   time::{Duration, Instant},
@@ -83,13 +83,66 @@ const FOREIGN_GUI_CALL_TIMEOUT: Duration = Duration::from_millis(50);
 
 static NATIVE_OP_LOGGER: Mutex<Option<fn(&str)>> = Mutex::new(None);
 
-/// HWNDs with a style or layered write that has not returned yet.
+/// Most foreign GUI threads that may each keep one blocked worker.
 ///
-/// A timed-out worker stays here until the foreign call finishes, so
-/// a later attempt does not start a second blocked thread.
-fn foreign_gui_calls_in_flight() -> &'static Mutex<HashSet<isize>> {
-  static CALLS: OnceLock<Mutex<HashSet<isize>>> = OnceLock::new();
-  CALLS.get_or_init(|| Mutex::new(HashSet::new()))
+/// A native call already inside another process cannot be cancelled.
+/// The worker stays alive until that call returns, then reapplies the
+/// latest desired style. One permanently hung `HWND` therefore retains
+/// one `glazewm-foreign-gui` thread. Distinct HWNDs do not share that
+/// thread. Past this cap, further HWNDs keep their desired state but
+/// do not start another thread until a slot is free and a later call
+/// drives it. This bounds thread growth; it does not make a wedged
+/// GUI thread apply the new state.
+const FOREIGN_GUI_MAX_BLOCKED_THREADS: usize = 32;
+
+/// Latest style a foreign worker must leave on an `HWND`.
+///
+/// `generation` advances on every requested change. `applied_generation`
+/// advances only after a worker finishes a native apply of that
+/// generation. A worker that was blocked inside an older apply uses the
+/// mismatch to reapply the current values.
+#[derive(Clone, Default)]
+struct ForeignStyleIntent {
+  generation: u64,
+  applied_generation: u64,
+  /// `Some` once transparency has an opinion about `WS_EX_LAYERED`.
+  layered: Option<bool>,
+  /// Other extended-style bits that must be present.
+  ex_style_or: isize,
+  title_bar_visible: Option<bool>,
+  alpha: Option<u8>,
+}
+
+/// In-flight workers and the desired style they should converge to.
+struct ForeignGuiState {
+  in_flight: HashSet<isize>,
+  intents: HashMap<isize, ForeignStyleIntent>,
+}
+
+/// Shared desired-style table.
+///
+/// The mutex is not held across `SetWindowLongPtrW` or
+/// `SetLayeredWindowAttributes`.
+fn foreign_gui_sync() -> &'static (Mutex<ForeignGuiState>, Condvar) {
+  static STATE: OnceLock<(Mutex<ForeignGuiState>, Condvar)> =
+    OnceLock::new();
+  STATE.get_or_init(|| {
+    (
+      Mutex::new(ForeignGuiState {
+        in_flight: HashSet::new(),
+        intents: HashMap::new(),
+      }),
+      Condvar::new(),
+    )
+  })
+}
+
+/// Locks the desired-style table, recovering from a poisoned lock.
+fn lock_foreign_gui() -> std::sync::MutexGuard<'static, ForeignGuiState> {
+  foreign_gui_sync()
+    .0
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 thread_local! {
@@ -168,56 +221,265 @@ fn mark_native_op_result(label: &'static str) {
   });
 }
 
-/// Clears the in-flight slot when a foreign style write returns.
-struct ForeignGuiCallGuard(isize);
+/// Outcome of driving the desired foreign style.
+enum ForeignStyleDrive {
+  /// The desired generation was applied before the wait elapsed.
+  Applied,
+  /// A worker for this `HWND` is already blocked. It reapplies the
+  /// new generation when the foreign call returns.
+  Deferred,
+  /// The worker was still inside the native call when the wait elapsed.
+  TimedOut,
+  /// No worker was started. The desired state remains recorded.
+  Skipped,
+}
 
-impl Drop for ForeignGuiCallGuard {
-  fn drop(&mut self) {
-    if let Ok(mut in_flight) = foreign_gui_calls_in_flight().lock() {
-      in_flight.remove(&self.0);
+/// `WS_EX_LAYERED` as a signed extended-style bit.
+fn layered_ex_bit() -> isize {
+  #[allow(clippy::cast_possible_wrap)]
+  {
+    WS_EX_LAYERED.0 as isize
+  }
+}
+
+/// `WS_DLGFRAME` as a signed style bit.
+fn dlg_frame_bit() -> isize {
+  #[allow(clippy::cast_possible_wrap)]
+  {
+    WS_DLGFRAME.0 as isize
+  }
+}
+
+/// Whether `generation` is still the desired generation for `hwnd`.
+fn foreign_style_generation_is(hwnd: isize, generation: u64) -> bool {
+  lock_foreign_gui()
+    .intents
+    .get(&hwnd)
+    .is_some_and(|intent| intent.generation == generation)
+}
+
+/// Applies one snapshot. Returns early when a newer request arrived.
+///
+/// A call already blocked in the foreign window procedure cannot be
+/// cancelled. The caller loops and applies the newer snapshot after
+/// this one returns.
+fn apply_foreign_style_intent(hwnd: HWND, intent: &ForeignStyleIntent) {
+  if !foreign_style_generation_is(hwnd.0, intent.generation) {
+    return;
+  }
+
+  let current_ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+  let mut desired_ex = current_ex | intent.ex_style_or;
+  if let Some(layered) = intent.layered {
+    let bit = layered_ex_bit();
+    if layered {
+      desired_ex |= bit;
+    } else {
+      desired_ex &= !bit;
+    }
+  }
+  if desired_ex != current_ex {
+    // SAFETY: Cross-thread `SetWindowLongPtrW` sends
+    // `WM_STYLECHANGING` to the window thread. This runs on the
+    // worker, not the WM thread.
+    unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired_ex) };
+  }
+  if !foreign_style_generation_is(hwnd.0, intent.generation) {
+    return;
+  }
+
+  let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+  let layered_now = (ex_style & layered_ex_bit()) != 0;
+  if layered_now && intent.layered != Some(false) {
+    if let Some(alpha) = intent.alpha {
+      // `SetLayeredWindowAttributes` does not send to the foreign
+      // window procedure, so a `WM_STYLECHANGING` stall cannot hold
+      // it. It runs only while this snapshot is still current, which
+      // keeps a worker that was blocked in `SetWindowLongPtrW` from
+      // writing an older alpha after the GUI thread resumes.
+      // SAFETY: `LWA_ALPHA` writes only the opacity byte.
+      let _ = unsafe {
+        SetLayeredWindowAttributes(hwnd, None, alpha, LWA_ALPHA)
+      };
+    }
+  }
+  if !foreign_style_generation_is(hwnd.0, intent.generation) {
+    return;
+  }
+
+  let Some(visible) = intent.title_bar_visible else {
+    return;
+  };
+  let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+  let frame = dlg_frame_bit();
+  let new_style = if visible {
+    style | frame
+  } else {
+    style & !frame
+  };
+  if new_style == style {
+    return;
+  }
+  unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, new_style) };
+  // SAFETY: `SWP_NOZORDER` keeps this frame refresh from moving the
+  // window in z-order. `SWP_ASYNCWINDOWPOS` does not wait for the
+  // foreign queue.
+  let _ = unsafe {
+    SetWindowPos(
+      hwnd,
+      HWND_NOTOPMOST,
+      0,
+      0,
+      0,
+      0,
+      SWP_FRAMECHANGED
+        | SWP_NOMOVE
+        | SWP_NOSIZE
+        | SWP_NOZORDER
+        | SWP_NOOWNERZORDER
+        | SWP_NOACTIVATE
+        | SWP_NOCOPYBITS
+        | SWP_NOSENDCHANGING
+        | SWP_ASYNCWINDOWPOS,
+    )
+  };
+}
+
+/// Reapplies desired style until the snapshot it finished is current.
+fn foreign_style_worker(hwnd: isize) {
+  let (_lock, cvar) = foreign_gui_sync();
+  loop {
+    let snapshot = lock_foreign_gui().intents.get(&hwnd).cloned();
+    let Some(snapshot) = snapshot else {
+      let mut state = lock_foreign_gui();
+      state.in_flight.remove(&hwnd);
+      cvar.notify_all();
+      break;
+    };
+    apply_foreign_style_intent(HWND(hwnd), &snapshot);
+    let mut state = lock_foreign_gui();
+    let still_current = state
+      .intents
+      .get(&hwnd)
+      .is_some_and(|intent| intent.generation == snapshot.generation);
+    if still_current {
+      if let Some(intent) = state.intents.get_mut(&hwnd) {
+        intent.applied_generation = snapshot.generation;
+      }
+      state.in_flight.remove(&hwnd);
+      cvar.notify_all();
+      break;
+    }
+    cvar.notify_all();
+  }
+}
+
+/// Starts or joins the worker for `hwnd` and waits at most
+/// [`FOREIGN_GUI_CALL_TIMEOUT`].
+///
+/// Same-thread writes stay inline. A second request while the worker
+/// is blocked only updates the desired generation and returns
+/// [`ForeignStyleDrive::Deferred`].
+fn drive_foreign_style(window: &NativeWindow) -> ForeignStyleDrive {
+  let hwnd = window.hwnd().0;
+  if window.gui_thread_is_current() {
+    let snapshot = lock_foreign_gui().intents.get(&hwnd).cloned();
+    if let Some(snapshot) = snapshot {
+      apply_foreign_style_intent(window.hwnd(), &snapshot);
+      let mut state = lock_foreign_gui();
+      if let Some(intent) = state.intents.get_mut(&hwnd) {
+        if intent.generation == snapshot.generation {
+          intent.applied_generation = snapshot.generation;
+        }
+      }
+    }
+    return ForeignStyleDrive::Applied;
+  }
+  if !window.foreign_gui_responsive() {
+    return ForeignStyleDrive::Skipped;
+  }
+
+  let generation = {
+    let mut state = lock_foreign_gui();
+    if state.in_flight.contains(&hwnd) {
+      return ForeignStyleDrive::Deferred;
+    }
+    if state.in_flight.len() >= FOREIGN_GUI_MAX_BLOCKED_THREADS {
+      warn!(
+        "Foreign style worker cap ({FOREIGN_GUI_MAX_BLOCKED_THREADS}) is full; hwnd={} keeps its desired state until a worker returns.",
+        hwnd_token(HWND(hwnd))
+      );
+      return ForeignStyleDrive::Skipped;
+    }
+    state.in_flight.insert(hwnd);
+    state.intents.get(&hwnd).map(|intent| intent.generation)
+  };
+  let Some(generation) = generation else {
+    let mut state = lock_foreign_gui();
+    state.in_flight.remove(&hwnd);
+    return ForeignStyleDrive::Skipped;
+  };
+
+  let spawned = thread::Builder::new()
+    .name("glazewm-foreign-gui".to_string())
+    .spawn(move || foreign_style_worker(hwnd));
+  if spawned.is_err() {
+    let mut state = lock_foreign_gui();
+    state.in_flight.remove(&hwnd);
+    foreign_gui_sync().1.notify_all();
+    return ForeignStyleDrive::Skipped;
+  }
+
+  let (_lock, cvar) = foreign_gui_sync();
+  let guard = lock_foreign_gui();
+  let finished =
+    cvar.wait_timeout_while(guard, FOREIGN_GUI_CALL_TIMEOUT, |state| {
+      let pending = state
+        .intents
+        .get(&hwnd)
+        .is_some_and(|intent| intent.applied_generation != generation);
+      pending && state.in_flight.contains(&hwnd)
+    });
+  match finished {
+    Ok((_, wait)) if !wait.timed_out() => ForeignStyleDrive::Applied,
+    _ => ForeignStyleDrive::TimedOut,
+  }
+}
+
+/// Records `label` when the WM-facing call did not observe a finished
+/// apply.
+fn finish_foreign_style_drive(drive: &ForeignStyleDrive) {
+  match drive {
+    ForeignStyleDrive::Applied => {}
+    ForeignStyleDrive::Deferred => mark_native_op_result("deferred"),
+    ForeignStyleDrive::TimedOut | ForeignStyleDrive::Skipped => {
+      mark_native_op_result("skip-unresponsive");
     }
   }
 }
 
-/// Runs `work` away from the caller and waits at most
-/// [`FOREIGN_GUI_CALL_TIMEOUT`].
-///
-/// Returns `None` when `work` does not finish in time, or when this
-/// `HWND` already has a call in flight. The caller, which is the WM
-/// thread in production, does not stay inside `SetWindowLongPtrW` or
-/// `SetLayeredWindowAttributes`.
-fn run_bounded_foreign_gui_call<T>(
-  hwnd: isize,
-  work: impl FnOnce() -> T + Send + 'static,
-) -> Option<T>
-where
-  T: Send + 'static,
-{
-  {
-    let Ok(mut in_flight) = foreign_gui_calls_in_flight().lock() else {
-      return None;
-    };
-    if !in_flight.insert(hwnd) {
-      return None;
-    }
-  }
+/// Whether a foreign style worker has not yet returned for `hwnd`.
+#[cfg(test)]
+fn foreign_style_in_flight(hwnd: isize) -> bool {
+  lock_foreign_gui().in_flight.contains(&hwnd)
+}
 
-  let (sender, receiver) = mpsc::channel();
-  let spawned = thread::Builder::new()
-    .name("glazewm-foreign-gui".to_string())
-    .spawn(move || {
-      let _guard = ForeignGuiCallGuard(hwnd);
-      let value = work();
-      let _ = sender.send(value);
-    });
-  if spawned.is_err() {
-    if let Ok(mut in_flight) = foreign_gui_calls_in_flight().lock() {
-      in_flight.remove(&hwnd);
+/// Waits until the worker for `hwnd` has finished, including a stale
+/// apply that resumed and reconciled.
+#[cfg(test)]
+fn wait_until_foreign_style_idle(hwnd: isize, timeout: Duration) -> bool {
+  let (lock, cvar) = foreign_gui_sync();
+  let guard = lock
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  match cvar.wait_timeout_while(guard, timeout, |state| {
+    state.in_flight.contains(&hwnd)
+  }) {
+    Ok((guard, wait)) => {
+      !wait.timed_out() && !guard.in_flight.contains(&hwnd)
     }
-    return None;
+    Err(poisoned) => !poisoned.into_inner().0.in_flight.contains(&hwnd),
   }
-
-  receiver.recv_timeout(FOREIGN_GUI_CALL_TIMEOUT).ok()
 }
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -317,7 +579,9 @@ impl NativeWindow {
         rect.bottom,
       ))
     } else {
-      warn!("Failed to get window's frame position. Falling back to border position.");
+      warn!(
+        "Failed to get window's frame position. Falling back to border position."
+      );
       self.frame_with_shadows()
     }
   }
@@ -831,40 +1095,47 @@ impl NativeWindow {
   }
 
   fn add_window_style_ex_inner(&self, style: WINDOW_EX_STYLE) {
-    if self.has_window_style_ex(style) {
+    #[allow(clippy::cast_possible_wrap)]
+    let bit = style.0 as isize;
+    if !self.record_ex_style_bit(bit) {
       mark_native_op_result("unchanged");
       return;
     }
+    self.drive_recorded_style();
+  }
 
-    #[allow(clippy::cast_possible_wrap)]
-    let bit = style.0 as isize;
-    let hwnd = self.hwnd();
-    let apply = move || {
-      let current_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-      if current_style & bit == 0 {
-        // SAFETY: Cross-thread `SetWindowLongPtrW` sends
-        // `WM_STYLECHANGING` to the window thread. Callers that are
-        // not that thread use [`run_bounded_foreign_gui_call`].
-        unsafe {
-          SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current_style | bit)
-        };
-      }
-    };
+  /// Records an extended-style bit that must be present.
+  ///
+  /// Returns false when the bit is already present and no in-flight
+  /// worker is going to clear it.
+  fn record_ex_style_bit(&self, bit: isize) -> bool {
+    let present = self.has_window_style_ex_bit(bit);
+    let hwnd = self.hwnd().0;
+    let mut state = lock_foreign_gui();
+    let in_flight = state.in_flight.contains(&hwnd);
+    let intent = state.intents.entry(hwnd).or_default();
+    let layered = bit == layered_ex_bit();
+    let desired_on = intent.ex_style_or & bit == bit
+      && (!layered || intent.layered == Some(true));
+    let settled =
+      !in_flight && intent.applied_generation == intent.generation;
+    if desired_on && (in_flight || (present && settled)) {
+      return false;
+    }
+    if present && settled && (!layered || intent.layered != Some(false)) {
+      return false;
+    }
+    intent.ex_style_or |= bit;
+    if layered {
+      intent.layered = Some(true);
+    }
+    intent.generation = intent.generation.wrapping_add(1);
+    true
+  }
 
-    if self.gui_thread_is_current() {
-      apply();
-      return;
-    }
-    if !self.foreign_gui_responsive()
-      || run_bounded_foreign_gui_call(hwnd.0, apply).is_none()
-    {
-      mark_native_op_result("skip-unresponsive");
-      warn!(
-        "Skipped extended style {:#x} for unresponsive hwnd={}.",
-        style.0,
-        hwnd_token(hwnd)
-      );
-    }
+  /// Whether `bit` is set in `GWL_EXSTYLE`.
+  fn has_window_style_ex_bit(&self, bit: isize) -> bool {
+    (unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) } & bit) != 0
   }
 
   /// Implements [`NativeWindowWindowsExt::set_z_order`].
@@ -917,79 +1188,52 @@ impl NativeWindow {
   /// Implements [`NativeWindowWindowsExt::set_title_bar_visibility`].
   ///
   /// The style write is bounded the same way as
-  /// [`NativeWindow::add_window_style_ex`]. The following
-  /// `SetWindowPos` stays asynchronous.
+  /// [`NativeWindow::add_window_style_ex`]. A worker that resumes
+  /// after the wait reapplies the latest title-bar request. The
+  /// following `SetWindowPos` stays asynchronous and does not change
+  /// z-order.
   pub(crate) fn set_title_bar_visibility(
     &self,
     visible: bool,
   ) -> crate::Result<()> {
     timed_native_op(self.hwnd(), "set_title_bar_visibility", || {
-      self.set_title_bar_visibility_inner(visible)
+      self.set_title_bar_visibility_inner(visible);
+      Ok(())
     })
   }
 
-  fn set_title_bar_visibility_inner(
-    &self,
-    visible: bool,
-  ) -> crate::Result<()> {
-    let style = unsafe { GetWindowLongPtrW(self.hwnd(), GWL_STYLE) };
-
-    #[allow(clippy::cast_possible_wrap)]
-    let new_style = if visible {
-      style | (WS_DLGFRAME.0 as isize)
-    } else {
-      style & !(WS_DLGFRAME.0 as isize)
-    };
-
-    if new_style == style {
+  fn set_title_bar_visibility_inner(&self, visible: bool) {
+    if !self.record_title_bar(visible) {
       mark_native_op_result("unchanged");
-      return Ok(());
+      return;
     }
+    self.drive_recorded_style();
+  }
 
-    let hwnd = self.hwnd();
-    let wrote = if self.gui_thread_is_current() {
-      unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, new_style) };
-      true
-    } else if !self.foreign_gui_responsive() {
-      false
-    } else {
-      run_bounded_foreign_gui_call(hwnd.0, move || {
-        unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, new_style) };
-      })
-      .is_some()
-    };
-    if !wrote {
-      mark_native_op_result("skip-unresponsive");
-      warn!(
-        "Skipped title-bar style for unresponsive hwnd={}.",
-        hwnd_token(hwnd)
-      );
-      return Ok(());
+  /// Records the latest title-bar visibility.
+  ///
+  /// Returns false when the frame bit already matches and no worker
+  /// is about to apply the opposite value.
+  fn record_title_bar(&self, visible: bool) -> bool {
+    let style = unsafe { GetWindowLongPtrW(self.hwnd(), GWL_STYLE) };
+    let has_frame = (style & dlg_frame_bit()) != 0;
+    let hwnd = self.hwnd().0;
+    let mut state = lock_foreign_gui();
+    let in_flight = state.in_flight.contains(&hwnd);
+    let intent = state.intents.entry(hwnd).or_default();
+    let settled =
+      !in_flight && intent.applied_generation == intent.generation;
+    if intent.title_bar_visible == Some(visible)
+      && (in_flight || (has_frame == visible && settled))
+    {
+      return false;
     }
-
-    // SAFETY: `SWP_ASYNCWINDOWPOS` keeps the frame refresh off this
-    // thread. The style bits were already written.
-    unsafe {
-      SetWindowPos(
-        hwnd,
-        HWND_NOTOPMOST,
-        0,
-        0,
-        0,
-        0,
-        SWP_FRAMECHANGED
-          | SWP_NOMOVE
-          | SWP_NOSIZE
-          | SWP_NOZORDER
-          | SWP_NOOWNERZORDER
-          | SWP_NOACTIVATE
-          | SWP_NOCOPYBITS
-          | SWP_NOSENDCHANGING
-          | SWP_ASYNCWINDOWPOS,
-      )?;
+    if has_frame == visible && settled {
+      return false;
     }
-
-    Ok(())
+    intent.title_bar_visible = Some(visible);
+    intent.generation = intent.generation.wrapping_add(1);
+    true
   }
 
   /// Implements [`NativeWindowWindowsExt::set_border_color`].
@@ -1057,81 +1301,82 @@ impl NativeWindow {
   /// Implements [`NativeWindowWindowsExt::set_transparency`].
   ///
   /// A fully opaque request does not add `WS_EX_LAYERED`. A window
-  /// that is already layered still receives `opacity_value`. Both
-  /// the style bit and `SetLayeredWindowAttributes` run off this
-  /// thread when the target GUI thread is foreign, so a stall in
-  /// either call cannot freeze the WM thread.
+  /// that is already layered still receives `opacity_value`. The
+  /// foreign apply runs on a worker. If that worker resumes after a
+  /// newer request, it writes the newer alpha and layered bit.
   pub(crate) fn set_transparency(
     &self,
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
     timed_native_op(self.hwnd(), "set_transparency", || {
-      self.set_transparency_inner(opacity_value)
+      self.set_transparency_inner(opacity_value);
+      Ok(())
     })
   }
 
-  fn set_transparency_inner(
-    &self,
-    opacity_value: &OpacityValue,
-  ) -> crate::Result<()> {
-    let alpha = opacity_value.to_alpha();
-    let already_layered = self.has_window_style_ex(WS_EX_LAYERED);
-    // 100% on a non-layered window is a no-op. Do not add the bit.
-    if alpha == u8::MAX && !already_layered {
+  fn set_transparency_inner(&self, opacity_value: &OpacityValue) {
+    if !self.record_transparency(opacity_value.to_alpha()) {
       mark_native_op_result("unchanged");
-      return Ok(());
+      return;
     }
-
-    if !already_layered {
-      self.add_window_style_ex(WS_EX_LAYERED);
-      if !self.has_window_style_ex(WS_EX_LAYERED) {
-        mark_native_op_result("skip-unresponsive");
-        warn!(
-          "Skipped transparency for unresponsive hwnd={}.",
-          hwnd_token(self.hwnd())
-        );
-        return Ok(());
-      }
-    }
-
-    self.set_layered_alpha_bounded(alpha)
+    self.drive_recorded_style();
   }
 
-  /// Applies `alpha` with `SetLayeredWindowAttributes`.
+  /// Records the latest layered-alpha request.
   ///
-  /// The foreign call is bounded by [`run_bounded_foreign_gui_call`].
-  /// A `WM_NULL` probe only avoids starting that call when the thread
-  /// is already not answering.
-  fn set_layered_alpha_bounded(&self, alpha: u8) -> crate::Result<()> {
-    let hwnd = self.hwnd();
-    let apply = move || unsafe {
-      SetLayeredWindowAttributes(hwnd, None, alpha, LWA_ALPHA)
-    };
+  /// Alpha 255 on a window that is not layered, and that has no
+  /// in-flight request to become layered, is a no-op. Alpha 255 while
+  /// a worker may still add `WS_EX_LAYERED` records "not layered" so
+  /// that worker removes the bit when it resumes.
+  fn record_transparency(&self, alpha: u8) -> bool {
+    let has_layered = self.has_window_style_ex(WS_EX_LAYERED);
+    let hwnd = self.hwnd().0;
+    let mut state = lock_foreign_gui();
+    let in_flight = state.in_flight.contains(&hwnd);
+    let intent = state.intents.entry(hwnd).or_default();
+    let pending_layer = intent.layered == Some(true)
+      && (in_flight || intent.applied_generation != intent.generation);
 
-    if self.gui_thread_is_current() {
-      apply()?;
-      return Ok(());
+    if alpha == u8::MAX && !has_layered && !pending_layer {
+      return false;
     }
-    if !self.foreign_gui_responsive() {
-      mark_native_op_result("skip-unresponsive");
-      warn!(
-        "Skipped layered alpha for unresponsive hwnd={}.",
-        hwnd_token(hwnd)
-      );
-      return Ok(());
+    if alpha == u8::MAX && !has_layered && pending_layer {
+      intent.layered = Some(false);
+      intent.alpha = None;
+      intent.ex_style_or &= !layered_ex_bit();
+      intent.generation = intent.generation.wrapping_add(1);
+      return true;
     }
 
-    if let Some(result) = run_bounded_foreign_gui_call(hwnd.0, apply) {
-      result?;
-      Ok(())
-    } else {
-      mark_native_op_result("skip-unresponsive");
-      warn!(
-        "Skipped layered alpha for unresponsive hwnd={}.",
-        hwnd_token(hwnd)
-      );
-      Ok(())
+    if intent.layered == Some(true)
+      && intent.alpha == Some(alpha)
+      && has_layered
+      && !in_flight
+      && intent.applied_generation == intent.generation
+    {
+      return false;
     }
+    intent.layered = Some(true);
+    intent.alpha = Some(alpha);
+    intent.ex_style_or |= layered_ex_bit();
+    intent.generation = intent.generation.wrapping_add(1);
+    true
+  }
+
+  /// Drives the recorded intent and logs when the caller did not see it
+  /// finish.
+  fn drive_recorded_style(&self) {
+    let drive = drive_foreign_style(self);
+    if matches!(
+      drive,
+      ForeignStyleDrive::TimedOut | ForeignStyleDrive::Skipped
+    ) {
+      warn!(
+        "Skipped style apply for unresponsive hwnd={}.",
+        hwnd_token(self.hwnd())
+      );
+    }
+    finish_foreign_style_drive(&drive);
   }
 
   /// Implements [`NativeWindowWindowsExt::adjust_transparency`].
@@ -1643,11 +1888,11 @@ mod reorder_z_order_tests {
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetLayeredWindowAttributes, GetMessageW, GetTopWindow, GetWindow,
         GetWindowLongPtrW, InSendMessage, RegisterClassW,
-        TranslateMessage, UnregisterClassW, GWL_EXSTYLE, GWL_STYLE,
-        GW_HWNDNEXT, LAYERED_WINDOW_ATTRIBUTES_FLAGS, MSG,
-        WINDOW_EX_STYLE, WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW,
-        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, TranslateMessage,
+        UnregisterClassW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG, WINDOW_EX_STYLE,
+        WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW, WS_DLGFRAME,
+        WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
       },
     },
   };
@@ -1852,6 +2097,131 @@ mod reorder_z_order_tests {
     std::thread::sleep(std::time::Duration::from_secs(60));
   }
 
+  /// Armed after creation. Cross-thread sends other than `WM_NULL`
+  /// wait until the parent signals the named event, then run.
+  static RESUME_GATE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+  unsafe extern "system" fn resume_gate_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+  ) -> LRESULT {
+    if RESUME_GATE_ARMED.load(std::sync::atomic::Ordering::SeqCst)
+      && unsafe { InSendMessage() }.as_bool()
+      && msg != WM_NULL
+    {
+      if let Ok(name) = std::env::var("GLAZEWM_RESUME_EVENT") {
+        use windows::Win32::{
+          Foundation::CloseHandle,
+          System::Threading::{
+            OpenEventW, WaitForSingleObject, SYNCHRONIZATION_ACCESS_RIGHTS,
+          },
+        };
+        // `EVENT_ALL_ACCESS`. The Storage feature that names it is off.
+        let wide_name = wide(&name);
+        match unsafe {
+          OpenEventW(
+            SYNCHRONIZATION_ACCESS_RIGHTS(0x001F_0003),
+            false,
+            PCWSTR(wide_name.as_ptr()),
+          )
+        } {
+          Ok(handle) => {
+            // Parent signals this after publishing the newer desired
+            // state.
+            unsafe { WaitForSingleObject(handle, 30_000) };
+            unsafe {
+              let _ = CloseHandle(handle);
+            }
+          }
+          Err(err) => {
+            eprintln!("resume-gate OpenEventW failed: {err}");
+          }
+        }
+      }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+  }
+
+  /// Pumps messages, answers `WM_NULL`, and holds other sent messages
+  /// until the parent releases the gate.
+  fn create_resume_gate_window() {
+    use std::io::Write;
+
+    RESUME_GATE_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let class_name =
+      wide(&format!("GlazeWmResumeGate{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(resume_gate_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register resume-gate helper class");
+
+    let title = wide("GlazeWM resume-gate helper");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW,
+        80,
+        80,
+        240,
+        120,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create resume-gate helper window");
+    if std::env::var("GLAZEWM_HELPER_LAYERED").ok().as_deref() == Some("1")
+    {
+      super::NativeWindow::new(hwnd.0)
+        .set_transparency(&OpacityValue::from_alpha(200))
+        .expect("seed layered alpha");
+    }
+    // Let a running GlazeWM finish its own create-time style calls
+    // before the gate starts holding sent messages.
+    let pump_until =
+      std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let mut message = MSG::default();
+    while std::time::Instant::now() < pump_until {
+      let found = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+          &raw mut message,
+          None,
+          0,
+          0,
+          windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+        )
+      };
+      if found.as_bool() {
+        unsafe {
+          TranslateMessage(&raw const message);
+          DispatchMessageW(&raw const message);
+        }
+      } else {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+      }
+    }
+    RESUME_GATE_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    println!("GLAZEWM_Z_ORDER_HWND:{}", hwnd.0);
+    std::io::stdout().flush().expect("flush helper HWND");
+
+    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {
+      unsafe {
+        TranslateMessage(&raw const message);
+        DispatchMessageW(&raw const message);
+      }
+    }
+    std::thread::sleep(std::time::Duration::from_secs(60));
+  }
+
   fn create_pumping_window_pair() {
     use std::{io::Write, time::Duration};
 
@@ -1982,6 +2352,13 @@ mod reorder_z_order_tests {
   fn style_stall_helper_window() {
     if helper_mode("style-stall") {
       create_style_stall_window();
+    }
+  }
+
+  #[test]
+  fn resume_gate_helper_window() {
+    if helper_mode("resume-gate") {
+      create_resume_gate_window();
     }
   }
 
@@ -2150,7 +2527,9 @@ mod reorder_z_order_tests {
       .collect::<Vec<_>>();
     let expected_order =
       expected.iter().map(|window| window.0).collect::<Vec<_>>();
-    panic!("foreign z-order did not converge: expected={expected_order:?}, actual={order:?}, topmost={topmost_states:?}");
+    panic!(
+      "foreign z-order did not converge: expected={expected_order:?}, actual={order:?}, topmost={topmost_states:?}"
+    );
   }
 
   fn spawn_pumping_window_helper() -> (std::process::Child, [HWND; 2]) {
@@ -2742,6 +3121,399 @@ mod reorder_z_order_tests {
       Some(200),
       "SetLayeredWindowAttributes changed alpha while the GUI thread was stalled"
     );
+  }
+
+  /// Foreign window that blocks sent messages until
+  /// [`ResumeGate::release`].
+  struct ResumeGate {
+    helper: std::process::Child,
+    hwnd: isize,
+    event: windows::Win32::Foundation::HANDLE,
+  }
+
+  impl Drop for ResumeGate {
+    fn drop(&mut self) {
+      let _ = self.helper.kill();
+      let _ = self.helper.wait();
+      unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(self.event);
+      }
+    }
+  }
+
+  impl ResumeGate {
+    /// Signals the helper so the blocked native call can return.
+    fn release(&self) {
+      unsafe {
+        windows::Win32::System::Threading::SetEvent(self.event)
+          .expect("signal resume gate");
+      }
+    }
+  }
+
+  /// Spawns a pumping foreign window whose sent messages wait on an event.
+  fn spawn_resume_gate(layered: bool) -> ResumeGate {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+      sync::atomic::{AtomicU64, Ordering},
+      time::Duration,
+    };
+
+    use windows::Win32::{
+      Foundation::HANDLE, System::Threading::CreateEventW,
+    };
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+      r"Local\GlazeWmResume{}-{}",
+      std::process::id(),
+      SEQ.fetch_add(1, Ordering::SeqCst)
+    );
+    let wide_name = wide(&name);
+    let event = unsafe {
+      CreateEventW(None, true, false, PCWSTR(wide_name.as_ptr()))
+    }
+    .expect("create resume event");
+    assert_ne!(event, HANDLE::default(), "resume event handle");
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut helper = Command::new(current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "resume-gate")
+      .env("GLAZEWM_RESUME_EVENT", &name)
+      .env("GLAZEWM_HELPER_LAYERED", if layered { "1" } else { "0" })
+      .arg("resume_gate_helper_window")
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn resume-gate helper");
+    let stdout = helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let hwnd = loop {
+      let line = lines
+        .next()
+        .expect("resume-gate HWND")
+        .expect("read resume-gate HWND");
+      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
+        break hwnd.parse::<isize>().expect("parse resume-gate HWND");
+      }
+    };
+    // The HWND line is printed after the gate is armed and before the
+    // pump.
+    std::thread::sleep(Duration::from_millis(100));
+    ResumeGate {
+      helper,
+      hwnd,
+      event,
+    }
+  }
+
+  #[test]
+  fn resume_after_timeout_does_not_keep_stale_layered_bit() {
+    let gate = spawn_resume_gate(false);
+    let window = super::NativeWindow::new(gate.hwnd);
+    let started = std::time::Instant::now();
+    window
+      .set_transparency(&OpacityValue::from_alpha(180))
+      .expect("first transparency");
+    assert!(
+      started.elapsed() < std::time::Duration::from_secs(2),
+      "first layered request blocked the caller"
+    );
+    assert!(
+      super::foreign_style_in_flight(gate.hwnd),
+      "first layered request was not still in the worker; layered={} elapsed={:?}",
+      ex_style_bit(gate.hwnd, WS_EX_LAYERED.0),
+      started.elapsed()
+    );
+    let started = std::time::Instant::now();
+    window
+      .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      .expect("superseding opaque request");
+    assert!(
+      started.elapsed() < std::time::Duration::from_millis(500),
+      "superseding request waited on the blocked worker"
+    );
+    gate.release();
+    assert!(
+      super::wait_until_foreign_style_idle(
+        gate.hwnd,
+        std::time::Duration::from_secs(2)
+      ),
+      "layered worker did not finish after resume"
+    );
+    assert!(
+      !ex_style_bit(gate.hwnd, WS_EX_LAYERED.0),
+      "resumed worker left WS_EX_LAYERED from the timed-out request"
+    );
+  }
+
+  #[test]
+  fn resume_after_timeout_restores_title_bar() {
+    let gate = spawn_resume_gate(false);
+    let window = super::NativeWindow::new(gate.hwnd);
+    let started = std::time::Instant::now();
+    window
+      .set_title_bar_visibility(false)
+      .expect("first title-bar request");
+    assert!(
+      started.elapsed() < std::time::Duration::from_secs(2),
+      "first title-bar request blocked the caller"
+    );
+    assert!(super::foreign_style_in_flight(gate.hwnd));
+    assert!(
+      {
+        let frame = super::dlg_frame_bit();
+        (unsafe { GetWindowLongPtrW(HWND(gate.hwnd), GWL_STYLE) }) & frame
+          != 0
+      },
+      "title bar was cleared before the worker resumed"
+    );
+    let started = std::time::Instant::now();
+    window
+      .set_title_bar_visibility(true)
+      .expect("restore title bar");
+    assert!(
+      started.elapsed() < std::time::Duration::from_millis(500),
+      "title-bar restore waited on the blocked worker"
+    );
+    gate.release();
+    assert!(
+      super::wait_until_foreign_style_idle(
+        gate.hwnd,
+        std::time::Duration::from_secs(2)
+      ),
+      "title-bar worker did not finish after resume"
+    );
+    let frame = super::dlg_frame_bit();
+    assert!(
+      (unsafe { GetWindowLongPtrW(HWND(gate.hwnd), GWL_STYLE) }) & frame
+        != 0,
+      "resumed worker left the title bar hidden"
+    );
+  }
+
+  #[test]
+  fn resume_after_timeout_applies_latest_layered_alpha() {
+    // The first request blocks in `WM_STYLECHANGING` before the alpha
+    // write. `SetLayeredWindowAttributes` itself does not enter the
+    // foreign procedure, so the stale alpha is the one that would run
+    // after that style call returns.
+    let gate = spawn_resume_gate(false);
+    let window = super::NativeWindow::new(gate.hwnd);
+    let started = std::time::Instant::now();
+    window
+      .set_transparency(&OpacityValue::from_alpha(180))
+      .expect("first alpha");
+    assert!(
+      started.elapsed() < std::time::Duration::from_secs(2),
+      "first alpha request blocked the caller"
+    );
+    assert!(
+      super::foreign_style_in_flight(gate.hwnd),
+      "style write ahead of the alpha did not stay in the worker"
+    );
+    assert!(
+      !ex_style_bit(gate.hwnd, WS_EX_LAYERED.0),
+      "layered bit was committed while the style change was stalled"
+    );
+    let started = std::time::Instant::now();
+    window
+      .set_transparency(&OpacityValue::from_alpha(90))
+      .expect("latest alpha");
+    assert!(
+      started.elapsed() < std::time::Duration::from_millis(500),
+      "latest alpha waited on the blocked worker"
+    );
+    gate.release();
+    assert!(
+      super::wait_until_foreign_style_idle(
+        gate.hwnd,
+        std::time::Duration::from_secs(2)
+      ),
+      "alpha worker did not finish after resume"
+    );
+    assert!(ex_style_bit(gate.hwnd, WS_EX_LAYERED.0));
+    assert_eq!(
+      layered_alpha(gate.hwnd),
+      Some(90),
+      "resumed worker left the timed-out alpha"
+    );
+  }
+
+  struct TimedCall {
+    blocked: bool,
+    thread: std::thread::JoinHandle<()>,
+  }
+
+  /// Runs `body` on another thread. `blocked` is set when `body` is
+  /// still running after `limit`.
+  fn call_exceeds(
+    limit: std::time::Duration,
+    body: impl FnOnce() + Send + 'static,
+  ) -> TimedCall {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+      body();
+      let _ = sender.send(());
+    });
+    TimedCall {
+      blocked: receiver.recv_timeout(limit).is_err(),
+      thread,
+    }
+  }
+
+  struct SuspendedProbe {
+    hwnd: isize,
+    thread_id: u32,
+    thread: windows::Win32::Foundation::HANDLE,
+    gui: std::thread::JoinHandle<()>,
+  }
+
+  /// Hidden window whose GUI thread is suspended inside `GetMessage`.
+  fn spawn_suspended_probe() -> SuspendedProbe {
+    use std::sync::mpsc;
+
+    use windows::Win32::System::Threading::{
+      GetCurrentThreadId, OpenThread, SuspendThread, THREAD_SUSPEND_RESUME,
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    let gui = std::thread::spawn(move || {
+      let class_name =
+        wide(&format!("GlazeWmSuspendProbe{}", std::process::id()));
+      let class = WNDCLASSW {
+        lpfnWndProc: Some(reorder_test_wnd_proc),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+      };
+      let atom = unsafe { RegisterClassW(&raw const class) };
+      assert_ne!(atom, 0, "register suspend-probe class");
+      let hwnd = unsafe {
+        CreateWindowExW(
+          WINDOW_EX_STYLE::default(),
+          PCWSTR(class_name.as_ptr()),
+          PCWSTR(wide("suspend probe").as_ptr()),
+          WS_OVERLAPPEDWINDOW,
+          0,
+          0,
+          120,
+          80,
+          None,
+          None,
+          None,
+          None,
+        )
+      };
+      assert_ne!(hwnd.0, 0, "create suspend-probe window");
+      sender
+        .send((hwnd.0, unsafe { GetCurrentThreadId() }))
+        .expect("send probe hwnd");
+      let mut message = MSG::default();
+      while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool()
+      {
+        unsafe {
+          TranslateMessage(&raw const message);
+          DispatchMessageW(&raw const message);
+        }
+      }
+      unsafe {
+        let _ = DestroyWindow(hwnd);
+        let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+      }
+    });
+
+    let (hwnd, thread_id) = receiver
+      .recv_timeout(std::time::Duration::from_secs(2))
+      .expect("probe hwnd");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let thread =
+      unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
+        .expect("open gui thread");
+    assert_ne!(
+      unsafe { SuspendThread(thread) },
+      u32::MAX,
+      "suspend gui thread"
+    );
+    SuspendedProbe {
+      hwnd,
+      thread_id,
+      thread,
+      gui,
+    }
+  }
+
+  #[test]
+  fn suspended_gui_thread_blocks_style_write_not_layered_alpha() {
+    use windows::Win32::System::Threading::{ResumeThread, SuspendThread};
+
+    let probe = spawn_suspended_probe();
+    let hwnd = probe.hwnd;
+    let style_call =
+      call_exceeds(std::time::Duration::from_millis(200), move || {
+        let current =
+          unsafe { GetWindowLongPtrW(HWND(hwnd), GWL_EXSTYLE) };
+        unsafe {
+          SetWindowLongPtrW(
+            HWND(hwnd),
+            GWL_EXSTYLE,
+            current | super::layered_ex_bit(),
+          );
+        }
+      });
+    assert_ne!(
+      unsafe { ResumeThread(probe.thread) },
+      u32::MAX,
+      "resume after style"
+    );
+    style_call.thread.join().expect("style call");
+    assert!(
+      style_call.blocked,
+      "SetWindowLongPtrW returned while the GUI thread was suspended"
+    );
+    assert!(
+      ex_style_bit(hwnd, WS_EX_LAYERED.0),
+      "style write did not add WS_EX_LAYERED"
+    );
+
+    assert_ne!(
+      unsafe { SuspendThread(probe.thread) },
+      u32::MAX,
+      "suspend gui thread again"
+    );
+    let alpha_call =
+      call_exceeds(std::time::Duration::from_millis(200), move || {
+        let _ = unsafe {
+          SetLayeredWindowAttributes(HWND(hwnd), None, 90, LWA_ALPHA)
+        };
+      });
+    assert_ne!(
+      unsafe { ResumeThread(probe.thread) },
+      u32::MAX,
+      "resume after alpha"
+    );
+    alpha_call.thread.join().expect("alpha call");
+    assert!(
+      !alpha_call.blocked,
+      "SetLayeredWindowAttributes blocked on a suspended GUI thread"
+    );
+
+    unsafe {
+      let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+        probe.thread_id,
+        WM_NULL,
+        WPARAM(0),
+        LPARAM(0),
+      );
+      let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+        HWND(hwnd),
+        windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
+        WPARAM(0),
+        LPARAM(0),
+      );
+      let _ = windows::Win32::Foundation::CloseHandle(probe.thread);
+    }
+    probe.gui.join().expect("probe gui thread");
   }
 
   #[test]
