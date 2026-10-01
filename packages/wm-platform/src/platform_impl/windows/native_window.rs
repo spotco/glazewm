@@ -8,7 +8,7 @@ use tracing::warn;
 use windows::{
   core::PWSTR,
   Win32::{
-    Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
+    Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT, WPARAM},
     Graphics::Dwm::{
       DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
       DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_COLOR_NONE,
@@ -16,8 +16,8 @@ use windows::{
       DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
     },
     System::Threading::{
-      OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-      PROCESS_QUERY_LIMITED_INFORMATION,
+      GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+      PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::{
       Input::KeyboardAndMouse::{
@@ -29,17 +29,18 @@ use windows::{
         GetForegroundWindow, GetLayeredWindowAttributes, GetParent,
         GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-        IsWindowVisible, IsZoomed, SendNotifyMessageW,
-        SetForegroundWindow, SetLayeredWindowAttributes,
-        SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-        ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-        GW_OWNER, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
-        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY,
-        SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
-        SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-        SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT,
+        IsWindowVisible, IsZoomed, SendMessageTimeoutW,
+        SendNotifyMessageW, SetForegroundWindow,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
+        SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
+        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
+        HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
+        LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SMTO_ABORTIFHUNG, SMTO_NORMAL,
+        SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
+        SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE,
+        SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_CLOSE, WM_NULL, WPF_ASYNCWINDOWPLACEMENT,
         WS_CHILD, WS_DLGFRAME, WS_EX_APPWINDOW, WS_EX_LAYERED,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         WS_THICKFRAME,
@@ -60,6 +61,12 @@ use crate::{
 pub(crate) const FOREGROUND_INPUT_IDENTIFIER: u32 = 6379;
 
 static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Bound for the `WM_NULL` probe used before a synchronous style write.
+///
+/// `IsHungAppWindow` stays false for several seconds after a debugger
+/// suspends a thread. `SendMessageTimeoutW` returns when this elapses.
+const FOREIGN_GUI_PROBE_TIMEOUT_MS: u32 = 50;
 
 /// Platform-specific implementation of [`NativeWindow`].
 #[derive(Clone, Debug)]
@@ -547,15 +554,73 @@ impl NativeWindow {
     })
   }
 
+  /// Whether the window's GUI thread can accept a synchronous message.
+  ///
+  /// Same-thread windows are treated as responsive. A cross-thread
+  /// target must answer `WM_NULL` within
+  /// [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. A debugger-suspended thread
+  /// does not, and the caller skips the style write.
+  fn foreign_gui_responsive(&self) -> bool {
+    let hwnd = self.hwnd();
+    // SAFETY: `IsWindow` accepts any bit pattern and reports whether
+    // it is still a window.
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+      return false;
+    }
+
+    let mut process_id = 0u32;
+    // SAFETY: `process_id` is a valid out-parameter.
+    let thread_id =
+      unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    if thread_id == 0 {
+      return false;
+    }
+    // SAFETY: `GetCurrentThreadId` has no parameters.
+    if thread_id == unsafe { GetCurrentThreadId() } {
+      return true;
+    }
+
+    let mut result = 0usize;
+    // SAFETY: `WM_NULL` carries no payload. The timeout keeps a
+    // suspended foreign GUI thread from stalling this thread.
+    let returned = unsafe {
+      SendMessageTimeoutW(
+        hwnd,
+        WM_NULL,
+        WPARAM(0),
+        LPARAM(0),
+        SMTO_ABORTIFHUNG | SMTO_NORMAL,
+        FOREIGN_GUI_PROBE_TIMEOUT_MS,
+        Some(&raw mut result),
+      )
+    };
+    returned.0 != 0
+  }
+
   /// Implements [`NativeWindowWindowsExt::add_window_style_ex`].
+  ///
+  /// Does nothing when the foreign GUI thread is not answering
+  /// messages. `SetWindowLongPtrW` delivers `WM_STYLECHANGING`
+  /// synchronously and would freeze the WM thread on a suspended
+  /// debuggee.
   pub(crate) fn add_window_style_ex(&self, style: WINDOW_EX_STYLE) {
     let current_style =
       unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) };
 
     #[allow(clippy::cast_possible_wrap)]
     if current_style & style.0 as isize == 0 {
-      let new_style = current_style | style.0 as isize;
+      if !self.foreign_gui_responsive() {
+        warn!(
+          "Skipped extended style {:#x} for unresponsive hwnd={}.",
+          style.0,
+          self.hwnd().0
+        );
+        return;
+      }
 
+      let new_style = current_style | style.0 as isize;
+      // SAFETY: The target thread answered `WM_NULL`. Style changes
+      // still send `WM_STYLECHANGING` to that thread.
       unsafe { SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, new_style) };
     }
   }
@@ -608,6 +673,10 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_title_bar_visibility`].
+  ///
+  /// Skips the style write when the foreign GUI thread is not
+  /// answering messages. The following `SetWindowPos` is already
+  /// asynchronous; `SetWindowLongPtrW` is not.
   pub(crate) fn set_title_bar_visibility(
     &self,
     visible: bool,
@@ -622,6 +691,16 @@ impl NativeWindow {
     };
 
     if new_style != style {
+      if !self.foreign_gui_responsive() {
+        warn!(
+          "Skipped title-bar style for unresponsive hwnd={}.",
+          self.hwnd().0
+        );
+        return Ok(());
+      }
+
+      // SAFETY: The target thread answered `WM_NULL`.
+      // `SWP_ASYNCWINDOWPOS` keeps the frame refresh off this thread.
       unsafe {
         SetWindowLongPtrW(self.hwnd(), GWL_STYLE, new_style);
         SetWindowPos(
@@ -696,13 +775,35 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_transparency`].
+  ///
+  /// A responsive window is layered and given `opacity_value`,
+  /// including a fully opaque value. Both writes are skipped when the
+  /// foreign GUI thread is not answering messages, because
+  /// `SetWindowLongPtrW` and `SetLayeredWindowAttributes` would freeze
+  /// the WM thread on a suspended debuggee.
   pub(crate) fn set_transparency(
     &self,
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
-    // Make the window layered if it isn't already.
-    self.add_window_style_ex(WS_EX_LAYERED);
+    if !self.foreign_gui_responsive() {
+      warn!(
+        "Skipped transparency for unresponsive hwnd={}.",
+        self.hwnd().0
+      );
+      return Ok(());
+    }
 
+    // Make the window layered if it isn't already. The style helper
+    // probes again and does not call `SetWindowLongPtrW` if the
+    // thread stopped answering.
+    self.add_window_style_ex(WS_EX_LAYERED);
+    if !self.has_window_style_ex(WS_EX_LAYERED) {
+      return Ok(());
+    }
+
+    // SAFETY: The target thread answered `WM_NULL`, and the window
+    // has `WS_EX_LAYERED`. `SetLayeredWindowAttributes` sends to
+    // that thread.
     unsafe {
       SetLayeredWindowAttributes(
         self.hwnd(),
@@ -902,16 +1003,18 @@ mod reorder_z_order_tests {
       Foundation::{HWND, LPARAM, LRESULT, WPARAM},
       UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetMessageW, GetTopWindow, GetWindow, GetWindowLongPtrW,
-        RegisterClassW, TranslateMessage, UnregisterClassW, GWL_EXSTYLE,
-        GW_HWNDNEXT, MSG, WINDOW_EX_STYLE, WM_WINDOWPOSCHANGING,
-        WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        GetLayeredWindowAttributes, GetMessageW, GetTopWindow, GetWindow,
+        GetWindowLongPtrW, RegisterClassW, TranslateMessage,
+        UnregisterClassW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, MSG, WINDOW_EX_STYLE,
+        WM_WINDOWPOSCHANGING, WNDCLASSW, WS_DLGFRAME, WS_EX_LAYERED,
+        WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
       },
     },
   };
 
   use super::reorder_z_order;
-  use crate::{WindowId, WindowZOrder};
+  use crate::{OpacityValue, WindowId, WindowZOrder};
 
   unsafe extern "system" fn reorder_test_wnd_proc(
     hwnd: HWND,
@@ -1440,6 +1543,230 @@ mod reorder_z_order_tests {
   #[test]
   fn reorder_z_order_does_not_wait_for_a_non_pumping_foreign_window() {
     assert_foreign_z_order_call_is_bounded("reorder-z-order");
+  }
+
+  fn run_hung_style_helper_call(mode: &str) {
+    let hwnd = std::env::var("GLAZEWM_Z_ORDER_HWND")
+      .expect("helper HWND")
+      .parse::<isize>()
+      .expect("parse helper HWND");
+    let window = super::NativeWindow::new(hwnd);
+    match mode {
+      "set-transparency" => {
+        window
+          .set_transparency(&OpacityValue::from_alpha(180))
+          .expect("set transparency");
+      }
+      "set-transparency-opaque" => {
+        window
+          .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+          .expect("set opaque transparency");
+      }
+      "set-title-bar" => {
+        window
+          .set_title_bar_visibility(false)
+          .expect("hide title bar");
+      }
+      _ => panic!("unknown hung style helper mode: {mode}"),
+    }
+  }
+
+  #[test]
+  fn hung_style_helper_set_transparency() {
+    if helper_mode("set-transparency") {
+      run_hung_style_helper_call("set-transparency");
+    }
+  }
+
+  #[test]
+  fn hung_style_helper_set_transparency_opaque() {
+    if helper_mode("set-transparency-opaque") {
+      run_hung_style_helper_call("set-transparency-opaque");
+    }
+  }
+
+  #[test]
+  fn hung_style_helper_set_title_bar() {
+    if helper_mode("set-title-bar") {
+      run_hung_style_helper_call("set-title-bar");
+    }
+  }
+
+  /// Style bits of the helper window after a bounded call.
+  struct HungStyleOutcome {
+    layered: bool,
+    has_dlg_frame: bool,
+  }
+
+  /// Runs `mode` against the non-pumping helper.
+  ///
+  /// The caller must finish within 2 seconds. Without the `WM_NULL`
+  /// probe, `SetWindowLongPtrW` and `SetLayeredWindowAttributes` block
+  /// here until the helper is killed. Style is read before the helper
+  /// exits.
+  fn assert_hung_style_call_is_bounded(mode: &str) -> HungStyleOutcome {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+      time::{Duration, Instant},
+    };
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut window_helper = Command::new(&current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "window")
+      .arg("z_order_test_helper_window")
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn non-pumping window helper");
+    let stdout = window_helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let hwnd = loop {
+      let line = lines
+        .next()
+        .expect("window helper HWND")
+        .expect("read window helper HWND");
+      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
+        break hwnd.parse::<isize>().expect("parse window helper HWND");
+      }
+    };
+
+    let test_name = match mode {
+      "set-transparency" => "hung_style_helper_set_transparency",
+      "set-transparency-opaque" => {
+        "hung_style_helper_set_transparency_opaque"
+      }
+      "set-title-bar" => "hung_style_helper_set_title_bar",
+      _ => panic!("unknown hung style mode: {mode}"),
+    };
+    let mut style_call = Command::new(&current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", mode)
+      .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
+      .arg(test_name)
+      .arg("--nocapture")
+      .stdout(Stdio::null())
+      .spawn()
+      .expect("spawn hung style caller");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let completed = loop {
+      if style_call.try_wait().expect("poll style caller").is_some() {
+        break true;
+      }
+      if Instant::now() >= deadline {
+        break false;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    };
+
+    if !completed {
+      let _ = style_call.kill();
+      let _ = style_call.wait();
+    }
+    let outcome = HungStyleOutcome {
+      layered: ex_style_bit(hwnd, WS_EX_LAYERED.0),
+      has_dlg_frame: {
+        #[allow(clippy::cast_possible_wrap)]
+        let frame = WS_DLGFRAME.0 as isize;
+        (unsafe { GetWindowLongPtrW(HWND(hwnd), GWL_STYLE) }) & frame != 0
+      },
+    };
+    let _ = window_helper.kill();
+    let _ = window_helper.wait();
+
+    assert!(completed, "{mode} blocked on a non-pumping foreign HWND");
+    outcome
+  }
+
+  fn ex_style_bit(hwnd: isize, bit: u32) -> bool {
+    #[allow(clippy::cast_possible_wrap)]
+    let bit = bit as isize;
+    (unsafe { GetWindowLongPtrW(HWND(hwnd), GWL_EXSTYLE) }) & bit != 0
+  }
+
+  #[test]
+  fn set_transparency_does_not_block_or_layer_a_non_pumping_window() {
+    let outcome = assert_hung_style_call_is_bounded("set-transparency");
+    assert!(
+      !outcome.layered,
+      "set_transparency added WS_EX_LAYERED on a non-pumping window"
+    );
+  }
+
+  #[test]
+  fn opaque_transparency_does_not_block_or_layer_a_non_pumping_window() {
+    let outcome =
+      assert_hung_style_call_is_bounded("set-transparency-opaque");
+    assert!(
+      !outcome.layered,
+      "opaque set_transparency added WS_EX_LAYERED on a non-pumping window"
+    );
+  }
+
+  #[test]
+  fn set_title_bar_visibility_does_not_block_on_a_non_pumping_window() {
+    let outcome = assert_hung_style_call_is_bounded("set-title-bar");
+    assert!(
+      outcome.has_dlg_frame,
+      "set_title_bar_visibility cleared the title bar on a non-pumping window"
+    );
+  }
+
+  #[test]
+  fn set_transparency_still_layers_a_responsive_window() {
+    let class_name = wide(&format!(
+      "GlazeWmResponsiveTransparency{}",
+      std::process::id()
+    ));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register responsive transparency class");
+    let hwnd = create_test_window(&class_name, false);
+    let window = super::NativeWindow::new(hwnd.0);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+      .expect("opaque transparency");
+    assert!(
+      ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
+      "a responsive opaque request still layers the window"
+    );
+    let mut alpha = 0u8;
+    let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+    unsafe {
+      GetLayeredWindowAttributes(
+        hwnd,
+        None,
+        Some(&raw mut alpha),
+        Some(&raw mut flag),
+      )
+      .expect("read layered alpha");
+    }
+    assert_eq!(alpha, u8::MAX);
+
+    window
+      .set_transparency(&OpacityValue::from_alpha(80))
+      .expect("partial transparency");
+    unsafe {
+      GetLayeredWindowAttributes(
+        hwnd,
+        None,
+        Some(&raw mut alpha),
+        Some(&raw mut flag),
+      )
+      .expect("read partial alpha");
+    }
+    assert_eq!(alpha, 80);
+    assert!(ex_style_bit(hwnd.0, WS_EX_LAYERED.0));
+
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
   }
 }
 
