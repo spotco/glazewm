@@ -89,22 +89,38 @@ static NATIVE_OP_LOGGER: Mutex<Option<fn(&str)>> = Mutex::new(None);
 /// The worker stays alive until that call returns, then reapplies the
 /// latest desired style. One permanently hung `HWND` therefore retains
 /// one `glazewm-foreign-gui` thread. Distinct HWNDs do not share that
-/// thread. Past this cap, further HWNDs keep their desired state but
-/// do not start another thread until a slot is free and a later call
-/// drives it. This bounds thread growth; it does not make a wedged
-/// GUI thread apply the new state.
+/// thread. A thread whose `HWND` was destroyed or reused stays counted
+/// until that thread returns, so a recycled handle cannot borrow it.
+/// Past this cap, further HWNDs keep their desired state but do not
+/// start another thread until a slot is free and a later call drives
+/// it. This bounds thread growth; it does not make a wedged GUI thread
+/// apply the new state.
 const FOREIGN_GUI_MAX_BLOCKED_THREADS: usize = 32;
+
+/// Process and GUI thread that owned an `HWND` when its intent was stored.
+///
+/// Windows reuses numeric handle values. The pair distinguishes the
+/// window that created the cache from a later window that received the
+/// same value.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct ForeignWindowOwner {
+  process_id: u32,
+  thread_id: u32,
+}
 
 /// Latest style a foreign worker must leave on an `HWND`.
 ///
 /// `generation` advances on every requested change. `applied_generation`
 /// advances only after a worker finishes a native apply of that
 /// generation. A worker that was blocked inside an older apply uses the
-/// mismatch to reapply the current values.
+/// mismatch to reapply the current values. `owner` is the process and
+/// GUI thread captured with the entry. A changed or invalid owner drops
+/// the entry instead of replaying it.
 #[derive(Clone, Default)]
 struct ForeignStyleIntent {
   generation: u64,
   applied_generation: u64,
+  owner: ForeignWindowOwner,
   /// `Some` once transparency has an opinion about `WS_EX_LAYERED`.
   layered: Option<bool>,
   /// Other extended-style bits that must be present.
@@ -113,10 +129,19 @@ struct ForeignStyleIntent {
   alpha: Option<u8>,
 }
 
+/// Worker currently applying style for one `HWND`.
+struct ForeignStyleWorker {
+  ticket: u64,
+  owner: ForeignWindowOwner,
+}
+
 /// In-flight workers and the desired style they should converge to.
 struct ForeignGuiState {
-  in_flight: HashSet<isize>,
+  in_flight: HashMap<isize, ForeignStyleWorker>,
   intents: HashMap<isize, ForeignStyleIntent>,
+  next_ticket: u64,
+  /// Tickets for workers detached after their `HWND` died or was reused.
+  detached_tickets: HashSet<u64>,
 }
 
 /// Shared desired-style table.
@@ -129,8 +154,10 @@ fn foreign_gui_sync() -> &'static (Mutex<ForeignGuiState>, Condvar) {
   STATE.get_or_init(|| {
     (
       Mutex::new(ForeignGuiState {
-        in_flight: HashSet::new(),
+        in_flight: HashMap::new(),
         intents: HashMap::new(),
+        next_ticket: 1,
+        detached_tickets: HashSet::new(),
       }),
       Condvar::new(),
     )
@@ -250,12 +277,96 @@ fn dlg_frame_bit() -> isize {
   }
 }
 
-/// Whether `generation` is still the desired generation for `hwnd`.
-fn foreign_style_generation_is(hwnd: isize, generation: u64) -> bool {
-  lock_foreign_gui()
+/// Reads the process and GUI thread that currently own `hwnd`.
+///
+/// Returns `None` when `hwnd` is not a window. A destroyed handle and
+/// a handle reused by another window do not report the stored owner.
+fn foreign_window_owner(hwnd: HWND) -> Option<ForeignWindowOwner> {
+  if !unsafe { IsWindow(hwnd) }.as_bool() {
+    return None;
+  }
+  let mut process_id = 0u32;
+  let thread_id =
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+  if thread_id == 0 || process_id == 0 {
+    return None;
+  }
+  Some(ForeignWindowOwner {
+    process_id,
+    thread_id,
+  })
+}
+
+/// Workers that still occupy a thread, including ones detached from a
+/// dead or reused `HWND`.
+fn foreign_style_thread_count(state: &ForeignGuiState) -> usize {
+  state.in_flight.len() + state.detached_tickets.len()
+}
+
+/// Forgets a worker's claim on `hwnd` without assuming the thread has
+/// returned. The thread keeps its ticket until it exits.
+fn detach_foreign_style_worker(state: &mut ForeignGuiState, hwnd: isize) {
+  if let Some(worker) = state.in_flight.remove(&hwnd) {
+    state.detached_tickets.insert(worker.ticket);
+  }
+}
+
+/// Records that the worker for `ticket` has left its native call.
+fn release_foreign_style_worker(
+  state: &mut ForeignGuiState,
+  hwnd: isize,
+  ticket: u64,
+) {
+  if state
+    .in_flight
+    .get(&hwnd)
+    .is_some_and(|worker| worker.ticket == ticket)
+  {
+    state.in_flight.remove(&hwnd);
+  } else {
+    state.detached_tickets.remove(&ticket);
+  }
+}
+
+/// Drops cached style when `hwnd` is gone or belongs to another window.
+///
+/// Returns the live owner. A detached worker remains counted until its
+/// thread returns, and it no longer applies this `HWND`.
+fn reclaim_foreign_style_owner(
+  state: &mut ForeignGuiState,
+  hwnd: isize,
+) -> Option<ForeignWindowOwner> {
+  let owner = foreign_window_owner(HWND(hwnd));
+  let intent_stale = state
     .intents
     .get(&hwnd)
-    .is_some_and(|intent| intent.generation == generation)
+    .is_some_and(|intent| owner.is_none_or(|owner| intent.owner != owner));
+  if intent_stale {
+    state.intents.remove(&hwnd);
+  }
+  let worker_stale = state
+    .in_flight
+    .get(&hwnd)
+    .is_some_and(|worker| owner.is_none_or(|owner| worker.owner != owner));
+  if worker_stale {
+    detach_foreign_style_worker(state, hwnd);
+  }
+  owner
+}
+
+/// Whether `intent` is still the desired style for the same window.
+fn foreign_style_snapshot_is_current(
+  hwnd: HWND,
+  intent: &ForeignStyleIntent,
+) -> bool {
+  let stored_matches = lock_foreign_gui()
+    .intents
+    .get(&hwnd.0)
+    .is_some_and(|stored| {
+      stored.generation == intent.generation
+        && stored.owner == intent.owner
+    });
+  stored_matches && foreign_window_owner(hwnd) == Some(intent.owner)
 }
 
 /// Applies one snapshot. Returns early when a newer request arrived.
@@ -264,7 +375,7 @@ fn foreign_style_generation_is(hwnd: isize, generation: u64) -> bool {
 /// cancelled. The caller loops and applies the newer snapshot after
 /// this one returns.
 fn apply_foreign_style_intent(hwnd: HWND, intent: &ForeignStyleIntent) {
-  if !foreign_style_generation_is(hwnd.0, intent.generation) {
+  if !foreign_style_snapshot_is_current(hwnd, intent) {
     return;
   }
 
@@ -284,7 +395,7 @@ fn apply_foreign_style_intent(hwnd: HWND, intent: &ForeignStyleIntent) {
     // worker, not the WM thread.
     unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired_ex) };
   }
-  if !foreign_style_generation_is(hwnd.0, intent.generation) {
+  if !foreign_style_snapshot_is_current(hwnd, intent) {
     return;
   }
 
@@ -303,7 +414,7 @@ fn apply_foreign_style_intent(hwnd: HWND, intent: &ForeignStyleIntent) {
       };
     }
   }
-  if !foreign_style_generation_is(hwnd.0, intent.generation) {
+  if !foreign_style_snapshot_is_current(hwnd, intent) {
     return;
   }
 
@@ -346,27 +457,53 @@ fn apply_foreign_style_intent(hwnd: HWND, intent: &ForeignStyleIntent) {
 }
 
 /// Reapplies desired style until the snapshot it finished is current.
-fn foreign_style_worker(hwnd: isize) {
+///
+/// `ticket` is the worker's claim. After the `HWND` is destroyed or
+/// reused, the claim is detached and this thread must not apply style
+/// or clear a newer worker.
+fn foreign_style_worker(hwnd: isize, ticket: u64) {
   let (_lock, cvar) = foreign_gui_sync();
   loop {
-    let snapshot = lock_foreign_gui().intents.get(&hwnd).cloned();
-    let Some(snapshot) = snapshot else {
+    let snapshot = {
       let mut state = lock_foreign_gui();
-      state.in_flight.remove(&hwnd);
-      cvar.notify_all();
+      let owner = reclaim_foreign_style_owner(&mut state, hwnd);
+      let current = state
+        .in_flight
+        .get(&hwnd)
+        .is_some_and(|worker| worker.ticket == ticket);
+      let snapshot = state.intents.get(&hwnd).cloned().filter(|intent| {
+        current && owner.is_some_and(|owner| intent.owner == owner)
+      });
+      if snapshot.is_none() {
+        release_foreign_style_worker(&mut state, hwnd, ticket);
+        cvar.notify_all();
+      }
+      snapshot
+    };
+    let Some(snapshot) = snapshot else {
       break;
     };
     apply_foreign_style_intent(HWND(hwnd), &snapshot);
     let mut state = lock_foreign_gui();
-    let still_current = state
-      .intents
+    let owns_hwnd = state
+      .in_flight
       .get(&hwnd)
-      .is_some_and(|intent| intent.generation == snapshot.generation);
+      .is_some_and(|worker| worker.ticket == ticket);
+    if !owns_hwnd {
+      release_foreign_style_worker(&mut state, hwnd, ticket);
+      cvar.notify_all();
+      break;
+    }
+    let still_current = state.intents.get(&hwnd).is_some_and(|intent| {
+      intent.generation == snapshot.generation
+        && intent.owner == snapshot.owner
+    }) && foreign_window_owner(HWND(hwnd))
+      == Some(snapshot.owner);
     if still_current {
       if let Some(intent) = state.intents.get_mut(&hwnd) {
         intent.applied_generation = snapshot.generation;
       }
-      state.in_flight.remove(&hwnd);
+      release_foreign_style_worker(&mut state, hwnd, ticket);
       cvar.notify_all();
       break;
     }
@@ -383,12 +520,18 @@ fn foreign_style_worker(hwnd: isize) {
 fn drive_foreign_style(window: &NativeWindow) -> ForeignStyleDrive {
   let hwnd = window.hwnd().0;
   if window.gui_thread_is_current() {
-    let snapshot = lock_foreign_gui().intents.get(&hwnd).cloned();
+    let snapshot = {
+      let mut state = lock_foreign_gui();
+      let _ = reclaim_foreign_style_owner(&mut state, hwnd);
+      state.intents.get(&hwnd).cloned()
+    };
     if let Some(snapshot) = snapshot {
       apply_foreign_style_intent(window.hwnd(), &snapshot);
       let mut state = lock_foreign_gui();
       if let Some(intent) = state.intents.get_mut(&hwnd) {
-        if intent.generation == snapshot.generation {
+        if intent.generation == snapshot.generation
+          && intent.owner == snapshot.owner
+        {
           intent.applied_generation = snapshot.generation;
         }
       }
@@ -399,33 +542,44 @@ fn drive_foreign_style(window: &NativeWindow) -> ForeignStyleDrive {
     return ForeignStyleDrive::Skipped;
   }
 
-  let generation = {
+  let (generation, ticket) = {
     let mut state = lock_foreign_gui();
-    if state.in_flight.contains(&hwnd) {
+    let Some(owner) = reclaim_foreign_style_owner(&mut state, hwnd) else {
+      return ForeignStyleDrive::Skipped;
+    };
+    if state.in_flight.contains_key(&hwnd) {
       return ForeignStyleDrive::Deferred;
     }
-    if state.in_flight.len() >= FOREIGN_GUI_MAX_BLOCKED_THREADS {
+    if foreign_style_thread_count(&state)
+      >= FOREIGN_GUI_MAX_BLOCKED_THREADS
+    {
       warn!(
         "Foreign style worker cap ({FOREIGN_GUI_MAX_BLOCKED_THREADS}) is full; hwnd={} keeps its desired state until a worker returns.",
         hwnd_token(HWND(hwnd))
       );
       return ForeignStyleDrive::Skipped;
     }
-    state.in_flight.insert(hwnd);
-    state.intents.get(&hwnd).map(|intent| intent.generation)
-  };
-  let Some(generation) = generation else {
-    let mut state = lock_foreign_gui();
-    state.in_flight.remove(&hwnd);
-    return ForeignStyleDrive::Skipped;
+    let Some(intent) = state.intents.get(&hwnd) else {
+      return ForeignStyleDrive::Skipped;
+    };
+    if intent.owner != owner {
+      return ForeignStyleDrive::Skipped;
+    }
+    let generation = intent.generation;
+    let ticket = state.next_ticket;
+    state.next_ticket = state.next_ticket.wrapping_add(1);
+    state
+      .in_flight
+      .insert(hwnd, ForeignStyleWorker { ticket, owner });
+    (generation, ticket)
   };
 
   let spawned = thread::Builder::new()
     .name("glazewm-foreign-gui".to_string())
-    .spawn(move || foreign_style_worker(hwnd));
+    .spawn(move || foreign_style_worker(hwnd, ticket));
   if spawned.is_err() {
     let mut state = lock_foreign_gui();
-    state.in_flight.remove(&hwnd);
+    release_foreign_style_worker(&mut state, hwnd, ticket);
     foreign_gui_sync().1.notify_all();
     return ForeignStyleDrive::Skipped;
   }
@@ -438,7 +592,7 @@ fn drive_foreign_style(window: &NativeWindow) -> ForeignStyleDrive {
         .intents
         .get(&hwnd)
         .is_some_and(|intent| intent.applied_generation != generation);
-      pending && state.in_flight.contains(&hwnd)
+      pending && state.in_flight.contains_key(&hwnd)
     });
   match finished {
     Ok((_, wait)) if !wait.timed_out() => ForeignStyleDrive::Applied,
@@ -461,7 +615,7 @@ fn finish_foreign_style_drive(drive: &ForeignStyleDrive) {
 /// Whether a foreign style worker has not yet returned for `hwnd`.
 #[cfg(test)]
 fn foreign_style_in_flight(hwnd: isize) -> bool {
-  lock_foreign_gui().in_flight.contains(&hwnd)
+  lock_foreign_gui().in_flight.contains_key(&hwnd)
 }
 
 /// Waits until the worker for `hwnd` has finished, including a stale
@@ -473,13 +627,27 @@ fn wait_until_foreign_style_idle(hwnd: isize, timeout: Duration) -> bool {
     .lock()
     .unwrap_or_else(std::sync::PoisonError::into_inner);
   match cvar.wait_timeout_while(guard, timeout, |state| {
-    state.in_flight.contains(&hwnd)
+    state.in_flight.contains_key(&hwnd)
   }) {
     Ok((guard, wait)) => {
-      !wait.timed_out() && !guard.in_flight.contains(&hwnd)
+      !wait.timed_out() && !guard.in_flight.contains_key(&hwnd)
     }
-    Err(poisoned) => !poisoned.into_inner().0.in_flight.contains(&hwnd),
+    Err(poisoned) => {
+      !poisoned.into_inner().0.in_flight.contains_key(&hwnd)
+    }
   }
+}
+
+/// Copies the cached style for `hwnd`.
+#[cfg(test)]
+fn foreign_style_intent_clone(hwnd: isize) -> Option<ForeignStyleIntent> {
+  lock_foreign_gui().intents.get(&hwnd).cloned()
+}
+
+/// Stores `intent` under `hwnd` without checking its owner.
+#[cfg(test)]
+fn replace_foreign_style_intent(hwnd: isize, intent: ForeignStyleIntent) {
+  lock_foreign_gui().intents.insert(hwnd, intent);
 }
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -1112,8 +1280,18 @@ impl NativeWindow {
     let present = self.has_window_style_ex_bit(bit);
     let hwnd = self.hwnd().0;
     let mut state = lock_foreign_gui();
-    let in_flight = state.in_flight.contains(&hwnd);
-    let intent = state.intents.entry(hwnd).or_default();
+    let Some(owner) = reclaim_foreign_style_owner(&mut state, hwnd) else {
+      return false;
+    };
+    let in_flight = state.in_flight.contains_key(&hwnd);
+    let intent =
+      state
+        .intents
+        .entry(hwnd)
+        .or_insert_with(|| ForeignStyleIntent {
+          owner,
+          ..ForeignStyleIntent::default()
+        });
     let layered = bit == layered_ex_bit();
     let desired_on = intent.ex_style_or & bit == bit
       && (!layered || intent.layered == Some(true));
@@ -1219,8 +1397,18 @@ impl NativeWindow {
     let has_frame = (style & dlg_frame_bit()) != 0;
     let hwnd = self.hwnd().0;
     let mut state = lock_foreign_gui();
-    let in_flight = state.in_flight.contains(&hwnd);
-    let intent = state.intents.entry(hwnd).or_default();
+    let Some(owner) = reclaim_foreign_style_owner(&mut state, hwnd) else {
+      return false;
+    };
+    let in_flight = state.in_flight.contains_key(&hwnd);
+    let intent =
+      state
+        .intents
+        .entry(hwnd)
+        .or_insert_with(|| ForeignStyleIntent {
+          owner,
+          ..ForeignStyleIntent::default()
+        });
     let settled =
       !in_flight && intent.applied_generation == intent.generation;
     if intent.title_bar_visible == Some(visible)
@@ -1332,8 +1520,18 @@ impl NativeWindow {
     let has_layered = self.has_window_style_ex(WS_EX_LAYERED);
     let hwnd = self.hwnd().0;
     let mut state = lock_foreign_gui();
-    let in_flight = state.in_flight.contains(&hwnd);
-    let intent = state.intents.entry(hwnd).or_default();
+    let Some(owner) = reclaim_foreign_style_owner(&mut state, hwnd) else {
+      return false;
+    };
+    let in_flight = state.in_flight.contains_key(&hwnd);
+    let intent =
+      state
+        .intents
+        .entry(hwnd)
+        .or_insert_with(|| ForeignStyleIntent {
+          owner,
+          ..ForeignStyleIntent::default()
+        });
     let pending_layer = intent.layered == Some(true)
       && (in_flight || intent.applied_generation != intent.generation);
 
@@ -3339,6 +3537,132 @@ mod reorder_z_order_tests {
       Some(90),
       "resumed worker left the timed-out alpha"
     );
+  }
+
+  /// Hidden top-level window created on the calling thread.
+  fn hidden_style_window(label: &str) -> (Vec<u16>, HWND) {
+    let class_name =
+      wide(&format!("GlazeWmOwner{label}{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register owner-identity class");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(wide(label).as_ptr()),
+        WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        120,
+        80,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create owner-identity window");
+    (class_name, hwnd)
+  }
+
+  #[test]
+  fn changed_hwnd_owner_does_not_keep_cached_layered_style() {
+    let (class_name, hwnd) = hidden_style_window("reuse");
+    let window = super::NativeWindow::new(hwnd.0);
+    window
+      .set_transparency(&OpacityValue::from_alpha(90))
+      .expect("seed alpha");
+    let mut stale =
+      super::foreign_style_intent_clone(hwnd.0).expect("seeded intent");
+    stale.owner = super::ForeignWindowOwner {
+      process_id: 1,
+      thread_id: 1,
+    };
+    stale.title_bar_visible = Some(false);
+    super::replace_foreign_style_intent(hwnd.0, stale);
+    window
+      .set_title_bar_visibility(true)
+      .expect("title bar after owner change");
+    let stored =
+      super::foreign_style_intent_clone(hwnd.0).expect("fresh intent");
+    assert_ne!(
+      stored.alpha,
+      Some(90),
+      "cached alpha survived owner change"
+    );
+    assert_ne!(
+      stored.layered,
+      Some(true),
+      "cached layered bit survived owner change"
+    );
+    assert_ne!(
+      stored.title_bar_visible,
+      Some(false),
+      "cached title-bar hide survived owner change"
+    );
+    let frame = super::dlg_frame_bit();
+    assert!(
+      (unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) }) & frame != 0,
+      "owner change reapplied a hidden title bar"
+    );
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn stale_owner_snapshot_does_not_apply() {
+    let (class_name, hwnd) = hidden_style_window("snapshot");
+    let window = super::NativeWindow::new(hwnd.0);
+    window
+      .set_transparency(&OpacityValue::from_alpha(90))
+      .expect("seed alpha");
+    let mut stale =
+      super::foreign_style_intent_clone(hwnd.0).expect("seeded intent");
+    stale.owner = super::ForeignWindowOwner {
+      process_id: 1,
+      thread_id: 1,
+    };
+    stale.title_bar_visible = Some(false);
+    super::replace_foreign_style_intent(hwnd.0, stale.clone());
+    super::apply_foreign_style_intent(hwnd, &stale);
+    let frame = super::dlg_frame_bit();
+    assert!(
+      (unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) }) & frame != 0,
+      "stale owner snapshot hid the title bar"
+    );
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn destroyed_hwnd_drops_cached_style() {
+    let (class_name, hwnd) = hidden_style_window("destroyed");
+    let window = super::NativeWindow::new(hwnd.0);
+    window
+      .set_transparency(&OpacityValue::from_alpha(90))
+      .expect("seed alpha");
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+    }
+    window
+      .set_transparency(&OpacityValue::from_alpha(180))
+      .expect("request after destroy");
+    assert!(
+      super::foreign_style_intent_clone(hwnd.0).is_none(),
+      "destroyed HWND kept its cached style"
+    );
+    unsafe {
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
   }
 
   struct TimedCall {

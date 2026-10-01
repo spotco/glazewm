@@ -1,6 +1,6 @@
 # GlazeWM debug helper
 
-Native window used to reproduce a foreign GUI thread that stops pumping. Open `GlazeWmDebugHelper.sln` and start the Debug x64 target. The project toolset is v145 (Visual Studio 18 Build Tools on this machine). Retarget the project if your Visual Studio only has v143.
+Native window used to reproduce a foreign GUI thread that stops pumping. Open `GlazeWmDebugHelper.sln` in Visual Studio 2022 and start the Debug x64 target. The project toolset is v143, so it builds there without retargeting.
 
 The process has a main window, an owned tool window, and a worker thread that sleeps. Break All suspends every one of those threads. `IsHungAppWindow` stays false.
 
