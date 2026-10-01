@@ -1,9 +1,11 @@
 use std::{
   cell::RefCell,
+  collections::HashSet,
   sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    mpsc, Mutex, OnceLock,
   },
+  thread,
   time::{Duration, Instant},
 };
 
@@ -72,11 +74,27 @@ static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// suspends a thread. `SendMessageTimeoutW` returns when this elapses.
 const FOREIGN_GUI_PROBE_TIMEOUT_MS: u32 = 50;
 
+/// How long the caller waits for a foreign style or layered write.
+///
+/// The write itself runs on another thread. A `WM_NULL` probe is not
+/// this bound: the target can answer `WM_NULL` and then stall in
+/// `WM_STYLECHANGING`.
+const FOREIGN_GUI_CALL_TIMEOUT: Duration = Duration::from_millis(50);
+
 static NATIVE_OP_LOGGER: Mutex<Option<fn(&str)>> = Mutex::new(None);
+
+/// HWNDs with a style or layered write that has not returned yet.
+///
+/// A timed-out worker stays here until the foreign call finishes, so
+/// a later attempt does not start a second blocked thread.
+fn foreign_gui_calls_in_flight() -> &'static Mutex<HashSet<isize>> {
+  static CALLS: OnceLock<Mutex<HashSet<isize>>> = OnceLock::new();
+  CALLS.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
 thread_local! {
   static NATIVE_OP_RESULTS: RefCell<Vec<Option<&'static str>>> =
-    RefCell::new(Vec::new());
+    const { RefCell::new(Vec::new()) };
 }
 
 /// Registers the sink for `native-op` timing lines.
@@ -148,6 +166,58 @@ fn mark_native_op_result(label: &'static str) {
       *slot = Some(label);
     }
   });
+}
+
+/// Clears the in-flight slot when a foreign style write returns.
+struct ForeignGuiCallGuard(isize);
+
+impl Drop for ForeignGuiCallGuard {
+  fn drop(&mut self) {
+    if let Ok(mut in_flight) = foreign_gui_calls_in_flight().lock() {
+      in_flight.remove(&self.0);
+    }
+  }
+}
+
+/// Runs `work` away from the caller and waits at most
+/// [`FOREIGN_GUI_CALL_TIMEOUT`].
+///
+/// Returns `None` when `work` does not finish in time, or when this
+/// `HWND` already has a call in flight. The caller, which is the WM
+/// thread in production, does not stay inside `SetWindowLongPtrW` or
+/// `SetLayeredWindowAttributes`.
+fn run_bounded_foreign_gui_call<T>(
+  hwnd: isize,
+  work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T>
+where
+  T: Send + 'static,
+{
+  {
+    let Ok(mut in_flight) = foreign_gui_calls_in_flight().lock() else {
+      return None;
+    };
+    if !in_flight.insert(hwnd) {
+      return None;
+    }
+  }
+
+  let (sender, receiver) = mpsc::channel();
+  let spawned = thread::Builder::new()
+    .name("glazewm-foreign-gui".to_string())
+    .spawn(move || {
+      let _guard = ForeignGuiCallGuard(hwnd);
+      let value = work();
+      let _ = sender.send(value);
+    });
+  if spawned.is_err() {
+    if let Ok(mut in_flight) = foreign_gui_calls_in_flight().lock() {
+      in_flight.remove(&hwnd);
+    }
+    return None;
+  }
+
+  receiver.recv_timeout(FOREIGN_GUI_CALL_TIMEOUT).ok()
 }
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -374,18 +444,14 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::minimize`].
   pub(crate) fn minimize(&self) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "minimize", || {
-      unsafe { ShowWindowAsync(self.hwnd(), SW_MINIMIZE).ok() }?;
-      Ok(())
-    })
+    unsafe { ShowWindowAsync(self.hwnd(), SW_MINIMIZE).ok() }?;
+    Ok(())
   }
 
   /// Implements [`NativeWindow::maximize`].
   pub(crate) fn maximize(&self) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "maximize", || {
-      unsafe { ShowWindowAsync(self.hwnd(), SW_MAXIMIZE).ok() }?;
-      Ok(())
-    })
+    unsafe { ShowWindowAsync(self.hwnd(), SW_MAXIMIZE).ok() }?;
+    Ok(())
   }
 
   /// Implements [`NativeWindow::focus`].
@@ -508,9 +574,7 @@ impl NativeWindow {
     rect: &Rect,
     flags: SET_WINDOW_POS_FLAGS,
   ) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "set_window_pos", || {
-      self.set_window_pos_inner(z_order, rect, flags)
-    })
+    self.set_window_pos_inner(z_order, rect, flags)
   }
 
   fn set_window_pos_inner(
@@ -543,18 +607,14 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::show`].
   pub(crate) fn show(&self) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "show", || {
-      unsafe { ShowWindowAsync(self.hwnd(), SW_SHOWNA) }.ok()?;
-      Ok(())
-    })
+    unsafe { ShowWindowAsync(self.hwnd(), SW_SHOWNA) }.ok()?;
+    Ok(())
   }
 
   /// Implements [`NativeWindowWindowsExt::hide`].
   pub(crate) fn hide(&self) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "hide", || {
-      unsafe { ShowWindowAsync(self.hwnd(), SW_HIDE) }.ok()?;
-      Ok(())
-    })
+    unsafe { ShowWindowAsync(self.hwnd(), SW_HIDE) }.ok()?;
+    Ok(())
   }
 
   /// Implements [`NativeWindowWindowsExt::restore`].
@@ -562,9 +622,7 @@ impl NativeWindow {
     &self,
     outer_frame: Option<&Rect>,
   ) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "restore", || {
-      self.restore_inner(outer_frame)
-    })
+    self.restore_inner(outer_frame)
   }
 
   fn restore_inner(
@@ -605,8 +663,9 @@ impl NativeWindow {
   /// are synchronous RPC into Explorer / Immersive Shell. They do
   /// not wait on the target window's GUI thread, so a
   /// debugger-suspended debuggee does not block them. A wedged
-  /// Explorer still can. They stay on the WM thread. A worker would
-  /// only move the stall. The `native-op` lines identify it.
+  /// Explorer still can, and that is not closed here. Isolating the
+  /// RPC would only move the stall. It is a separate follow-up. The
+  /// `native-op` lines identify it.
   pub(crate) fn set_cloaked(&self, cloaked: bool) -> crate::Result<()> {
     timed_native_op(self.hwnd(), "set_cloaked", || {
       self.set_cloaked_inner(cloaked)
@@ -702,12 +761,27 @@ impl NativeWindow {
     })
   }
 
+  /// Whether `hwnd` belongs to this thread.
+  ///
+  /// Same-thread style writes do not send `WM_STYLECHANGING` across
+  /// threads, so they stay inline. A worker would deadlock if this
+  /// thread waited on it.
+  fn gui_thread_is_current(&self) -> bool {
+    let hwnd = self.hwnd();
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+      return false;
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    thread_id != 0 && thread_id == unsafe { GetCurrentThreadId() }
+  }
+
   /// Whether the window's GUI thread can accept a synchronous message.
   ///
   /// Same-thread windows are treated as responsive. A cross-thread
   /// target must answer `WM_NULL` within
-  /// [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. A debugger-suspended thread
-  /// does not, and the caller skips the style write.
+  /// [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. This is only a fast skip for a
+  /// thread that is already not pumping. It is not the bound on
+  /// `SetWindowLongPtrW` or `SetLayeredWindowAttributes`.
   fn foreign_gui_responsive(&self) -> bool {
     let hwnd = self.hwnd();
     // SAFETY: `IsWindow` accepts any bit pattern and reports whether
@@ -747,10 +821,9 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::add_window_style_ex`].
   ///
-  /// Does nothing when the foreign GUI thread is not answering
-  /// messages. `SetWindowLongPtrW` delivers `WM_STYLECHANGING`
-  /// synchronously and would freeze the WM thread on a suspended
-  /// debuggee.
+  /// A foreign write runs off this thread. `SetWindowLongPtrW` sends
+  /// `WM_STYLECHANGING` to the target and would freeze the WM thread
+  /// if that handler stalls, even after `WM_NULL` succeeded.
   pub(crate) fn add_window_style_ex(&self, style: WINDOW_EX_STYLE) {
     timed_native_op(self.hwnd(), "add_window_style_ex", || {
       self.add_window_style_ex_inner(style);
@@ -758,27 +831,39 @@ impl NativeWindow {
   }
 
   fn add_window_style_ex_inner(&self, style: WINDOW_EX_STYLE) {
-    let current_style =
-      unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) };
+    if self.has_window_style_ex(style) {
+      mark_native_op_result("unchanged");
+      return;
+    }
 
     #[allow(clippy::cast_possible_wrap)]
-    if current_style & style.0 as isize == 0 {
-      if !self.foreign_gui_responsive() {
-        mark_native_op_result("skip-unresponsive");
-        warn!(
-          "Skipped extended style {:#x} for unresponsive hwnd={}.",
-          style.0,
-          hwnd_token(self.hwnd())
-        );
-        return;
+    let bit = style.0 as isize;
+    let hwnd = self.hwnd();
+    let apply = move || {
+      let current_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+      if current_style & bit == 0 {
+        // SAFETY: Cross-thread `SetWindowLongPtrW` sends
+        // `WM_STYLECHANGING` to the window thread. Callers that are
+        // not that thread use [`run_bounded_foreign_gui_call`].
+        unsafe {
+          SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current_style | bit)
+        };
       }
+    };
 
-      let new_style = current_style | style.0 as isize;
-      // SAFETY: The target thread answered `WM_NULL`. Style changes
-      // still send `WM_STYLECHANGING` to that thread.
-      unsafe { SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, new_style) };
-    } else {
-      mark_native_op_result("unchanged");
+    if self.gui_thread_is_current() {
+      apply();
+      return;
+    }
+    if !self.foreign_gui_responsive()
+      || run_bounded_foreign_gui_call(hwnd.0, apply).is_none()
+    {
+      mark_native_op_result("skip-unresponsive");
+      warn!(
+        "Skipped extended style {:#x} for unresponsive hwnd={}.",
+        style.0,
+        hwnd_token(hwnd)
+      );
     }
   }
 
@@ -831,9 +916,9 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::set_title_bar_visibility`].
   ///
-  /// Skips the style write when the foreign GUI thread is not
-  /// answering messages. The following `SetWindowPos` is already
-  /// asynchronous; `SetWindowLongPtrW` is not.
+  /// The style write is bounded the same way as
+  /// [`NativeWindow::add_window_style_ex`]. The following
+  /// `SetWindowPos` stays asynchronous.
   pub(crate) fn set_title_bar_visibility(
     &self,
     visible: bool,
@@ -860,37 +945,48 @@ impl NativeWindow {
       mark_native_op_result("unchanged");
       return Ok(());
     }
-    if !self.foreign_gui_responsive() {
+
+    let hwnd = self.hwnd();
+    let wrote = if self.gui_thread_is_current() {
+      unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, new_style) };
+      true
+    } else if !self.foreign_gui_responsive() {
+      false
+    } else {
+      run_bounded_foreign_gui_call(hwnd.0, move || {
+        unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, new_style) };
+      })
+      .is_some()
+    };
+    if !wrote {
       mark_native_op_result("skip-unresponsive");
       warn!(
         "Skipped title-bar style for unresponsive hwnd={}.",
-        hwnd_token(self.hwnd())
+        hwnd_token(hwnd)
       );
       return Ok(());
     }
-    {
-      // SAFETY: The target thread answered `WM_NULL`.
-      // `SWP_ASYNCWINDOWPOS` keeps the frame refresh off this thread.
-      unsafe {
-        SetWindowLongPtrW(self.hwnd(), GWL_STYLE, new_style);
-        SetWindowPos(
-          self.hwnd(),
-          HWND_NOTOPMOST,
-          0,
-          0,
-          0,
-          0,
-          SWP_FRAMECHANGED
-            | SWP_NOMOVE
-            | SWP_NOSIZE
-            | SWP_NOZORDER
-            | SWP_NOOWNERZORDER
-            | SWP_NOACTIVATE
-            | SWP_NOCOPYBITS
-            | SWP_NOSENDCHANGING
-            | SWP_ASYNCWINDOWPOS,
-        )?;
-      }
+
+    // SAFETY: `SWP_ASYNCWINDOWPOS` keeps the frame refresh off this
+    // thread. The style bits were already written.
+    unsafe {
+      SetWindowPos(
+        hwnd,
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_FRAMECHANGED
+          | SWP_NOMOVE
+          | SWP_NOSIZE
+          | SWP_NOZORDER
+          | SWP_NOOWNERZORDER
+          | SWP_NOACTIVATE
+          | SWP_NOCOPYBITS
+          | SWP_NOSENDCHANGING
+          | SWP_ASYNCWINDOWPOS,
+      )?;
     }
 
     Ok(())
@@ -901,9 +997,7 @@ impl NativeWindow {
     &self,
     color: Option<&Color>,
   ) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "set_border_color", || {
-      self.set_border_color_inner(color)
-    })
+    self.set_border_color_inner(color)
   }
 
   fn set_border_color_inner(
@@ -933,9 +1027,7 @@ impl NativeWindow {
     &self,
     corner_style: &CornerStyle,
   ) -> crate::Result<()> {
-    timed_native_op(self.hwnd(), "set_corner_style", || {
-      self.set_corner_style_inner(corner_style)
-    })
+    self.set_corner_style_inner(corner_style)
   }
 
   fn set_corner_style_inner(
@@ -964,11 +1056,11 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::set_transparency`].
   ///
-  /// A responsive window is layered and given `opacity_value`,
-  /// including a fully opaque value. Both writes are skipped when the
-  /// foreign GUI thread is not answering messages, because
-  /// `SetWindowLongPtrW` and `SetLayeredWindowAttributes` would freeze
-  /// the WM thread on a suspended debuggee.
+  /// A fully opaque request does not add `WS_EX_LAYERED`. A window
+  /// that is already layered still receives `opacity_value`. Both
+  /// the style bit and `SetLayeredWindowAttributes` run off this
+  /// thread when the target GUI thread is foreign, so a stall in
+  /// either call cannot freeze the WM thread.
   pub(crate) fn set_transparency(
     &self,
     opacity_value: &OpacityValue,
@@ -982,36 +1074,64 @@ impl NativeWindow {
     &self,
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
+    let alpha = opacity_value.to_alpha();
+    let already_layered = self.has_window_style_ex(WS_EX_LAYERED);
+    // 100% on a non-layered window is a no-op. Do not add the bit.
+    if alpha == u8::MAX && !already_layered {
+      mark_native_op_result("unchanged");
+      return Ok(());
+    }
+
+    if !already_layered {
+      self.add_window_style_ex(WS_EX_LAYERED);
+      if !self.has_window_style_ex(WS_EX_LAYERED) {
+        mark_native_op_result("skip-unresponsive");
+        warn!(
+          "Skipped transparency for unresponsive hwnd={}.",
+          hwnd_token(self.hwnd())
+        );
+        return Ok(());
+      }
+    }
+
+    self.set_layered_alpha_bounded(alpha)
+  }
+
+  /// Applies `alpha` with `SetLayeredWindowAttributes`.
+  ///
+  /// The foreign call is bounded by [`run_bounded_foreign_gui_call`].
+  /// A `WM_NULL` probe only avoids starting that call when the thread
+  /// is already not answering.
+  fn set_layered_alpha_bounded(&self, alpha: u8) -> crate::Result<()> {
+    let hwnd = self.hwnd();
+    let apply = move || unsafe {
+      SetLayeredWindowAttributes(hwnd, None, alpha, LWA_ALPHA)
+    };
+
+    if self.gui_thread_is_current() {
+      apply()?;
+      return Ok(());
+    }
     if !self.foreign_gui_responsive() {
       mark_native_op_result("skip-unresponsive");
       warn!(
-        "Skipped transparency for unresponsive hwnd={}.",
-        hwnd_token(self.hwnd())
+        "Skipped layered alpha for unresponsive hwnd={}.",
+        hwnd_token(hwnd)
       );
       return Ok(());
     }
 
-    // Make the window layered if it isn't already. The style helper
-    // probes again and does not call `SetWindowLongPtrW` if the
-    // thread stopped answering.
-    self.add_window_style_ex(WS_EX_LAYERED);
-    if !self.has_window_style_ex(WS_EX_LAYERED) {
-      return Ok(());
+    if let Some(result) = run_bounded_foreign_gui_call(hwnd.0, apply) {
+      result?;
+      Ok(())
+    } else {
+      mark_native_op_result("skip-unresponsive");
+      warn!(
+        "Skipped layered alpha for unresponsive hwnd={}.",
+        hwnd_token(hwnd)
+      );
+      Ok(())
     }
-
-    // SAFETY: The target thread answered `WM_NULL`, and the window
-    // has `WS_EX_LAYERED`. `SetLayeredWindowAttributes` sends to
-    // that thread.
-    unsafe {
-      SetLayeredWindowAttributes(
-        self.hwnd(),
-        None,
-        opacity_value.to_alpha(),
-        LWA_ALPHA,
-      )?;
-    }
-
-    Ok(())
   }
 
   /// Implements [`NativeWindowWindowsExt::adjust_transparency`].
@@ -1191,6 +1311,326 @@ pub(crate) fn reorder_z_order(
   Ok(())
 }
 
+fn next_z_order_generation() -> u64 {
+  Z_ORDER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+pub(crate) fn begin_z_order_batch() -> u64 {
+  next_z_order_generation()
+}
+
+fn current_or_new_z_order_generation() -> u64 {
+  let generation = Z_ORDER_GENERATION.load(Ordering::SeqCst);
+  if generation == 0 {
+    next_z_order_generation()
+  } else {
+    generation
+  }
+}
+
+fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
+  // Always use asynchronous cross-thread requests. A debugger-suspended or
+  // otherwise hung target GUI thread must not block GlazeWM's event loop.
+  let flags = SWP_NOACTIVATE
+    | SWP_NOCOPYBITS
+    | SWP_NOMOVE
+    | SWP_NOSIZE
+    | SWP_ASYNCWINDOWPOS
+    | SWP_NOOWNERZORDER;
+
+  for (index, window_id) in window_ids.iter().enumerate() {
+    let insert_after = index
+      .checked_sub(1)
+      .and_then(|previous| window_ids.get(previous))
+      .map_or(HWND_TOP, |previous| HWND(previous.0));
+
+    // HWND_TOP does not clear TOPMOST. Drop that bit, then immediately
+    // place the window. HWND_NOTOPMOST alone would leave it above every
+    // non-topmost window, which is the wrong band for an ignored window.
+    unsafe {
+      SetWindowPos(HWND(window_id.0), HWND_NOTOPMOST, 0, 0, 0, 0, flags)?;
+      SetWindowPos(HWND(window_id.0), insert_after, 0, 0, 0, 0, flags)?;
+    }
+  }
+
+  Ok(())
+}
+
+impl PartialEq for NativeWindow {
+  fn eq(&self, other: &Self) -> bool {
+    self.handle == other.handle
+  }
+}
+
+impl Eq for NativeWindow {}
+
+impl From<NativeWindow> for crate::NativeWindow {
+  fn from(window: NativeWindow) -> Self {
+    crate::NativeWindow { inner: window }
+  }
+}
+
+/// Implements [`Dispatcher::visible_windows`].
+pub(crate) fn visible_windows(
+  _: &Dispatcher,
+) -> crate::Result<Vec<crate::NativeWindow>> {
+  let mut handles: Vec<isize> = Vec::new();
+
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn visible_windows_proc(
+    handle: HWND,
+    data: LPARAM,
+  ) -> BOOL {
+    let handles = data.0 as *mut Vec<isize>;
+    unsafe { (*handles).push(handle.0) };
+    true.into()
+  }
+
+  unsafe {
+    EnumWindows(
+      Some(visible_windows_proc),
+      LPARAM(std::ptr::from_mut(&mut handles) as _),
+    )
+  }?;
+
+  Ok(
+    handles
+      .into_iter()
+      .map(NativeWindow::new)
+      .filter(|window| window.is_visible().unwrap_or(false))
+      .map(Into::into)
+      .collect(),
+  )
+}
+
+/// Implements [`Dispatcher::debug_windows`].
+pub(crate) fn debug_windows(
+  _: &Dispatcher,
+) -> crate::Result<Vec<NativeWindowDebugInfo>> {
+  let mut handles: Vec<isize> = Vec::new();
+
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn debug_windows_proc(
+    handle: HWND,
+    data: LPARAM,
+  ) -> BOOL {
+    let handles = data.0 as *mut Vec<isize>;
+    unsafe { (*handles).push(handle.0) };
+    true.into()
+  }
+
+  unsafe {
+    EnumWindows(
+      Some(debug_windows_proc),
+      LPARAM(std::ptr::from_mut(&mut handles) as _),
+    )
+  }?;
+
+  Ok(
+    handles
+      .into_iter()
+      .enumerate()
+      .map(|(index, handle)| {
+        let window = NativeWindow::new(handle);
+        let mut info = debug_info(&window);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+          info.z_order_index = Some(index as u32);
+        }
+        info
+      })
+      .collect(),
+  )
+}
+
+/// Uncloak + show top-level DWM-cloaked windows, skipping `skip_handles`
+/// (typically currently managed `GlazeWM` window handles).
+///
+/// Unlike `visible_windows` / managed-container restore, this uses raw
+/// `EnumWindows` and does **not** filter out cloaked HWNDs - so orphaned
+/// windows left cloaked by a prior `GlazeWM` session (Brave/Edge/Terminal)
+/// are included.
+///
+/// Returns how many windows were successfully unhidden.
+pub(crate) fn unhide_all_cloaked_windows(
+  skip_handles: &[isize],
+  _: &Dispatcher,
+) -> crate::Result<usize> {
+  let handles = top_level_window_handles()?;
+
+  let mut unhidden = 0usize;
+  for handle in handles {
+    let window = NativeWindow::new(handle);
+    if !window.is_valid() {
+      continue;
+    }
+    if skip_handles.contains(&handle) {
+      continue;
+    }
+
+    // explorer.exe owns both real File Explorer windows and a large number
+    // of shell/desktop helper HWNDs (WorkerW, Progman, taskbar internals,
+    // etc.). The latter are not user windows, but AddTab below would
+    // create a blank, uncloseable taskbar entry for them. Keep real
+    // Explorer folder windows eligible while cleaning up any stale
+    // shell tabs left by older versions of this command.
+    if is_taskbar_helper_window(&window) {
+      let _ = window.set_taskbar_visibility(false);
+      continue;
+    }
+
+    let cloaked = match window.is_cloaked() {
+      Ok(true) => true,
+      Ok(false) => false,
+      Err(_) => continue,
+    };
+    if !cloaked {
+      continue;
+    }
+
+    // Primary path: same ApplicationView cloak API GlazeWM uses to hide.
+    let uncloak_ok = window.set_cloaked(false).is_ok();
+    if !uncloak_ok {
+      // Fallback: DWMWA_CLOAK = FALSE (attribute 13).
+      let mut cloak_flag: i32 = 0;
+      let _ = unsafe {
+        #[allow(clippy::cast_possible_truncation)]
+        DwmSetWindowAttribute(
+          window.hwnd(),
+          DWMWA_CLOAK,
+          std::ptr::from_mut(&mut cloak_flag).cast(),
+          std::mem::size_of::<i32>() as u32,
+        )
+      };
+    }
+
+    let _ = window.show();
+    let _ = window.set_taskbar_visibility(true);
+    unhidden += 1;
+  }
+
+  Ok(unhidden)
+}
+
+/// Removes taskbar tabs left behind by broad uncloak operations that
+/// treated shell/input helper HWNDs as user windows.
+pub(crate) fn cleanup_taskbar_helper_windows(
+  _: &Dispatcher,
+) -> crate::Result<usize> {
+  let mut cleaned = 0usize;
+  for handle in top_level_window_handles()? {
+    let window = NativeWindow::new(handle);
+    if !window.is_valid() || !is_taskbar_helper_window(&window) {
+      continue;
+    }
+
+    if window.set_taskbar_visibility(false).is_ok() {
+      cleaned += 1;
+    }
+  }
+
+  Ok(cleaned)
+}
+
+fn top_level_window_handles() -> crate::Result<Vec<isize>> {
+  let mut handles: Vec<isize> = Vec::new();
+
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn enum_proc(handle: HWND, data: LPARAM) -> BOOL {
+    let handles = data.0 as *mut Vec<isize>;
+    unsafe { (*handles).push(handle.0) };
+    true.into()
+  }
+
+  unsafe {
+    EnumWindows(
+      Some(enum_proc),
+      LPARAM(std::ptr::from_mut(&mut handles) as _),
+    )
+  }?;
+
+  Ok(handles)
+}
+
+fn is_taskbar_helper_window(window: &NativeWindow) -> bool {
+  is_explorer_shell_window(window) || is_input_method_window(window)
+}
+
+fn is_input_method_window(window: &NativeWindow) -> bool {
+  window.class_name().is_ok_and(|class_name| {
+    matches!(class_name.as_str(), "MSCTFIME UI" | "IME")
+  })
+}
+
+fn is_explorer_shell_window(window: &NativeWindow) -> bool {
+  let Ok(process_name) = window.process_name() else {
+    return false;
+  };
+
+  if !process_name.eq_ignore_ascii_case("explorer") {
+    return false;
+  }
+
+  let Ok(class_name) = window.class_name() else {
+    return false;
+  };
+
+  !matches!(class_name.as_str(), "CabinetWClass" | "ExploreWClass")
+}
+
+/// Implements [`Dispatcher::focused_window`].
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn focused_window(
+  _: &Dispatcher,
+) -> crate::Result<crate::NativeWindow> {
+  let handle = unsafe { GetForegroundWindow() };
+  Ok(NativeWindow::new(handle.0).into())
+}
+
+/// Implements [`Dispatcher::window_from_point`].
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn window_from_point(
+  point: &Point,
+  _: &Dispatcher,
+) -> crate::Result<Option<crate::NativeWindow>> {
+  let point = POINT {
+    x: point.x,
+    y: point.y,
+  };
+
+  let handle = unsafe { WindowFromPoint(point) };
+  if handle.0 == 0 {
+    return Ok(None);
+  }
+
+  let root = unsafe { GetAncestor(handle, GA_ROOT) };
+  if root.0 == 0 {
+    return Ok(None);
+  }
+
+  Ok(Some(NativeWindow::new(root.0).into()))
+}
+
+/// Implements [`Dispatcher::reset_focus`].
+pub(crate) fn reset_focus(_dispatcher: &Dispatcher) -> crate::Result<()> {
+  desktop_window().focus()
+}
+
+/// Gets the `NativeWindow` instance of the desktop window.
+///
+/// This is the explorer.exe wallpaper window (i.e. "Progman"). If
+/// explorer.exe isn't running, then default to the desktop window below
+/// the wallpaper window.
+#[must_use]
+fn desktop_window() -> NativeWindow {
+  let handle = match unsafe { GetShellWindow() } {
+    HWND(0) => unsafe { GetDesktopWindow() },
+    handle => handle,
+  };
+
+  NativeWindow::new(handle.0)
+}
+
 #[cfg(test)]
 mod reorder_z_order_tests {
   use std::os::windows::ffi::OsStrExt;
@@ -1202,11 +1642,12 @@ mod reorder_z_order_tests {
       UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         GetLayeredWindowAttributes, GetMessageW, GetTopWindow, GetWindow,
-        GetWindowLongPtrW, RegisterClassW, TranslateMessage,
-        UnregisterClassW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
-        LAYERED_WINDOW_ATTRIBUTES_FLAGS, MSG, WINDOW_EX_STYLE,
-        WM_WINDOWPOSCHANGING, WNDCLASSW, WS_DLGFRAME, WS_EX_LAYERED,
-        WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        GetWindowLongPtrW, InSendMessage, RegisterClassW,
+        TranslateMessage, UnregisterClassW, GWL_EXSTYLE, GWL_STYLE,
+        GW_HWNDNEXT, LAYERED_WINDOW_ATTRIBUTES_FLAGS, MSG,
+        WINDOW_EX_STYLE, WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW,
+        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        WS_VISIBLE,
       },
     },
   };
@@ -1334,6 +1775,83 @@ mod reorder_z_order_tests {
     }
   }
 
+  /// Armed after the helper has created and, when requested, layered
+  /// the window. Posted messages still run. A cross-thread send other
+  /// than `WM_NULL` stalls, including `WM_STYLECHANGING`.
+  static STYLE_STALL_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+  unsafe extern "system" fn style_stall_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+  ) -> LRESULT {
+    if STYLE_STALL_ARMED.load(std::sync::atomic::Ordering::SeqCst)
+      && unsafe { InSendMessage() }.as_bool()
+      && msg != WM_NULL
+    {
+      // Longer than the production foreign-call bound and the
+      // parent's 2 second deadline.
+      std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+  }
+
+  /// Pumps messages, answers `WM_NULL`, and stalls in the style-change
+  /// handler. This is the case a `WM_NULL` probe cannot see.
+  fn create_style_stall_window() {
+    use std::io::Write;
+
+    STYLE_STALL_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let class_name =
+      wide(&format!("GlazeWmStyleStallHelper{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(style_stall_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register style-stall helper class");
+
+    let title = wide("GlazeWM style-stall helper");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        80,
+        80,
+        240,
+        120,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create style-stall helper window");
+    if std::env::var("GLAZEWM_HELPER_LAYERED").ok().as_deref() == Some("1")
+    {
+      super::NativeWindow::new(hwnd.0)
+        .set_transparency(&OpacityValue::from_alpha(200))
+        .expect("seed layered alpha");
+    }
+    STYLE_STALL_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+    println!("GLAZEWM_Z_ORDER_HWND:{}", hwnd.0);
+    std::io::stdout().flush().expect("flush helper HWND");
+
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {
+      unsafe {
+        TranslateMessage(&raw const message);
+        DispatchMessageW(&raw const message);
+      }
+    }
+    std::thread::sleep(std::time::Duration::from_secs(60));
+  }
+
   fn create_pumping_window_pair() {
     use std::{io::Write, time::Duration};
 
@@ -1457,6 +1975,13 @@ mod reorder_z_order_tests {
   fn z_order_test_helper_window() {
     if helper_mode("window") {
       create_non_pumping_window();
+    }
+  }
+
+  #[test]
+  fn style_stall_helper_window() {
+    if helper_mode("style-stall") {
+      create_style_stall_window();
     }
   }
 
@@ -1840,11 +2365,16 @@ mod reorder_z_order_tests {
     };
 
     let current_exe = std::env::current_exe().expect("test executable");
+    let (helper_test, helper_kind) = if stop == "style-stall" {
+      ("style_stall_helper_window", "style-stall")
+    } else {
+      ("z_order_test_helper_window", "window")
+    };
     let mut window_helper = Command::new(&current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", "window")
+      .env("GLAZEWM_Z_ORDER_HELPER", helper_kind)
       .env("GLAZEWM_HELPER_STOP", stop)
       .env("GLAZEWM_HELPER_LAYERED", if layered { "1" } else { "0" })
-      .arg("z_order_test_helper_window")
+      .arg(helper_test)
       .arg("--nocapture")
       .stdout(Stdio::piped())
       .spawn()
@@ -1860,9 +2390,10 @@ mod reorder_z_order_tests {
         break hwnd.parse::<isize>().expect("parse window helper HWND");
       }
     };
-    if stop == "suspend" {
-      // The HWND line is printed just before SuspendThread. Wait
-      // until that suspend has landed.
+    if stop == "suspend" || stop == "style-stall" {
+      // Suspend: the HWND line is printed just before SuspendThread.
+      // Style stall: the stall is armed before the HWND line, and the
+      // pump starts after it. Wait until that pump is running.
       std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -2102,25 +2633,15 @@ mod reorder_z_order_tests {
       .set_transparency(&OpacityValue::from_alpha(u8::MAX))
       .expect("opaque transparency");
     assert!(
-      ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
-      "a responsive opaque request still layers the window"
+      !ex_style_bit(hwnd.0, WS_EX_LAYERED.0),
+      "a 100% request must not add WS_EX_LAYERED"
     );
-    let mut alpha = 0u8;
-    let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
-    unsafe {
-      GetLayeredWindowAttributes(
-        hwnd,
-        None,
-        Some(&raw mut alpha),
-        Some(&raw mut flag),
-      )
-      .expect("read layered alpha");
-    }
-    assert_eq!(alpha, u8::MAX);
 
     window
       .set_transparency(&OpacityValue::from_alpha(80))
       .expect("partial transparency");
+    let mut alpha = 0u8;
+    let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
     unsafe {
       GetLayeredWindowAttributes(
         hwnd,
@@ -2188,6 +2709,39 @@ mod reorder_z_order_tests {
   #[test]
   fn focus_returns_for_a_suspended_foreign_window() {
     assert_stopped_style_call("focus", "suspend", false);
+  }
+
+  #[test]
+  fn style_changing_stall_does_not_block_or_layer() {
+    let outcome =
+      assert_stopped_style_call("set-transparency", "style-stall", false);
+    assert!(
+      !outcome.layered,
+      "set_transparency layered a window stalled in WM_STYLECHANGING"
+    );
+    assert!(outcome.has_dlg_frame);
+  }
+
+  #[test]
+  fn style_changing_stall_does_not_clear_title_bar() {
+    let outcome =
+      assert_stopped_style_call("set-title-bar", "style-stall", false);
+    assert!(
+      outcome.has_dlg_frame,
+      "set_title_bar_visibility cleared a window stalled in WM_STYLECHANGING"
+    );
+  }
+
+  #[test]
+  fn layered_attributes_stay_bounded_during_style_stall() {
+    let outcome =
+      assert_stopped_style_call("set-transparency", "style-stall", true);
+    assert!(outcome.layered);
+    assert_eq!(
+      outcome.alpha,
+      Some(200),
+      "SetLayeredWindowAttributes changed alpha while the GUI thread was stalled"
+    );
   }
 
   #[test]
@@ -2270,324 +2824,4 @@ mod reorder_z_order_tests {
       "missing end line: {lines:?}"
     );
   }
-}
-
-fn next_z_order_generation() -> u64 {
-  Z_ORDER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
-}
-
-pub(crate) fn begin_z_order_batch() -> u64 {
-  next_z_order_generation()
-}
-
-fn current_or_new_z_order_generation() -> u64 {
-  let generation = Z_ORDER_GENERATION.load(Ordering::SeqCst);
-  if generation == 0 {
-    next_z_order_generation()
-  } else {
-    generation
-  }
-}
-
-fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
-  // Always use asynchronous cross-thread requests. A debugger-suspended or
-  // otherwise hung target GUI thread must not block GlazeWM's event loop.
-  let flags = SWP_NOACTIVATE
-    | SWP_NOCOPYBITS
-    | SWP_NOMOVE
-    | SWP_NOSIZE
-    | SWP_ASYNCWINDOWPOS
-    | SWP_NOOWNERZORDER;
-
-  for (index, window_id) in window_ids.iter().enumerate() {
-    let insert_after = index
-      .checked_sub(1)
-      .and_then(|previous| window_ids.get(previous))
-      .map_or(HWND_TOP, |previous| HWND(previous.0));
-
-    // HWND_TOP does not clear TOPMOST. Drop that bit, then immediately
-    // place the window. HWND_NOTOPMOST alone would leave it above every
-    // non-topmost window, which is the wrong band for an ignored window.
-    unsafe {
-      SetWindowPos(HWND(window_id.0), HWND_NOTOPMOST, 0, 0, 0, 0, flags)?;
-      SetWindowPos(HWND(window_id.0), insert_after, 0, 0, 0, 0, flags)?;
-    }
-  }
-
-  Ok(())
-}
-
-impl PartialEq for NativeWindow {
-  fn eq(&self, other: &Self) -> bool {
-    self.handle == other.handle
-  }
-}
-
-impl Eq for NativeWindow {}
-
-impl From<NativeWindow> for crate::NativeWindow {
-  fn from(window: NativeWindow) -> Self {
-    crate::NativeWindow { inner: window }
-  }
-}
-
-/// Implements [`Dispatcher::visible_windows`].
-pub(crate) fn visible_windows(
-  _: &Dispatcher,
-) -> crate::Result<Vec<crate::NativeWindow>> {
-  let mut handles: Vec<isize> = Vec::new();
-
-  #[allow(clippy::items_after_statements)]
-  extern "system" fn visible_windows_proc(
-    handle: HWND,
-    data: LPARAM,
-  ) -> BOOL {
-    let handles = data.0 as *mut Vec<isize>;
-    unsafe { (*handles).push(handle.0) };
-    true.into()
-  }
-
-  unsafe {
-    EnumWindows(
-      Some(visible_windows_proc),
-      LPARAM(std::ptr::from_mut(&mut handles) as _),
-    )
-  }?;
-
-  Ok(
-    handles
-      .into_iter()
-      .map(NativeWindow::new)
-      .filter(|window| window.is_visible().unwrap_or(false))
-      .map(Into::into)
-      .collect(),
-  )
-}
-
-/// Implements [`Dispatcher::debug_windows`].
-pub(crate) fn debug_windows(
-  _: &Dispatcher,
-) -> crate::Result<Vec<NativeWindowDebugInfo>> {
-  let mut handles: Vec<isize> = Vec::new();
-
-  #[allow(clippy::items_after_statements)]
-  extern "system" fn debug_windows_proc(
-    handle: HWND,
-    data: LPARAM,
-  ) -> BOOL {
-    let handles = data.0 as *mut Vec<isize>;
-    unsafe { (*handles).push(handle.0) };
-    true.into()
-  }
-
-  unsafe {
-    EnumWindows(
-      Some(debug_windows_proc),
-      LPARAM(std::ptr::from_mut(&mut handles) as _),
-    )
-  }?;
-
-  Ok(
-    handles
-      .into_iter()
-      .enumerate()
-      .map(|(index, handle)| {
-        let window = NativeWindow::new(handle);
-        let mut info = debug_info(&window);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-          info.z_order_index = Some(index as u32);
-        }
-        info
-      })
-      .collect(),
-  )
-}
-
-/// Uncloak + show top-level DWM-cloaked windows, skipping `skip_handles`
-/// (typically currently managed `GlazeWM` window handles).
-///
-/// Unlike `visible_windows` / managed-container restore, this uses raw
-/// `EnumWindows` and does **not** filter out cloaked HWNDs - so orphaned
-/// windows left cloaked by a prior `GlazeWM` session (Brave/Edge/Terminal)
-/// are included.
-///
-/// Returns how many windows were successfully unhidden.
-pub(crate) fn unhide_all_cloaked_windows(
-  skip_handles: &[isize],
-  _: &Dispatcher,
-) -> crate::Result<usize> {
-  let handles = top_level_window_handles()?;
-
-  let mut unhidden = 0usize;
-  for handle in handles {
-    let window = NativeWindow::new(handle);
-    if !window.is_valid() {
-      continue;
-    }
-    if skip_handles.contains(&handle) {
-      continue;
-    }
-
-    // explorer.exe owns both real File Explorer windows and a large number
-    // of shell/desktop helper HWNDs (WorkerW, Progman, taskbar internals,
-    // etc.). The latter are not user windows, but AddTab below would
-    // create a blank, uncloseable taskbar entry for them. Keep real
-    // Explorer folder windows eligible while cleaning up any stale
-    // shell tabs left by older versions of this command.
-    if is_taskbar_helper_window(&window) {
-      let _ = window.set_taskbar_visibility(false);
-      continue;
-    }
-
-    let cloaked = match window.is_cloaked() {
-      Ok(true) => true,
-      Ok(false) => false,
-      Err(_) => continue,
-    };
-    if !cloaked {
-      continue;
-    }
-
-    // Primary path: same ApplicationView cloak API GlazeWM uses to hide.
-    let uncloak_ok = window.set_cloaked(false).is_ok();
-    if !uncloak_ok {
-      // Fallback: DWMWA_CLOAK = FALSE (attribute 13).
-      let mut cloak_flag: i32 = 0;
-      let _ = unsafe {
-        #[allow(clippy::cast_possible_truncation)]
-        DwmSetWindowAttribute(
-          window.hwnd(),
-          DWMWA_CLOAK,
-          std::ptr::from_mut(&mut cloak_flag).cast(),
-          std::mem::size_of::<i32>() as u32,
-        )
-      };
-    }
-
-    let _ = window.show();
-    let _ = window.set_taskbar_visibility(true);
-    unhidden += 1;
-  }
-
-  Ok(unhidden)
-}
-
-/// Removes taskbar tabs left behind by broad uncloak operations that
-/// treated shell/input helper HWNDs as user windows.
-pub(crate) fn cleanup_taskbar_helper_windows(
-  _: &Dispatcher,
-) -> crate::Result<usize> {
-  let mut cleaned = 0usize;
-  for handle in top_level_window_handles()? {
-    let window = NativeWindow::new(handle);
-    if !window.is_valid() || !is_taskbar_helper_window(&window) {
-      continue;
-    }
-
-    if window.set_taskbar_visibility(false).is_ok() {
-      cleaned += 1;
-    }
-  }
-
-  Ok(cleaned)
-}
-
-fn top_level_window_handles() -> crate::Result<Vec<isize>> {
-  let mut handles: Vec<isize> = Vec::new();
-
-  #[allow(clippy::items_after_statements)]
-  extern "system" fn enum_proc(handle: HWND, data: LPARAM) -> BOOL {
-    let handles = data.0 as *mut Vec<isize>;
-    unsafe { (*handles).push(handle.0) };
-    true.into()
-  }
-
-  unsafe {
-    EnumWindows(
-      Some(enum_proc),
-      LPARAM(std::ptr::from_mut(&mut handles) as _),
-    )
-  }?;
-
-  Ok(handles)
-}
-
-fn is_taskbar_helper_window(window: &NativeWindow) -> bool {
-  is_explorer_shell_window(window) || is_input_method_window(window)
-}
-
-fn is_input_method_window(window: &NativeWindow) -> bool {
-  window.class_name().is_ok_and(|class_name| {
-    matches!(class_name.as_str(), "MSCTFIME UI" | "IME")
-  })
-}
-
-fn is_explorer_shell_window(window: &NativeWindow) -> bool {
-  let Ok(process_name) = window.process_name() else {
-    return false;
-  };
-
-  if !process_name.eq_ignore_ascii_case("explorer") {
-    return false;
-  }
-
-  let Ok(class_name) = window.class_name() else {
-    return false;
-  };
-
-  !matches!(class_name.as_str(), "CabinetWClass" | "ExploreWClass")
-}
-
-/// Implements [`Dispatcher::focused_window`].
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn focused_window(
-  _: &Dispatcher,
-) -> crate::Result<crate::NativeWindow> {
-  let handle = unsafe { GetForegroundWindow() };
-  Ok(NativeWindow::new(handle.0).into())
-}
-
-/// Implements [`Dispatcher::window_from_point`].
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn window_from_point(
-  point: &Point,
-  _: &Dispatcher,
-) -> crate::Result<Option<crate::NativeWindow>> {
-  let point = POINT {
-    x: point.x,
-    y: point.y,
-  };
-
-  let handle = unsafe { WindowFromPoint(point) };
-  if handle.0 == 0 {
-    return Ok(None);
-  }
-
-  let root = unsafe { GetAncestor(handle, GA_ROOT) };
-  if root.0 == 0 {
-    return Ok(None);
-  }
-
-  Ok(Some(NativeWindow::new(root.0).into()))
-}
-
-/// Implements [`Dispatcher::reset_focus`].
-pub(crate) fn reset_focus(_dispatcher: &Dispatcher) -> crate::Result<()> {
-  desktop_window().focus()
-}
-
-/// Gets the `NativeWindow` instance of the desktop window.
-///
-/// This is the explorer.exe wallpaper window (i.e. "Progman"). If
-/// explorer.exe isn't running, then default to the desktop window below
-/// the wallpaper window.
-#[must_use]
-fn desktop_window() -> NativeWindow {
-  let handle = match unsafe { GetShellWindow() } {
-    HWND(0) => unsafe { GetDesktopWindow() },
-    handle => handle,
-  };
-
-  NativeWindow::new(handle.0)
 }
