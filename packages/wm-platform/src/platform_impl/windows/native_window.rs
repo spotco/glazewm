@@ -1,10 +1,14 @@
 use std::{
-  sync::atomic::{AtomicU64, Ordering},
-  time::Duration,
+  cell::RefCell,
+  sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+  },
+  time::{Duration, Instant},
 };
 
 use tokio::runtime::Handle;
-use tracing::warn;
+use tracing::{debug, warn};
 use windows::{
   core::PWSTR,
   Win32::{
@@ -67,6 +71,84 @@ static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// `IsHungAppWindow` stays false for several seconds after a debugger
 /// suspends a thread. `SendMessageTimeoutW` returns when this elapses.
 const FOREIGN_GUI_PROBE_TIMEOUT_MS: u32 = 50;
+
+static NATIVE_OP_LOGGER: Mutex<Option<fn(&str)>> = Mutex::new(None);
+
+thread_local! {
+  static NATIVE_OP_RESULTS: RefCell<Vec<Option<&'static str>>> =
+    RefCell::new(Vec::new());
+}
+
+/// Registers the sink for `native-op` timing lines.
+///
+/// The WM points this at `layout.log`. An unmatched `native-op begin`
+/// is the call that is still blocked on a foreign window.
+pub(crate) fn set_native_op_logger(logger: fn(&str)) {
+  if let Ok(mut guard) = NATIVE_OP_LOGGER.lock() {
+    *guard = Some(logger);
+  }
+}
+
+fn log_native_op(line: &str) {
+  debug!("{line}");
+  let logger = NATIVE_OP_LOGGER.lock().ok().and_then(|guard| *guard);
+  if let Some(logger) = logger {
+    logger(line);
+  }
+}
+
+fn hwnd_token(hwnd: HWND) -> String {
+  #[allow(clippy::cast_sign_loss)]
+  let value = hwnd.0 as usize;
+  format!("{value:#x}")
+}
+
+struct NativeOpSpan {
+  hwnd: String,
+  op: &'static str,
+  started: Instant,
+}
+
+impl Drop for NativeOpSpan {
+  fn drop(&mut self) {
+    let label = NATIVE_OP_RESULTS
+      .with(|stack| stack.borrow_mut().pop().flatten().unwrap_or("ok"));
+    log_native_op(&format!(
+      "native-op end hwnd={} op={} elapsed_ms={} result={label}",
+      self.hwnd,
+      self.op,
+      self.started.elapsed().as_millis()
+    ));
+  }
+}
+
+/// Logs a paired begin/end line around `body`.
+///
+/// The end line is written when `body` returns. A missing end in
+/// `layout.log` means `body` is still inside a foreign call.
+fn timed_native_op<T>(
+  hwnd: HWND,
+  op: &'static str,
+  body: impl FnOnce() -> T,
+) -> T {
+  let hwnd = hwnd_token(hwnd);
+  log_native_op(&format!("native-op begin hwnd={hwnd} op={op}"));
+  NATIVE_OP_RESULTS.with(|stack| stack.borrow_mut().push(None));
+  let _span = NativeOpSpan {
+    hwnd,
+    op,
+    started: Instant::now(),
+  };
+  body()
+}
+
+fn mark_native_op_result(label: &'static str) {
+  NATIVE_OP_RESULTS.with(|stack| {
+    if let Some(slot) = stack.borrow_mut().last_mut() {
+      *slot = Some(label);
+    }
+  });
+}
 
 /// Platform-specific implementation of [`NativeWindow`].
 #[derive(Clone, Debug)]
@@ -292,18 +374,26 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::minimize`].
   pub(crate) fn minimize(&self) -> crate::Result<()> {
-    unsafe { ShowWindowAsync(self.hwnd(), SW_MINIMIZE).ok() }?;
-    Ok(())
+    timed_native_op(self.hwnd(), "minimize", || {
+      unsafe { ShowWindowAsync(self.hwnd(), SW_MINIMIZE).ok() }?;
+      Ok(())
+    })
   }
 
   /// Implements [`NativeWindow::maximize`].
   pub(crate) fn maximize(&self) -> crate::Result<()> {
-    unsafe { ShowWindowAsync(self.hwnd(), SW_MAXIMIZE).ok() }?;
-    Ok(())
+    timed_native_op(self.hwnd(), "maximize", || {
+      unsafe { ShowWindowAsync(self.hwnd(), SW_MAXIMIZE).ok() }?;
+      Ok(())
+    })
   }
 
   /// Implements [`NativeWindow::focus`].
   pub(crate) fn focus(&self) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "focus", || self.focus_inner())
+  }
+
+  fn focus_inner(&self) -> crate::Result<()> {
     let input = [INPUT {
       r#type: INPUT_MOUSE,
       Anonymous: INPUT_0 {
@@ -418,6 +508,17 @@ impl NativeWindow {
     rect: &Rect,
     flags: SET_WINDOW_POS_FLAGS,
   ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_window_pos", || {
+      self.set_window_pos_inner(z_order, rect, flags)
+    })
+  }
+
+  fn set_window_pos_inner(
+    &self,
+    z_order: &WindowZOrder,
+    rect: &Rect,
+    flags: SET_WINDOW_POS_FLAGS,
+  ) -> crate::Result<()> {
     let z_order_hwnd = match z_order {
       WindowZOrder::TopMost => HWND_TOPMOST,
       WindowZOrder::Top => HWND_TOP,
@@ -442,18 +543,31 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::show`].
   pub(crate) fn show(&self) -> crate::Result<()> {
-    unsafe { ShowWindowAsync(self.hwnd(), SW_SHOWNA) }.ok()?;
-    Ok(())
+    timed_native_op(self.hwnd(), "show", || {
+      unsafe { ShowWindowAsync(self.hwnd(), SW_SHOWNA) }.ok()?;
+      Ok(())
+    })
   }
 
   /// Implements [`NativeWindowWindowsExt::hide`].
   pub(crate) fn hide(&self) -> crate::Result<()> {
-    unsafe { ShowWindowAsync(self.hwnd(), SW_HIDE) }.ok()?;
-    Ok(())
+    timed_native_op(self.hwnd(), "hide", || {
+      unsafe { ShowWindowAsync(self.hwnd(), SW_HIDE) }.ok()?;
+      Ok(())
+    })
   }
 
   /// Implements [`NativeWindowWindowsExt::restore`].
   pub(crate) fn restore(
+    &self,
+    outer_frame: Option<&Rect>,
+  ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "restore", || {
+      self.restore_inner(outer_frame)
+    })
+  }
+
+  fn restore_inner(
     &self,
     outer_frame: Option<&Rect>,
   ) -> crate::Result<()> {
@@ -484,7 +598,22 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_cloaked`].
+  ///
+  /// # Shell COM
+  ///
+  /// `set_cloaked`, `mark_fullscreen`, and `set_taskbar_visibility`
+  /// are synchronous RPC into Explorer / Immersive Shell. They do
+  /// not wait on the target window's GUI thread, so a
+  /// debugger-suspended debuggee does not block them. A wedged
+  /// Explorer still can. They stay on the WM thread. A worker would
+  /// only move the stall. The `native-op` lines identify it.
   pub(crate) fn set_cloaked(&self, cloaked: bool) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_cloaked", || {
+      self.set_cloaked_inner(cloaked)
+    })
+  }
+
+  fn set_cloaked_inner(&self, cloaked: bool) -> crate::Result<()> {
     COM_INIT.with(|com_init| -> crate::Result<()> {
       com_init.borrow_mut().with_retry(|com| {
         let view_collection = com.application_view_collection()?;
@@ -516,6 +645,14 @@ impl NativeWindow {
     &self,
     fullscreen: bool,
   ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "mark_fullscreen", || {
+      self.mark_fullscreen_inner(fullscreen)
+    })
+  }
+
+  /// See [`NativeWindow::set_cloaked`] for why this Shell RPC stays
+  /// on the WM thread.
+  fn mark_fullscreen_inner(&self, fullscreen: bool) -> crate::Result<()> {
     COM_INIT.with(|com_init| -> crate::Result<()> {
       com_init.borrow_mut().with_retry(|com| {
         let taskbar_list = com.taskbar_list()?;
@@ -531,6 +668,17 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::set_taskbar_visibility`].
   pub(crate) fn set_taskbar_visibility(
+    &self,
+    visible: bool,
+  ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_taskbar_visibility", || {
+      self.set_taskbar_visibility_inner(visible)
+    })
+  }
+
+  /// See [`NativeWindow::set_cloaked`] for why this Shell RPC stays
+  /// on the WM thread.
+  fn set_taskbar_visibility_inner(
     &self,
     visible: bool,
   ) -> crate::Result<()> {
@@ -604,16 +752,23 @@ impl NativeWindow {
   /// synchronously and would freeze the WM thread on a suspended
   /// debuggee.
   pub(crate) fn add_window_style_ex(&self, style: WINDOW_EX_STYLE) {
+    timed_native_op(self.hwnd(), "add_window_style_ex", || {
+      self.add_window_style_ex_inner(style);
+    });
+  }
+
+  fn add_window_style_ex_inner(&self, style: WINDOW_EX_STYLE) {
     let current_style =
       unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) };
 
     #[allow(clippy::cast_possible_wrap)]
     if current_style & style.0 as isize == 0 {
       if !self.foreign_gui_responsive() {
+        mark_native_op_result("skip-unresponsive");
         warn!(
           "Skipped extended style {:#x} for unresponsive hwnd={}.",
           style.0,
-          self.hwnd().0
+          hwnd_token(self.hwnd())
         );
         return;
       }
@@ -622,6 +777,8 @@ impl NativeWindow {
       // SAFETY: The target thread answered `WM_NULL`. Style changes
       // still send `WM_STYLECHANGING` to that thread.
       unsafe { SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, new_style) };
+    } else {
+      mark_native_op_result("unchanged");
     }
   }
 
@@ -681,6 +838,15 @@ impl NativeWindow {
     &self,
     visible: bool,
   ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_title_bar_visibility", || {
+      self.set_title_bar_visibility_inner(visible)
+    })
+  }
+
+  fn set_title_bar_visibility_inner(
+    &self,
+    visible: bool,
+  ) -> crate::Result<()> {
     let style = unsafe { GetWindowLongPtrW(self.hwnd(), GWL_STYLE) };
 
     #[allow(clippy::cast_possible_wrap)]
@@ -690,15 +856,19 @@ impl NativeWindow {
       style & !(WS_DLGFRAME.0 as isize)
     };
 
-    if new_style != style {
-      if !self.foreign_gui_responsive() {
-        warn!(
-          "Skipped title-bar style for unresponsive hwnd={}.",
-          self.hwnd().0
-        );
-        return Ok(());
-      }
-
+    if new_style == style {
+      mark_native_op_result("unchanged");
+      return Ok(());
+    }
+    if !self.foreign_gui_responsive() {
+      mark_native_op_result("skip-unresponsive");
+      warn!(
+        "Skipped title-bar style for unresponsive hwnd={}.",
+        hwnd_token(self.hwnd())
+      );
+      return Ok(());
+    }
+    {
       // SAFETY: The target thread answered `WM_NULL`.
       // `SWP_ASYNCWINDOWPOS` keeps the frame refresh off this thread.
       unsafe {
@@ -731,6 +901,15 @@ impl NativeWindow {
     &self,
     color: Option<&Color>,
   ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_border_color", || {
+      self.set_border_color_inner(color)
+    })
+  }
+
+  fn set_border_color_inner(
+    &self,
+    color: Option<&Color>,
+  ) -> crate::Result<()> {
     let bgr = match color {
       Some(color) => color.to_bgr(),
       None => DWMWA_COLOR_NONE,
@@ -751,6 +930,15 @@ impl NativeWindow {
 
   /// Implements [`NativeWindowWindowsExt::set_corner_style`].
   pub(crate) fn set_corner_style(
+    &self,
+    corner_style: &CornerStyle,
+  ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_corner_style", || {
+      self.set_corner_style_inner(corner_style)
+    })
+  }
+
+  fn set_corner_style_inner(
     &self,
     corner_style: &CornerStyle,
   ) -> crate::Result<()> {
@@ -785,10 +973,20 @@ impl NativeWindow {
     &self,
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
+    timed_native_op(self.hwnd(), "set_transparency", || {
+      self.set_transparency_inner(opacity_value)
+    })
+  }
+
+  fn set_transparency_inner(
+    &self,
+    opacity_value: &OpacityValue,
+  ) -> crate::Result<()> {
     if !self.foreign_gui_responsive() {
+      mark_native_op_result("skip-unresponsive");
       warn!(
         "Skipped transparency for unresponsive hwnd={}.",
-        self.hwnd().0
+        hwnd_token(self.hwnd())
       );
       return Ok(());
     }
@@ -1014,7 +1212,9 @@ mod reorder_z_order_tests {
   };
 
   use super::reorder_z_order;
-  use crate::{OpacityValue, WindowId, WindowZOrder};
+  use crate::{
+    Color, CornerStyle, OpacityValue, Rect, WindowId, WindowZOrder,
+  };
 
   unsafe extern "system" fn reorder_test_wnd_proc(
     hwnd: HWND,
@@ -1108,8 +1308,27 @@ mod reorder_z_order_tests {
       )
     };
     assert_ne!(hwnd.0, 0, "create non-pumping helper window");
+    if std::env::var("GLAZEWM_HELPER_LAYERED").ok().as_deref() == Some("1")
+    {
+      // Same thread, so the probe does not apply. Seeds the
+      // already-layered case from issue #10 before the thread stops.
+      super::NativeWindow::new(hwnd.0)
+        .set_transparency(&OpacityValue::from_alpha(200))
+        .expect("seed layered alpha");
+    }
     println!("GLAZEWM_Z_ORDER_HWND:{}", hwnd.0);
     std::io::stdout().flush().expect("flush helper HWND");
+    if std::env::var("GLAZEWM_HELPER_STOP").ok().as_deref()
+      == Some("suspend")
+    {
+      use windows::Win32::System::Threading::{
+        GetCurrentThread, SuspendThread,
+      };
+      // Debugger Break All suspends the GUI thread. Sleep does not.
+      unsafe {
+        SuspendThread(GetCurrentThread());
+      }
+    }
     loop {
       thread::sleep(Duration::from_secs(60));
     }
@@ -1596,15 +1815,24 @@ mod reorder_z_order_tests {
   struct HungStyleOutcome {
     layered: bool,
     has_dlg_frame: bool,
+    alpha: Option<u8>,
   }
 
-  /// Runs `mode` against the non-pumping helper.
-  ///
-  /// The caller must finish within 2 seconds. Without the `WM_NULL`
-  /// probe, `SetWindowLongPtrW` and `SetLayeredWindowAttributes` block
-  /// here until the helper is killed. Style is read before the helper
-  /// exits.
+  /// Runs `mode` against a sleeping, non-pumping helper.
   fn assert_hung_style_call_is_bounded(mode: &str) -> HungStyleOutcome {
+    assert_stopped_style_call(mode, "sleep", false)
+  }
+
+  /// Runs `mode` against a helper that has stopped its GUI thread.
+  ///
+  /// `stop` is `sleep` or `suspend`. `layered` seeds `WS_EX_LAYERED`
+  /// and alpha 200 before the thread stops. The caller must finish
+  /// within 2 seconds. Style is read before the helper exits.
+  fn assert_stopped_style_call(
+    mode: &str,
+    stop: &str,
+    layered: bool,
+  ) -> HungStyleOutcome {
     use std::{
       io::{BufRead, BufReader},
       process::{Command, Stdio},
@@ -1614,6 +1842,8 @@ mod reorder_z_order_tests {
     let current_exe = std::env::current_exe().expect("test executable");
     let mut window_helper = Command::new(&current_exe)
       .env("GLAZEWM_Z_ORDER_HELPER", "window")
+      .env("GLAZEWM_HELPER_STOP", stop)
+      .env("GLAZEWM_HELPER_LAYERED", if layered { "1" } else { "0" })
       .arg("z_order_test_helper_window")
       .arg("--nocapture")
       .stdout(Stdio::piped())
@@ -1630,17 +1860,27 @@ mod reorder_z_order_tests {
         break hwnd.parse::<isize>().expect("parse window helper HWND");
       }
     };
+    if stop == "suspend" {
+      // The HWND line is printed just before SuspendThread. Wait
+      // until that suspend has landed.
+      std::thread::sleep(Duration::from_millis(100));
+    }
 
-    let test_name = match mode {
-      "set-transparency" => "hung_style_helper_set_transparency",
-      "set-transparency-opaque" => {
-        "hung_style_helper_set_transparency_opaque"
+    let (test_name, helper_mode_name) = match mode {
+      "set-transparency" if stop == "sleep" && !layered => {
+        ("hung_style_helper_set_transparency", mode)
       }
-      "set-title-bar" => "hung_style_helper_set_title_bar",
-      _ => panic!("unknown hung style mode: {mode}"),
+      "set-transparency-opaque" if stop == "sleep" && !layered => {
+        ("hung_style_helper_set_transparency_opaque", mode)
+      }
+      "set-title-bar" if stop == "sleep" && !layered => {
+        ("hung_style_helper_set_title_bar", mode)
+      }
+      _ => ("foreign_hwnd_call", "foreign-call"),
     };
     let mut style_call = Command::new(&current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", mode)
+      .env("GLAZEWM_Z_ORDER_HELPER", helper_mode_name)
+      .env("GLAZEWM_FOREIGN_OP", mode)
       .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
       .arg(test_name)
       .arg("--nocapture")
@@ -1670,6 +1910,7 @@ mod reorder_z_order_tests {
         let frame = WS_DLGFRAME.0 as isize;
         (unsafe { GetWindowLongPtrW(HWND(hwnd), GWL_STYLE) }) & frame != 0
       },
+      alpha: layered_alpha(hwnd),
     };
     let _ = window_helper.kill();
     let _ = window_helper.wait();
@@ -1682,6 +1923,135 @@ mod reorder_z_order_tests {
     #[allow(clippy::cast_possible_wrap)]
     let bit = bit as isize;
     (unsafe { GetWindowLongPtrW(HWND(hwnd), GWL_EXSTYLE) }) & bit != 0
+  }
+
+  fn layered_alpha(hwnd: isize) -> Option<u8> {
+    if !ex_style_bit(hwnd, WS_EX_LAYERED.0) {
+      return None;
+    }
+    let mut alpha = 0u8;
+    let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
+    unsafe {
+      GetLayeredWindowAttributes(
+        HWND(hwnd),
+        None,
+        Some(&raw mut alpha),
+        Some(&raw mut flag),
+      )
+      .ok()?;
+    }
+    Some(alpha)
+  }
+
+  /// Dispatches one production call named by `GLAZEWM_FOREIGN_OP`.
+  ///
+  /// Errors are ignored. The parent only requires the process to exit.
+  /// A hang fails the parent's 2 second deadline.
+  fn run_foreign_hwnd_call() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+      SWP_NOCOPYBITS, SWP_NOSENDCHANGING,
+    };
+
+    let hwnd = std::env::var("GLAZEWM_Z_ORDER_HWND")
+      .expect("helper HWND")
+      .parse::<isize>()
+      .expect("parse helper HWND");
+    let window = super::NativeWindow::new(hwnd);
+    let op = std::env::var("GLAZEWM_FOREIGN_OP").unwrap_or_default();
+    let color = Color {
+      r: 1,
+      g: 2,
+      b: 3,
+      a: 255,
+    };
+    let rect = Rect::from_ltrb(60, 60, 260, 180);
+    match op.as_str() {
+      "set-transparency" => {
+        window
+          .set_transparency(&OpacityValue::from_alpha(180))
+          .expect("set transparency");
+      }
+      "set-transparency-opaque" => {
+        window
+          .set_transparency(&OpacityValue::from_alpha(u8::MAX))
+          .expect("set opaque transparency");
+      }
+      "set-title-bar" => {
+        window
+          .set_title_bar_visibility(false)
+          .expect("hide title bar");
+      }
+      "focus" => {
+        let _ = window.focus();
+      }
+      "set-border-color" => {
+        let _ = window.set_border_color(Some(&color));
+      }
+      "set-corner-style" => {
+        let _ = window.set_corner_style(&CornerStyle::Square);
+      }
+      "restore" => {
+        let _ = window.restore(Some(&rect));
+      }
+      "set-window-pos" => {
+        let _ = window.set_window_pos(
+          &WindowZOrder::Normal,
+          &rect,
+          SWP_NOACTIVATE
+            | SWP_NOCOPYBITS
+            | SWP_NOSENDCHANGING
+            | SWP_ASYNCWINDOWPOS
+            | SWP_FRAMECHANGED,
+        );
+      }
+      "show" => {
+        let _ = window.show();
+      }
+      "hide" => {
+        let _ = window.hide();
+      }
+      "minimize" => {
+        let _ = window.minimize();
+      }
+      "maximize" => {
+        let _ = window.maximize();
+      }
+      "set-cloaked" => {
+        let _ = window.set_cloaked(false);
+      }
+      "mark-fullscreen" => {
+        let _ = window.mark_fullscreen(false);
+      }
+      "set-taskbar-visibility" => {
+        let _ = window.set_taskbar_visibility(true);
+      }
+      "focus-transition" => {
+        let class_name =
+          wide(&format!("GlazeWmFocusPeer{}", std::process::id()));
+        let class = WNDCLASSW {
+          lpfnWndProc: Some(reorder_test_wnd_proc),
+          lpszClassName: PCWSTR(class_name.as_ptr()),
+          ..Default::default()
+        };
+        let atom = unsafe { RegisterClassW(&raw const class) };
+        assert_ne!(atom, 0, "register focus peer class");
+        let peer = create_test_window(&class_name, false);
+        let _ = super::NativeWindow::new(peer.0).focus();
+        let _ = window.set_transparency(&OpacityValue::from_alpha(180));
+        let _ = window.set_title_bar_visibility(false);
+        let _ = window.set_border_color(Some(&color));
+        let _ = window.set_corner_style(&CornerStyle::Square);
+      }
+      other => panic!("unknown foreign op: {other}"),
+    }
+  }
+
+  #[test]
+  fn foreign_hwnd_call() {
+    if helper_mode("foreign-call") {
+      run_foreign_hwnd_call();
+    }
   }
 
   #[test]
@@ -1767,6 +2137,138 @@ mod reorder_z_order_tests {
       let _ = DestroyWindow(hwnd);
       let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
     }
+  }
+
+  #[test]
+  fn suspended_thread_transparency_does_not_layer() {
+    let outcome =
+      assert_stopped_style_call("set-transparency", "suspend", false);
+    assert!(!outcome.layered);
+    assert!(outcome.has_dlg_frame);
+  }
+
+  #[test]
+  fn suspended_thread_opaque_transparency_does_not_layer() {
+    let outcome = assert_stopped_style_call(
+      "set-transparency-opaque",
+      "suspend",
+      false,
+    );
+    assert!(!outcome.layered);
+  }
+
+  #[test]
+  fn suspended_thread_title_bar_is_not_cleared() {
+    let outcome =
+      assert_stopped_style_call("set-title-bar", "suspend", false);
+    assert!(outcome.has_dlg_frame);
+  }
+
+  #[test]
+  fn layered_sleeping_window_keeps_its_alpha() {
+    let outcome =
+      assert_stopped_style_call("set-transparency", "sleep", true);
+    assert!(outcome.layered);
+    assert_eq!(outcome.alpha, Some(200));
+  }
+
+  #[test]
+  fn layered_suspended_window_keeps_its_alpha() {
+    let outcome =
+      assert_stopped_style_call("set-transparency", "suspend", true);
+    assert!(outcome.layered);
+    assert_eq!(outcome.alpha, Some(200));
+  }
+
+  #[test]
+  fn focus_returns_for_a_sleeping_foreign_window() {
+    assert_stopped_style_call("focus", "sleep", false);
+  }
+
+  #[test]
+  fn focus_returns_for_a_suspended_foreign_window() {
+    assert_stopped_style_call("focus", "suspend", false);
+  }
+
+  #[test]
+  fn focus_transition_effects_do_not_restyle_a_suspended_window() {
+    let outcome =
+      assert_stopped_style_call("focus-transition", "suspend", false);
+    assert!(
+      !outcome.layered,
+      "focus transition layered the suspended window"
+    );
+    assert!(
+      outcome.has_dlg_frame,
+      "focus transition cleared the suspended window frame"
+    );
+  }
+
+  #[test]
+  fn remaining_native_calls_return_for_a_suspended_window() {
+    for op in [
+      "set-border-color",
+      "set-corner-style",
+      "restore",
+      "set-window-pos",
+      "show",
+      "hide",
+      "minimize",
+      "maximize",
+      "set-cloaked",
+      "mark-fullscreen",
+      "set-taskbar-visibility",
+    ] {
+      assert_stopped_style_call(op, "suspend", false);
+    }
+  }
+
+  #[test]
+  fn native_op_log_brackets_a_transparency_call() {
+    use std::sync::Mutex;
+
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn record(line: &str) {
+      if let Ok(mut lines) = LINES.lock() {
+        lines.push(line.to_string());
+      }
+    }
+
+    let class_name =
+      wide(&format!("GlazeWmNativeOpLog{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register native-op log class");
+    let hwnd = create_test_window(&class_name, false);
+    LINES.lock().expect("log lines").clear();
+    super::set_native_op_logger(record);
+    super::NativeWindow::new(hwnd.0)
+      .set_transparency(&OpacityValue::from_alpha(90))
+      .expect("responsive transparency");
+    let lines = LINES.lock().expect("log lines").clone();
+    unsafe {
+      let _ = DestroyWindow(hwnd);
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+    assert!(
+      lines.iter().any(|line| {
+        line.contains("native-op begin")
+          && line.contains("op=set_transparency")
+      }),
+      "missing begin line: {lines:?}"
+    );
+    assert!(
+      lines.iter().any(|line| {
+        line.contains("native-op end")
+          && line.contains("op=set_transparency")
+          && line.contains("result=ok")
+      }),
+      "missing end line: {lines:?}"
+    );
   }
 }
 
