@@ -114,74 +114,97 @@ impl WindowListener {
     _event_thread: u32,
     _event_time: u32,
   ) {
-    // Check whether the event is associated with a window object rather
-    // than a UI control.
-    let is_window_event =
-      id_object == OBJID_WINDOW.0 && id_child == 0 && handle != HWND(0);
-
-    if !is_window_event {
+    let Some(event) =
+      classify_win_event(event_type, handle, id_object, id_child)
+    else {
       return;
-    }
+    };
 
     let Some(event_tx) = EVENT_TX.with(|lock| lock.get().cloned()) else {
       return;
     };
 
-    let notification = crate::WindowEventNotification(None);
-
-    let event = match event_type {
-      EVENT_OBJECT_DESTROY => WindowEvent::Destroyed {
-        window_id: WindowId(handle.0),
-        notification,
-      },
-      EVENT_SYSTEM_FOREGROUND => WindowEvent::Focused {
-        window: NativeWindow::new(handle.0).into(),
-        notification,
-      },
-      EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED => WindowEvent::Hidden {
-        window: NativeWindow::new(handle.0).into(),
-        notification,
-      },
-      EVENT_OBJECT_LOCATIONCHANGE => WindowEvent::MovedOrResized {
-        window: NativeWindow::new(handle.0).into(),
-        is_interactive_start: false,
-        is_interactive_end: false,
-        notification,
-      },
-      EVENT_SYSTEM_MINIMIZESTART => WindowEvent::Minimized {
-        window: NativeWindow::new(handle.0).into(),
-        notification,
-      },
-      EVENT_SYSTEM_MINIMIZEEND => WindowEvent::MinimizeEnded {
-        window: NativeWindow::new(handle.0).into(),
-        notification,
-      },
-      EVENT_SYSTEM_MOVESIZESTART => WindowEvent::MovedOrResized {
-        window: NativeWindow::new(handle.0).into(),
-        is_interactive_start: true,
-        is_interactive_end: false,
-        notification,
-      },
-      EVENT_SYSTEM_MOVESIZEEND => WindowEvent::MovedOrResized {
-        window: NativeWindow::new(handle.0).into(),
-        is_interactive_start: false,
-        is_interactive_end: true,
-        notification,
-      },
-      EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => WindowEvent::Shown {
-        window: NativeWindow::new(handle.0).into(),
-        notification,
-      },
-      EVENT_OBJECT_NAMECHANGE => WindowEvent::TitleChanged {
-        window: NativeWindow::new(handle.0).into(),
-        notification,
-      },
-      _ => return,
-    };
-
     if let Err(err) = event_tx.send(event) {
       tracing::warn!("Failed to send window event: {}.", err);
     }
+  }
+}
+
+/// Classifies one `WinEvent` callback.
+///
+/// `EVENT_OBJECT_DESTROY` drops cached foreign style before the event
+/// is returned. The hook is not filtered by whether GlazeWM manages
+/// the window, so an ignored or unmanaged `HWND` is cleared too. A
+/// child-control event returns `None` and does not touch that cache.
+pub(super) fn classify_win_event(
+  event_type: u32,
+  handle: HWND,
+  id_object: i32,
+  id_child: i32,
+) -> Option<WindowEvent> {
+  let is_window_event =
+    id_object == OBJID_WINDOW.0 && id_child == 0 && handle != HWND(0);
+  if !is_window_event {
+    return None;
+  }
+
+  if event_type == EVENT_OBJECT_DESTROY {
+    super::native_window::invalidate_foreign_style_state(handle);
+  }
+
+  let notification = crate::WindowEventNotification(None);
+  match event_type {
+    EVENT_OBJECT_DESTROY => Some(WindowEvent::Destroyed {
+      window_id: WindowId(handle.0),
+      notification,
+    }),
+    EVENT_SYSTEM_FOREGROUND => Some(WindowEvent::Focused {
+      window: NativeWindow::new(handle.0).into(),
+      notification,
+    }),
+    EVENT_OBJECT_HIDE | EVENT_OBJECT_CLOAKED => {
+      Some(WindowEvent::Hidden {
+        window: NativeWindow::new(handle.0).into(),
+        notification,
+      })
+    }
+    EVENT_OBJECT_LOCATIONCHANGE => Some(WindowEvent::MovedOrResized {
+      window: NativeWindow::new(handle.0).into(),
+      is_interactive_start: false,
+      is_interactive_end: false,
+      notification,
+    }),
+    EVENT_SYSTEM_MINIMIZESTART => Some(WindowEvent::Minimized {
+      window: NativeWindow::new(handle.0).into(),
+      notification,
+    }),
+    EVENT_SYSTEM_MINIMIZEEND => Some(WindowEvent::MinimizeEnded {
+      window: NativeWindow::new(handle.0).into(),
+      notification,
+    }),
+    EVENT_SYSTEM_MOVESIZESTART => Some(WindowEvent::MovedOrResized {
+      window: NativeWindow::new(handle.0).into(),
+      is_interactive_start: true,
+      is_interactive_end: false,
+      notification,
+    }),
+    EVENT_SYSTEM_MOVESIZEEND => Some(WindowEvent::MovedOrResized {
+      window: NativeWindow::new(handle.0).into(),
+      is_interactive_start: false,
+      is_interactive_end: true,
+      notification,
+    }),
+    EVENT_OBJECT_SHOW | EVENT_OBJECT_UNCLOAKED => {
+      Some(WindowEvent::Shown {
+        window: NativeWindow::new(handle.0).into(),
+        notification,
+      })
+    }
+    EVENT_OBJECT_NAMECHANGE => Some(WindowEvent::TitleChanged {
+      window: NativeWindow::new(handle.0).into(),
+      notification,
+    }),
+    _ => None,
   }
 }
 

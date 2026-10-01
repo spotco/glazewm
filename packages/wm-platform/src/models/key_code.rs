@@ -253,12 +253,14 @@ mod tests {
 
   #[test]
   fn test_key_conversion_roundtrip() {
+    // spotcobuild does not support macOS. `Key::Cmd` is the macOS
+    // command key and has no Windows virtual-key mapping.
     let test_keys = [
       Key::A,
       Key::S,
       Key::D,
       Key::F,
-      Key::Cmd,
+      Key::Win,
       Key::LAlt,
       Key::RCtrl,
       Key::LShift,

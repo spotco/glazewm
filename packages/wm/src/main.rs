@@ -139,6 +139,8 @@ async fn start_wm(
   let layout_path = layout_snapshot_path(&config);
   let layout_log_path = layout_debug_log_path(&config);
   set_layout_debug_log_path(layout_log_path.clone());
+  #[cfg(target_os = "windows")]
+  wm_platform::set_native_op_logger(log_native_op_to_layout_log);
   tracing::info!(
     "Layout persistence debug log -> {}",
     layout_log_path.display()
@@ -599,6 +601,12 @@ async fn start_wm(
   wm.cleanup(&mut config, &mut ipc_server);
 
   Ok(())
+}
+
+/// Writes one native-operation timing line to `layout.log`.
+#[cfg(target_os = "windows")]
+fn log_native_op_to_layout_log(message: &str) {
+  crate::commands::general::layout_debug_log(message);
 }
 
 /// Writes one startup step to tracing and `layout.log`.

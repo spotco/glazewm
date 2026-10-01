@@ -37,5 +37,14 @@ jobs:
       - name: Test wm binary
         run: cargo test -p wm --bin glazewm
 
+      # Integration tests, including the foreign-HWND hang cases.
+      # spotcobuild does not support macOS. The skipped tests fail on
+      # this branch already and are not part of the hang fix:
+      # dispatch_sync cases that see an empty queue after an earlier
+      # test posts WM_QUIT. dispatch_sync_with_nested passes alone and
+      # fails in this ordered run for the same reason.
+      - name: Test wm-platform integration
+        run: cargo test -p wm-platform --test test -- --test-threads=1 --skip dispatch_sync_executes_in_order --skip dispatch_sync_from_different_threads --skip dispatch_sync_with_nested
+
       - name: Check wm and wm-cli
         run: cargo check -p wm -p wm-cli
