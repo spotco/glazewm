@@ -1,10 +1,10 @@
 # Plan: Super+arrow detached z-order flash / stuck floaters between tiles
 
 Date: 2026-10-02
-Status: implemented + deployed; commit/push/PR approved
+Status: PR #13 review fixes in progress (box); Windows smoke/deploy pending Asus return
 Branch: `bugfix/super-arrow-z-order-hung-helper`
 Prior branch work preserved from `bugfix/issue-10-skip-hung-style-writes` HEAD
-Scope: document confirmed Super+arrow z-order bugs, fix tiling bring_to_front race + hung-HWND reorder failure, test, deploy with `general.verbose_z_order: true`
+Scope: document confirmed Super+arrow z-order bugs, fix tiling bring_to_front race + hung-HWND reorder failure, floating Super+arrow dual-applicator, hung recovery, TID probe cache; test; deploy with `general.verbose_z_order: true`
 
 ## Progress
 
@@ -17,6 +17,12 @@ Scope: document confirmed Super+arrow z-order bugs, fix tiling bring_to_front ra
 - [x] Step 5 - Soft `wm-exit`, deploy to Program Files; leave verbose on
 - [x] Step 6 - Report branch, plan updates, fail-then-pass evidence, fix approach, deploy proof
 - [x] Step 7 - Commit, push, open PR for review
+- [x] Step 8 - Review fix: floating Super+arrow mark targeted + defer when workspace reorder queued
+- [x] Step 9 - Review fix: hung HWND bounded delayed reconcile (100/250/500ms) + generation cancel
+- [x] Step 10 - Review fix: cache responsiveness probe by TID per chain apply
+- [x] Step 11 - Plan: document keep `SWP_ASYNCWINDOWPOS` (do not switch responsive path to sync)
+- [ ] Step 12 - Rebase onto current `glazewm-spotcobuild` (PR #12 squash) when pushing
+- [ ] Step 13 - Windows-only integration tests + Asus deploy/smoke on return
 
 ## Objective
 
@@ -120,8 +126,11 @@ Smoking-gun sample (`2026-10-02T05:02:35.628Z` / `05:02:39.830Z`):
    floaters even when the focused tile is hung.
 4. Call `HWND_NOTOPMOST` only when the window is actually topmost — avoid
    raising normal floaters via a redundant NOTOPMOST.
-5. Prefer sync SetWindowPos for responsive hwnds (no `SWP_ASYNCWINDOWPOS`)
-   to reduce 10ms/25ms race dependence; keep async skip path for hung.
+5. **Keep `SWP_ASYNCWINDOWPOS`** for all chain apply SetWindowPos calls
+   (responsive and hung). A slow-but-pumping foreign queue must never
+   block the WM loop; hung skip + insert-after-last-responsive is the
+   correctness fix, not sync SWP. (Earlier draft suggested sync for
+   responsive hwnds — rejected; code keeps ASYNC.)
 6. Keep Fix A skip-bring_to_front for normal tiling focus (no regression:
    tiles-as-one-group, detached focus only promotes selected, Super+arrow
    no flash on normal tiles).
@@ -138,6 +147,49 @@ Smoking-gun sample (`2026-10-02T05:02:35.628Z` / `05:02:39.830Z`):
    the group).
 5. Verbose z-order logging (`general.verbose_z_order` /
    `GLAZEWM_VERBOSE_Z_ORDER=1`) stays available for verification.
+
+
+## Review follow-ups (PR #13)
+
+### Bug C — floating Super+arrow dual applicators (MUST FIX)
+
+`focus_in_direction` queues `workspace_to_reorder` for every directional
+focus, but defer only covered tiling / `focused_window_to_bring_to_front`.
+Super+arrow among normal floaters still ran the legacy AfterWindow swarm
+*and* the workspace chain → peer floaters flash / wrong promote.
+
+**Fix C:**
+
+1. Mark floating directional targets via
+   `queue_focused_window_to_bring_to_front` (same as native floating focus)
+   so `windows_to_bring_to_front` selects only that hwnd.
+2. Expand `should_defer_bring_to_front_to_workspace_reorder` to also defer
+   whenever the workspace reorder is already queued / focus update pending.
+3. Invariant unchanged: focusing a detached window promotes **only** that
+   window. Regression coverage: 3 floaters + tiles, Super+Left/Right among
+   floaters (`floating_directional_focus_chain_promotes_only_selected_floater`).
+
+### Hung HWND eventual repair
+
+Skipping hung anchors leaves the hung hwnd out of native order until
+something re-applies. After Fix B, schedule generation-aware recovery
+retries at **100 / 250 / 500 ms** when any hwnd was skipped. Cancel when
+`Z_ORDER_GENERATION` advances. Stop early once a retry places the full
+responsive set (no remaining skips). Test:
+`hung_hwnd_eventually_rejoins_chain_after_resume`.
+
+### TID probe cache
+
+`apply_z_order_chain` caches `WM_NULL` responsiveness by GUI thread id for
+the duration of one chain apply so N hwnds on one hung TID cost one 50ms
+probe, not N×50ms.
+
+### Pending TOPMOST timing
+
+`reorder_z_order_retries_across_independent_foreign_gui_queues` remains the
+coverage for delayed TOPMOST foreign queues under ASYNC. Hung recovery
+retries may also help convergence; further TOPMOST-specific changes deferred
+unless Windows CI flakes.
 
 ## Constraints
 

@@ -50,10 +50,28 @@ pub fn focus_in_direction(
     set_focused_descendant(&focus_target, None);
     state.pending_sync.queue_focus_change().queue_cursor_jump();
     // Queue layer reorder in the same platform_sync as SetForegroundWindow
-    // so tiling focus does not briefly rely on per-window bring_to_front
-    // SWPs before the workspace chain apply runs.
+    // so tiling/floating directional focus does not briefly rely on
+    // per-window bring_to_front SWPs before the workspace chain apply.
     if let Some(workspace) = focus_target.workspace() {
-      state.pending_sync.queue_workspace_to_reorder(workspace);
+      state.pending_sync.queue_workspace_to_reorder(workspace.clone());
+      // Super+arrow between normal floaters must promote ONLY the
+      // selected window (invariant). Mark as targeted so
+      // windows_to_bring_to_front does not raise every peer floater and
+      // so bring_to_front defers to reorder_focused_workspace_layers —
+      // matching the native floating focus path. Without this mark,
+      // focus_in_direction queued workspace reorder while defer still
+      // only covered tiling / focused_window_to_bring_to_front, so both
+      // applicators raced (3 floaters + tiles Super+Left/Right).
+      if let Ok(window) = focus_target.as_window_container() {
+        if matches!(
+          window.state(),
+          WindowState::Floating(config) if !config.shown_on_top
+        ) {
+          state
+            .pending_sync
+            .queue_focused_window_to_bring_to_front(&workspace, window.id());
+        }
+      }
     }
   }
 

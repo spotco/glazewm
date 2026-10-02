@@ -140,16 +140,21 @@ fn sync_focus(
 /// Whether per-window `bring_to_front` `set_z_order` must defer to the
 /// workspace layer chain apply.
 ///
-/// Tiling focus and targeted floating focus both rely on
+/// Tiling focus, targeted floating focus, and any focus that already
+/// queued `workspace_to_reorder` (including Super+arrow) rely on
 /// `reorder_focused_workspace_layers`. Skipping the legacy AfterWindow
-/// swarm prevents floaters from flashing between tiles under
-/// `SWP_ASYNCWINDOWPOS` (layout.log 2026-10-02 ~00:33 ET).
+/// swarm prevents floaters from flashing between tiles / peer floaters
+/// under `SWP_ASYNCWINDOWPOS` (layout.log 2026-10-02 ~00:33 ET; floating
+/// Super+arrow dual-applicator race).
 #[cfg(target_os = "windows")]
 fn should_defer_bring_to_front_to_workspace_reorder(
   has_targeted_floating_focus: bool,
   focused_is_tiling: bool,
+  workspace_reorder_queued: bool,
 ) -> bool {
-  has_targeted_floating_focus || focused_is_tiling
+  has_targeted_floating_focus
+    || focused_is_tiling
+    || workspace_reorder_queued
 }
 
 /// Finds windows that should be brought to the top of their workspace's
@@ -346,21 +351,31 @@ fn redraw_containers(
           matches!(focused.state(), WindowState::Tiling)
         });
 
-      // Defer to `reorder_focused_workspace_layers` for tiling groups and
-      // targeted detached focus. Legacy non-targeted floating group raise
-      // still uses set_z_order.
+      let workspace_reorder_queued = state
+        .pending_sync
+        .workspaces_to_reorder()
+        .iter()
+        .any(|queued| queued.id() == workspace.id())
+        || state.pending_sync.needs_focus_update();
+
+      // Defer to `reorder_focused_workspace_layers` whenever that chain
+      // owns the outcome (tiling group, targeted detached, or any
+      // Super+arrow / queued workspace reorder). Avoid dual applicators.
       let defer_to_workspace_reorder =
         should_defer_bring_to_front_to_workspace_reorder(
           has_targeted_floating_focus,
           focused_is_tiling,
+          workspace_reorder_queued,
         );
 
       if defer_to_workspace_reorder {
         if verbose_z_order_enabled() {
           let reason = if has_targeted_floating_focus {
             "targeted_floating"
-          } else {
+          } else if focused_is_tiling {
             "tiling_group_defer_workspace_reorder"
+          } else {
+            "workspace_reorder_queued"
           };
           crate::commands::general::layout_debug_log(format!(
             "verbose z-order skip bring_to_front hwnd={:?} z_order={z_order:?} reason={reason}",
@@ -1102,15 +1117,56 @@ mod tests {
   #[test]
   fn tiling_focus_defers_bring_to_front_to_workspace_reorder() {
     assert!(should_defer_bring_to_front_to_workspace_reorder(
-      false, true
+      false, true, false
     ));
     assert!(
-      should_defer_bring_to_front_to_workspace_reorder(true, false),
+      should_defer_bring_to_front_to_workspace_reorder(true, false, false),
       "targeted floating also defers"
     );
     assert!(
-      !should_defer_bring_to_front_to_workspace_reorder(false, false),
-      "legacy non-targeted floating group raise still uses set_z_order"
+      should_defer_bring_to_front_to_workspace_reorder(false, false, true),
+      "queued workspace reorder (Super+arrow) must defer even without targeted mark"
+    );
+    assert!(
+      !should_defer_bring_to_front_to_workspace_reorder(false, false, false),
+      "without tiling/targeted/reorder, legacy set_z_order path remains"
+    );
+  }
+
+  #[test]
+  fn floating_directional_focus_chain_promotes_only_selected_floater() {
+    // Regression: 3 floaters + tiles, Super+Left/Right among floaters.
+    // Focusing a detached window must promote ONLY that window; peer
+    // floaters keep their relation to the tiled block (f1 stays above
+    // tiles; f3 stays below).
+    let f1 = window(1, NormalZOrderLayer::Floating);
+    let f2 = window(2, NormalZOrderLayer::Floating);
+    let f3 = window(3, NormalZOrderLayer::Floating);
+    let t1 = window(10, NormalZOrderLayer::Tiling);
+    let t2 = window(11, NormalZOrderLayer::Tiling);
+
+    // Prior: f1 on top of tiles, f2/f3 below the tiled block.
+    let previous = [f1.0, t1.0, t2.0, f2.0, f3.0];
+    assert_eq!(
+      normal_z_order_chain(
+        vec![f2, f1, f3, t1, t2],
+        f2.0,
+        Some(&previous),
+      ),
+      Some(vec![f2.0, f1.0, t1.0, t2.0, f3.0]),
+      "only f2 moves to front; f1 stays above tiles; f3 stays below"
+    );
+
+    // Second Super+arrow to f3: only f3 rises; f2/f1 keep peer order
+    // relative to the tiled block.
+    assert_eq!(
+      normal_z_order_chain(
+        vec![f3, f2, f1, t1, t2],
+        f3.0,
+        Some(&[f2.0, f1.0, t1.0, t2.0, f3.0]),
+      ),
+      Some(vec![f3.0, f2.0, f1.0, t1.0, t2.0]),
+      "only f3 moves; peers and tiled block undisturbed"
     );
   }
 

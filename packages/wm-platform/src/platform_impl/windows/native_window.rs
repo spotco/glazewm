@@ -1870,7 +1870,10 @@ pub(crate) fn sample_z_order_ranks(
 /// z-order. Each subsequent responsive window is placed immediately after
 /// the previous responsive one. Hung / non-pumping hwnds are skipped so they
 /// cannot block the WM loop or anchor peers below floaters. A generation-
-/// aware retry still re-applies after focus settles.
+/// aware 10ms retry still re-applies after focus settles. When any hwnd
+/// was skipped as hung, bounded delayed recovery retries re-apply the
+/// same chain so a later-resumed GUI thread eventually joins full order
+/// (cancelled when `Z_ORDER_GENERATION` advances).
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -1879,11 +1882,12 @@ pub(crate) fn reorder_z_order(
   }
 
   let generation = next_z_order_generation();
-  apply_z_order_chain(window_ids)?;
+  let skipped_hung = apply_z_order_chain(window_ids)?;
 
   let window_ids = window_ids.to_vec();
   let focused_window = window_ids[0];
   if let Ok(runtime) = Handle::try_current() {
+    let retry_ids = window_ids.clone();
     runtime.spawn(async move {
       tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1893,8 +1897,30 @@ pub(crate) fn reorder_z_order(
         return;
       }
 
-      let _ = apply_z_order_chain(&window_ids);
+      let _ = apply_z_order_chain(&retry_ids);
     });
+
+    if skipped_hung {
+      // Absolute checkpoints from this spawn. Generation cancel aborts
+      // stale recoveries when a newer focus/reorder batch starts.
+      const HUNG_RECOVERY_AT_MS: &[u64] = &[100, 250, 500];
+      let recovery_ids = window_ids;
+      runtime.spawn(async move {
+        let started = tokio::time::Instant::now();
+        for &at_ms in HUNG_RECOVERY_AT_MS {
+          let target = started + Duration::from_millis(at_ms);
+          tokio::time::sleep_until(target).await;
+          if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+          }
+          match apply_z_order_chain(&recovery_ids) {
+            Ok(false) => return, // full chain placed; stop early
+            Ok(true) => {}       // still skipping; try later checkpoint
+            Err(_) => return,
+          }
+        }
+      });
+    }
   }
 
   Ok(())
@@ -1923,7 +1949,14 @@ fn current_or_new_z_order_generation() -> u64 {
 /// Same-thread windows are treated as responsive. Cross-thread targets must
 /// answer `WM_NULL` within [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. Hung / debugger
 /// suspended helpers fail this probe and must be skipped by the chain apply.
-fn hwnd_gui_responsive(hwnd: HWND) -> bool {
+/// Probe responsiveness, caching by GUI thread id for one chain apply.
+///
+/// Multiple hwnds sharing a TID share one `WM_NULL` result so a hung
+/// helper with several owned windows does not cost N×50ms probes.
+fn hwnd_gui_responsive_with_tid_cache(
+  hwnd: HWND,
+  tid_cache: &mut Option<HashMap<u32, bool>>,
+) -> bool {
   if !unsafe { IsWindow(hwnd) }.as_bool() {
     return false;
   }
@@ -1938,6 +1971,12 @@ fn hwnd_gui_responsive(hwnd: HWND) -> bool {
     return true;
   }
 
+  if let Some(cache) = tid_cache.as_mut() {
+    if let Some(&cached) = cache.get(&thread_id) {
+      return cached;
+    }
+  }
+
   let mut result = 0usize;
   let returned = unsafe {
     SendMessageTimeoutW(
@@ -1950,7 +1989,26 @@ fn hwnd_gui_responsive(hwnd: HWND) -> bool {
       Some(&raw mut result),
     )
   };
-  returned.0 != 0
+  let responsive = returned.0 != 0;
+  if let Some(cache) = tid_cache.as_mut() {
+    cache.insert(thread_id, responsive);
+  }
+  responsive
+}
+
+/// Pure cache lookup helper for unit tests (avoids N×50ms probes per TID).
+#[cfg(test)]
+fn tid_probe_cache_get_or_insert(
+  cache: &mut HashMap<u32, bool>,
+  thread_id: u32,
+  mut probe: impl FnMut() -> bool,
+) -> bool {
+  if let Some(&cached) = cache.get(&thread_id) {
+    return cached;
+  }
+  let result = probe();
+  cache.insert(thread_id, result);
+  result
 }
 
 /// Planned insert-after target for one responsive window in a chain.
@@ -1980,11 +2038,16 @@ fn planned_insert_after(
   ZOrderInsertAfter::Top
 }
 
-fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
+/// Applies the z-order chain. Returns `true` when any hwnd was skipped as
+/// hung/non-responsive (caller may schedule recovery retries).
+fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<bool> {
   // Keep SWP_ASYNCWINDOWPOS so a slow-but-pumping foreign queue (or a hung
-  // helper) cannot block the WM loop. Hung / non-pumping hwnds are skipped
-  // as placement targets *and* as insert-after anchors so responsive tiles
-  // still rise to HWND_TOP above floaters (layout.log hung helper 2168898).
+  // helper) cannot block the WM loop. Prefer ASYNC over sync SetWindowPos
+  // even for responsive hwnds — a slow pump must never stall the WM
+  // thread (plan: keep SWP_ASYNCWINDOWPOS; code is right). Hung /
+  // non-pumping hwnds are skipped as placement targets *and* as
+  // insert-after anchors so responsive tiles still rise to HWND_TOP above
+  // floaters (layout.log hung helper 2168898).
   // Only clear TOPMOST when present — unconditional HWND_NOTOPMOST raises
   // normal floaters and races the follow-up insert_after under ASYNC.
   let flags = SWP_NOACTIVATE
@@ -1995,10 +2058,13 @@ fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
     | SWP_NOOWNERZORDER;
 
   let mut last_responsive: Option<isize> = None;
+  let mut tid_cache: Option<HashMap<u32, bool>> = Some(HashMap::new());
+  let mut skipped_hung = false;
 
   for window_id in window_ids {
     let hwnd = HWND(window_id.0);
-    if !hwnd_gui_responsive(hwnd) {
+    if !hwnd_gui_responsive_with_tid_cache(hwnd, &mut tid_cache) {
+      skipped_hung = true;
       continue;
     }
 
@@ -2020,7 +2086,7 @@ fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
     last_responsive = Some(window_id.0);
   }
 
-  Ok(())
+  Ok(skipped_hung)
 }
 
 impl PartialEq for NativeWindow {
@@ -2879,6 +2945,28 @@ mod reorder_z_order_tests {
   }
 
   #[test]
+  fn tid_probe_cache_reuses_result_per_thread() {
+    let mut probes = 0usize;
+    let mut cache = std::collections::HashMap::new();
+    let mut probe = || {
+      probes += 1;
+      false
+    };
+
+    assert!(!super::tid_probe_cache_get_or_insert(
+      &mut cache, 42, &mut probe
+    ));
+    assert!(
+      !super::tid_probe_cache_get_or_insert(&mut cache, 42, &mut probe),
+      "same TID must not re-probe"
+    );
+    assert!(!super::tid_probe_cache_get_or_insert(
+      &mut cache, 99, &mut probe
+    ));
+    assert_eq!(probes, 2, "one probe per distinct TID");
+  }
+
+  #[test]
   fn reorder_z_order_raises_responsive_tiles_above_floaters_when_focused_tile_is_hung()
   {
     use std::time::Duration;
@@ -2951,6 +3039,89 @@ mod reorder_z_order_tests {
       tile_above_floater,
       "responsive foreign tile must rise above foreign floater when focused        tile is hung (no 10ms/25ms race); initial={initial:?}        intended={intended:?} actual={order:?}"
     );
+  }
+
+  #[test]
+  fn hung_hwnd_eventually_rejoins_chain_after_resume() {
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::System::Threading::ResumeThread;
+
+    // hung → reorder (skip) → resume → bounded recovery → full chain.
+    let probe = spawn_suspended_probe();
+    let hung = HWND(probe.hwnd);
+    let (mut tile_helper, tile) =
+      spawn_single_pumping_window_helper(false, 0);
+    let (mut floater_helper, floater) =
+      spawn_single_pumping_window_helper(false, 0);
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+      // Steam-on-top seed, then Super+arrow onto hung tiled focus.
+      reorder_z_order(&[
+        WindowId(floater.0),
+        WindowId(tile.0),
+        WindowId(hung.0),
+      ])
+      .expect("seed floater-on-top");
+      tokio::time::sleep(Duration::from_millis(30)).await;
+
+      reorder_z_order(&[
+        WindowId(hung.0),
+        WindowId(tile.0),
+        WindowId(floater.0),
+      ])
+      .expect("reorder while focused tile GUI is suspended");
+
+      // Responsive tile must already be above floater (Fix B).
+      tokio::time::sleep(Duration::from_millis(40)).await;
+      let mid = relative_order(&[hung, tile, floater]);
+      let tile_above = mid
+        .iter()
+        .position(|id| *id == tile.0)
+        .zip(mid.iter().position(|id| *id == floater.0))
+        .is_some_and(|(t, f)| t < f);
+      assert!(
+        tile_above,
+        "before resume, responsive tile must beat floater: {mid:?}"
+      );
+
+      // Resume the hung GUI thread; generation-aware recovery retries
+      // at 100/250/500ms should place the recovered hwnd into the chain.
+      assert_ne!(
+        unsafe { ResumeThread(probe.thread) },
+        u32::MAX,
+        "resume hung gui thread"
+      );
+
+      let deadline = Instant::now() + Duration::from_millis(800);
+      let mut order = relative_order(&[hung, tile, floater]);
+      let mut full_chain = false;
+      while Instant::now() < deadline {
+        order = relative_order(&[hung, tile, floater]);
+        // Full intended chain: hung, tile, floater (top to bottom).
+        full_chain = order == vec![hung.0, tile.0, floater.0];
+        if full_chain {
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+      }
+
+      assert!(
+        full_chain,
+        "after resume, bounded recovery must restore full chain          hung→tile→floater; actual={order:?}"
+      );
+    });
+
+    let _ = tile_helper.kill();
+    let _ = tile_helper.wait();
+    let _ = floater_helper.kill();
+    let _ = floater_helper.wait();
+    unsafe {
+      let _ = windows::Win32::Foundation::CloseHandle(probe.thread);
+    }
+    // Prevent Drop of JoinHandle panic if thread still blocked; detach.
+    std::mem::forget(probe.gui);
   }
 
   fn read_helper_hwnd(
