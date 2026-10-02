@@ -40,7 +40,9 @@ if errorlevel 1 (
 )
 
 for %%F in (%REQUIRED_EXES%) do copy /y "%RELEASE_DIR%\%%F" "%STAGE%\%%F" >nul
+REM Repo sample config (starter deploy), not the live user config under %%USERPROFILE%%\.glzr\glazewm\
 copy /y "%CD%\resources\assets\sample-config.yaml" "%STAGE%\config.yaml" >nul
+REM GlazeWM has no settings.json (Zebar-only); config.yaml is the sole starter config.
 
 powershell -NoProfile -Command "Compress-Archive -Path '%STAGE%\*' -DestinationPath '%ZIP%' -CompressionLevel Optimal"
 if errorlevel 1 (
@@ -54,4 +56,8 @@ echo   %ZIP%
 echo Contents:
 for %%F in (%REQUIRED_EXES%) do echo   %%F
 echo   config.yaml
+echo.
+echo Install destinations on a stock GlazeWM machine:
+echo   glazewm*.exe  -^> C:\Program Files\glzr.io\GlazeWM\
+echo   config.yaml   -^> %%USERPROFILE%%\.glzr\glazewm\config.yaml
 exit /b 0
