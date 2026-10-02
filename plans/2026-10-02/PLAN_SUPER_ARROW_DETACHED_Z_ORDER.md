@@ -1,7 +1,7 @@
 # Plan: Super+arrow detached z-order flash / stuck floaters between tiles
 
 Date: 2026-10-02
-Status: PR #13 review fixes in progress (box); Windows smoke/deploy pending Asus return
+Status: PR #13 review fixes pushed (box); Windows smoke/deploy pending Asus return
 Branch: `bugfix/super-arrow-z-order-hung-helper`
 Prior branch work preserved from `bugfix/issue-10-skip-hung-style-writes` HEAD
 Scope: document confirmed Super+arrow z-order bugs, fix tiling bring_to_front race + hung-HWND reorder failure, floating Super+arrow dual-applicator, hung recovery, TID probe cache; test; deploy with `general.verbose_z_order: true`
@@ -21,7 +21,7 @@ Scope: document confirmed Super+arrow z-order bugs, fix tiling bring_to_front ra
 - [x] Step 9 - Review fix: hung HWND bounded delayed reconcile (100/250/500ms) + generation cancel
 - [x] Step 10 - Review fix: cache responsiveness probe by TID per chain apply
 - [x] Step 11 - Plan: document keep `SWP_ASYNCWINDOWPOS` (do not switch responsive path to sync)
-- [ ] Step 12 - Rebase onto current `glazewm-spotcobuild` (PR #12 squash) when pushing
+- [x] Step 12 - Rebase onto current `glazewm-spotcobuild` (PR #12 squash) when pushing
 - [ ] Step 13 - Windows-only integration tests + Asus deploy/smoke on return
 
 ## Objective
