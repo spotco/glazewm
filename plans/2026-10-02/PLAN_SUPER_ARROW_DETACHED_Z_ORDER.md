@@ -1,7 +1,7 @@
 # Plan: Super+arrow detached z-order flash / stuck floaters between tiles
 
 Date: 2026-10-02
-Status: in progress
+Status: implemented + deployed for user smoke-test
 Branch: `bugfix/issue-10-skip-hung-style-writes` (local; do not push unless asked)
 Scope: document confirmed Super+arrow z-order bug, fix tiling bring_to_front race, test, deploy with `general.verbose_z_order: true`
 
@@ -11,9 +11,9 @@ Scope: document confirmed Super+arrow z-order bug, fix tiling bring_to_front rac
 - [x] Step 1 - Write this plan (issues + observations + invariants)
 - [ ] Step 2 - Implement fix in `platform_sync` (+ same-sync reorder queue)
 - [x] Step 3 - `cargo test` for wm-common / wm / wm-platform as applicable (wm 76 ok, wm-common 87 ok, wm-platform 50 ok + 3 flakes that pass alone)
-- [ ] Step 4 - Commit locally (no push)
-- [ ] Step 5 - Soft `wm-exit`, deploy to Program Files, restart; leave verbose on
-- [ ] Step 6 - Report plan path, commit sha, test counts, deploy proof, smoke-test notes
+- [x] Step 4 - Commit locally (no push) — `720370503ec8944410227caadaf3dca80130fd81`
+- [x] Step 5 - Soft `wm-exit`, deploy to Program Files, restart; leave verbose on — PID 20684 from `"C:\Program Files\glzr.io\GlazeWM\glazewm.exe"` @ 12:55:49 ET
+- [x] Step 6 - Report plan path, commit sha, test counts, deploy proof, smoke-test notes
 
 ## Objective
 
