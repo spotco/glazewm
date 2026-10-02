@@ -110,7 +110,9 @@ pub fn reorder_z_order(window_ids: &[WindowId]) -> crate::Result<()> {
 /// Used by optional verbose diagnostics (`GLAZEWM_VERBOSE_Z_ORDER=1`).
 #[cfg(target_os = "windows")]
 #[must_use]
-pub fn sample_z_order_ranks(window_ids: &[WindowId]) -> Vec<(WindowId, u32)> {
+pub fn sample_z_order_ranks(
+  window_ids: &[WindowId],
+) -> Vec<(WindowId, u32)> {
   platform_impl::sample_z_order_ranks(window_ids)
 }
 

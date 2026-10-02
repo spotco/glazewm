@@ -18,11 +18,15 @@ Scope: document confirmed Super+arrow z-order bugs, fix tiling bring_to_front ra
 - [x] Step 6 - Report branch, plan updates, fail-then-pass evidence, fix approach, deploy proof
 - [x] Step 7 - Commit, push, open PR for review
 - [x] Step 8 - Review fix: floating Super+arrow mark targeted + defer when workspace reorder queued
-- [x] Step 9 - Review fix: hung HWND bounded delayed reconcile (100/250/500ms) + generation cancel
+- [x] Step 9 - Review fix: hung HWND recovery 100/250/500ms then 1s backoff + generation/foreground cancel
 - [x] Step 10 - Review fix: cache responsiveness probe by TID per chain apply
 - [x] Step 11 - Plan: document keep `SWP_ASYNCWINDOWPOS` (do not switch responsive path to sync)
 - [x] Step 12 - Rebase onto current `glazewm-spotcobuild` (PR #12 squash) when pushing
 - [ ] Step 13 - Windows-only integration tests + Asus deploy/smoke on return
+- [x] Step 14 - Review fix: hung recovery also aborts on GetForegroundWindow mismatch
+- [x] Step 15 - Review fix: long-suspend (>500ms) then resume recovery test
+- [x] Step 16 - Review fix: hung test teardown + unique suspend-probe class name
+- [x] Step 17 - Review fix: cargo fmt clean on native_window.rs
 
 ## Objective
 

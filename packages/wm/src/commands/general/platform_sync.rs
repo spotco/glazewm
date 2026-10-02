@@ -20,7 +20,6 @@ use wm_platform::{NativeWindowWindowsExt, WindowId};
 use wm_platform::{Rect, WindowZOrder};
 
 use super::verbose_z_order_enabled;
-
 use crate::{
   models::{Container, WindowContainer, Workspace},
   traits::{CommonGetters, PositionGetters, WindowGetters},
@@ -135,7 +134,6 @@ fn sync_focus(
 
   Ok(())
 }
-
 
 /// Whether per-window `bring_to_front` `set_z_order` must defer to the
 /// workspace layer chain apply.
@@ -488,8 +486,6 @@ fn redraw_containers(
   Ok(())
 }
 
-
-
 #[cfg(target_os = "windows")]
 fn log_verbose_native_z_order(label: &str, intended: &[WindowId]) {
   if !verbose_z_order_enabled() || intended.is_empty() {
@@ -525,7 +521,10 @@ fn log_verbose_native_z_order(label: &str, intended: &[WindowId]) {
 }
 
 #[cfg(target_os = "windows")]
-fn schedule_verbose_z_order_recheck(label: String, intended: Vec<WindowId>) {
+fn schedule_verbose_z_order_recheck(
+  label: String,
+  intended: Vec<WindowId>,
+) {
   if !verbose_z_order_enabled() || intended.is_empty() {
     return;
   }
@@ -1128,7 +1127,9 @@ mod tests {
       "queued workspace reorder (Super+arrow) must defer even without targeted mark"
     );
     assert!(
-      !should_defer_bring_to_front_to_workspace_reorder(false, false, false),
+      !should_defer_bring_to_front_to_workspace_reorder(
+        false, false, false
+      ),
       "without tiling/targeted/reorder, legacy set_z_order path remains"
     );
   }

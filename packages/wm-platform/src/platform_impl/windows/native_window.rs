@@ -1868,12 +1868,13 @@ pub(crate) fn sample_z_order_ranks(
 ///
 /// The first *responsive* window is placed at the top of the normal
 /// z-order. Each subsequent responsive window is placed immediately after
-/// the previous responsive one. Hung / non-pumping hwnds are skipped so they
-/// cannot block the WM loop or anchor peers below floaters. A generation-
-/// aware 10ms retry still re-applies after focus settles. When any hwnd
-/// was skipped as hung, bounded delayed recovery retries re-apply the
-/// same chain so a later-resumed GUI thread eventually joins full order
-/// (cancelled when `Z_ORDER_GENERATION` advances).
+/// the previous responsive one. Hung / non-pumping hwnds are skipped so
+/// they cannot block the WM loop or anchor peers below floaters. A
+/// generation- aware 10ms retry still re-applies after focus settles. When
+/// any hwnd was skipped as hung, delayed recovery retries re-apply the
+/// same chain (100/250/500ms then once per second) so a later-resumed GUI
+/// thread eventually joins full order (cancelled when `Z_ORDER_GENERATION`
+/// advances or focus leaves the intended foreground window).
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -1901,21 +1902,38 @@ pub(crate) fn reorder_z_order(
     });
 
     if skipped_hung {
-      // Absolute checkpoints from this spawn. Generation cancel aborts
-      // stale recoveries when a newer focus/reorder batch starts.
-      const HUNG_RECOVERY_AT_MS: &[u64] = &[100, 250, 500];
+      // Early absolute checkpoints, then low-frequency 1s backoff until
+      // the full chain applies or generation/focus cancels. TID-cached
+      // WM_NULL probes keep each attempt cheap. Foreground abort matches
+      // the 10ms retry: unmanaged Alt-Tab does not bump generation.
+      const HUNG_RECOVERY_EARLY_AT_MS: &[u64] = &[100, 250, 500];
       let recovery_ids = window_ids;
       runtime.spawn(async move {
         let started = tokio::time::Instant::now();
-        for &at_ms in HUNG_RECOVERY_AT_MS {
+        let stale = move || {
+          Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+            || unsafe { GetForegroundWindow() } != HWND(focused_window.0)
+        };
+        for &at_ms in HUNG_RECOVERY_EARLY_AT_MS {
           let target = started + Duration::from_millis(at_ms);
           tokio::time::sleep_until(target).await;
-          if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation {
+          if stale() {
             return;
           }
           match apply_z_order_chain(&recovery_ids) {
             Ok(false) => return, // full chain placed; stop early
             Ok(true) => {}       // still skipping; try later checkpoint
+            Err(_) => return,
+          }
+        }
+        loop {
+          tokio::time::sleep(Duration::from_secs(1)).await;
+          if stale() {
+            return;
+          }
+          match apply_z_order_chain(&recovery_ids) {
+            Ok(false) => return,
+            Ok(true) => {}
             Err(_) => return,
           }
         }
@@ -1943,13 +1961,14 @@ fn current_or_new_z_order_generation() -> u64 {
   }
 }
 
-
-/// Whether `hwnd` can accept a synchronous z-order change without blocking.
+/// Whether `hwnd` can accept a synchronous z-order change without
+/// blocking.
 ///
-/// Same-thread windows are treated as responsive. Cross-thread targets must
-/// answer `WM_NULL` within [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. Hung / debugger
-/// suspended helpers fail this probe and must be skipped by the chain apply.
-/// Probe responsiveness, caching by GUI thread id for one chain apply.
+/// Same-thread windows are treated as responsive. Cross-thread targets
+/// must answer `WM_NULL` within [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. Hung /
+/// debugger suspended helpers fail this probe and must be skipped by the
+/// chain apply. Probe responsiveness, caching by GUI thread id for one
+/// chain apply.
 ///
 /// Multiple hwnds sharing a TID share one `WM_NULL` result so a hung
 /// helper with several owned windows does not cost N×50ms probes.
@@ -2022,7 +2041,8 @@ enum ZOrderInsertAfter {
   After(WindowId),
 }
 
-/// Resolves insert-after for `index`, skipping non-responsive predecessors.
+/// Resolves insert-after for `index`, skipping non-responsive
+/// predecessors.
 #[cfg(test)]
 fn planned_insert_after(
   window_ids: &[WindowId],
@@ -2454,6 +2474,78 @@ mod reorder_z_order_tests {
     std::env::var("GLAZEWM_Z_ORDER_HELPER").ok().as_deref() == Some(mode)
   }
 
+  /// Creates a visible window, then waits on `GLAZEWM_RESUME_EVENT` before
+  /// pumping. Until the parent signals the event, `WM_NULL` probes fail
+  /// (thread is asleep, not in `GetMessage`) — unlike `SuspendThread` on a
+  /// pumping foreign GUI, which does not reliably fail same-desktop
+  /// probes.
+  fn create_deferred_pump_window() {
+    use std::io::Write;
+
+    use windows::Win32::{
+      Foundation::CloseHandle,
+      System::Threading::{
+        OpenEventW, WaitForSingleObject, SYNCHRONIZATION_ACCESS_RIGHTS,
+      },
+    };
+
+    let class_name =
+      wide(&format!("GlazeWmDeferredPump{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register deferred-pump helper class");
+    let title = wide("GlazeWM deferred-pump z-order helper");
+    let hwnd = unsafe {
+      CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        80,
+        80,
+        240,
+        120,
+        None,
+        None,
+        None,
+        None,
+      )
+    };
+    assert_ne!(hwnd.0, 0, "create deferred-pump helper window");
+    println!("GLAZEWM_Z_ORDER_HWND:{}", hwnd.0);
+    std::io::stdout().flush().expect("flush deferred-pump HWND");
+
+    let name = std::env::var("GLAZEWM_RESUME_EVENT")
+      .expect("GLAZEWM_RESUME_EVENT for deferred-pump");
+    let wide_name = wide(&name);
+    let handle = unsafe {
+      OpenEventW(
+        SYNCHRONIZATION_ACCESS_RIGHTS(0x001F_0003),
+        false,
+        PCWSTR(wide_name.as_ptr()),
+      )
+    }
+    .expect("open deferred-pump resume event");
+    // Sleep-wait (not GetMessage) so WM_NULL probes time out until
+    // release.
+    unsafe { WaitForSingleObject(handle, 120_000) };
+    unsafe {
+      let _ = CloseHandle(handle);
+    }
+
+    let mut message = MSG::default();
+    while unsafe { GetMessageW(&raw mut message, None, 0, 0) }.as_bool() {
+      unsafe {
+        TranslateMessage(&raw const message);
+        DispatchMessageW(&raw const message);
+      }
+    }
+  }
+
   fn create_non_pumping_window() {
     use std::{io::Write, thread, time::Duration};
 
@@ -2854,6 +2946,13 @@ mod reorder_z_order_tests {
   }
 
   #[test]
+  fn deferred_pump_helper_window() {
+    if helper_mode("deferred-pump") {
+      create_deferred_pump_window();
+    }
+  }
+
+  #[test]
   fn z_order_test_helper_pumping_window() {
     if helper_mode("pumping-window") {
       create_pumping_window_pair();
@@ -2920,7 +3019,6 @@ mod reorder_z_order_tests {
     );
   }
 
-
   #[test]
   fn planned_insert_after_skips_hung_predecessors() {
     let hung = WindowId(1);
@@ -2967,8 +3065,8 @@ mod reorder_z_order_tests {
   }
 
   #[test]
-  fn reorder_z_order_raises_responsive_tiles_above_floaters_when_focused_tile_is_hung()
-  {
+  fn reorder_z_order_raises_responsive_tiles_above_floaters_when_focused_tile_is_hung(
+  ) {
     use std::time::Duration;
 
     // Cross-process layout matching layout.log hung helper @ 05:02Z:
@@ -3045,83 +3143,184 @@ mod reorder_z_order_tests {
   fn hung_hwnd_eventually_rejoins_chain_after_resume() {
     use std::time::{Duration, Instant};
 
-    use windows::Win32::System::Threading::ResumeThread;
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
-    // hung → reorder (skip) → resume → bounded recovery → full chain.
-    let probe = spawn_suspended_probe();
-    let hung = HWND(probe.hwnd);
+    // deferred-pump hung -> reorder (skip) -> release during early
+    // checkpoints -> recovery.
+    let hung_gate = spawn_deferred_pump_helper();
+    let hung = hung_gate.hwnd;
     let (mut tile_helper, tile) =
       spawn_single_pumping_window_helper(false, 0);
     let (mut floater_helper, floater) =
       spawn_single_pumping_window_helper(false, 0);
+    force_foreground(hung, None);
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    runtime.block_on(async {
-      // Steam-on-top seed, then Super+arrow onto hung tiled focus.
-      reorder_z_order(&[
-        WindowId(floater.0),
-        WindowId(tile.0),
-        WindowId(hung.0),
-      ])
-      .expect("seed floater-on-top");
-      tokio::time::sleep(Duration::from_millis(30)).await;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+      || {
+        runtime.block_on(async {
+        reorder_z_order(&[WindowId(floater.0), WindowId(tile.0)])
+          .expect("seed floater-on-top");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+          unsafe { GetForegroundWindow() }.0,
+          hung.0,
+          "foreground left hung helper after seed reorder"
+        );
 
-      reorder_z_order(&[
-        WindowId(hung.0),
-        WindowId(tile.0),
-        WindowId(floater.0),
-      ])
-      .expect("reorder while focused tile GUI is suspended");
+        reorder_z_order(&[
+          WindowId(hung.0),
+          WindowId(tile.0),
+          WindowId(floater.0),
+        ])
+        .expect("reorder while focused tile GUI is not pumping");
 
-      // Responsive tile must already be above floater (Fix B).
-      tokio::time::sleep(Duration::from_millis(40)).await;
-      let mid = relative_order(&[hung, tile, floater]);
-      let tile_above = mid
-        .iter()
-        .position(|id| *id == tile.0)
-        .zip(mid.iter().position(|id| *id == floater.0))
-        .is_some_and(|(t, f)| t < f);
-      assert!(
-        tile_above,
-        "before resume, responsive tile must beat floater: {mid:?}"
-      );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+          unsafe { GetForegroundWindow() }.0,
+          hung.0,
+          "foreground left hung helper after hung reorder"
+        );
+        let mid = relative_order(&[hung, tile, floater]);
+        let tile_above = mid
+          .iter()
+          .position(|id| *id == tile.0)
+          .zip(mid.iter().position(|id| *id == floater.0))
+          .is_some_and(|(t, f)| t < f);
+        assert!(
+          tile_above,
+          "before resume, responsive tile must beat floater: {mid:?}"
+        );
+        assert_ne!(
+          mid.first().copied(),
+          Some(hung.0),
+          "hung hwnd must stay skipped before resume: {mid:?}"
+        );
 
-      // Resume the hung GUI thread; generation-aware recovery retries
-      // at 100/250/500ms should place the recovered hwnd into the chain.
-      assert_ne!(
-        unsafe { ResumeThread(probe.thread) },
-        u32::MAX,
-        "resume hung gui thread"
-      );
+        hung_gate.release();
+        force_foreground(hung, None);
 
-      let deadline = Instant::now() + Duration::from_millis(800);
-      let mut order = relative_order(&[hung, tile, floater]);
-      let mut full_chain = false;
-      while Instant::now() < deadline {
-        order = relative_order(&[hung, tile, floater]);
-        // Full intended chain: hung, tile, floater (top to bottom).
-        full_chain = order == vec![hung.0, tile.0, floater.0];
-        if full_chain {
-          break;
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let mut order = relative_order(&[hung, tile, floater]);
+        let mut full_chain = false;
+        while Instant::now() < deadline {
+          order = relative_order(&[hung, tile, floater]);
+          full_chain = order == vec![hung.0, tile.0, floater.0];
+          if full_chain {
+            break;
+          }
+          tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-      }
 
-      assert!(
-        full_chain,
-        "after resume, bounded recovery must restore full chain          hung→tile→floater; actual={order:?}"
-      );
-    });
+        assert!(
+          full_chain,
+          "after resume, early recovery must restore full chain; actual={order:?}"
+        );
+      });
+      },
+    ));
 
+    drop(hung_gate);
     let _ = tile_helper.kill();
     let _ = tile_helper.wait();
     let _ = floater_helper.kill();
     let _ = floater_helper.wait();
-    unsafe {
-      let _ = windows::Win32::Foundation::CloseHandle(probe.thread);
+    if let Err(payload) = result {
+      std::panic::resume_unwind(payload);
     }
-    // Prevent Drop of JoinHandle panic if thread still blocked; detach.
-    std::mem::forget(probe.gui);
+  }
+
+  #[test]
+  fn hung_hwnd_rejoins_after_suspend_past_early_recovery_window() {
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    // Stay non-pumping past the 100/250/500ms checkpoints, then release
+    // and require the 1s backoff recovery to converge without further
+    // input.
+    let hung_gate = spawn_deferred_pump_helper();
+    let hung = hung_gate.hwnd;
+    let (mut tile_helper, tile) =
+      spawn_single_pumping_window_helper(false, 0);
+    let (mut floater_helper, floater) =
+      spawn_single_pumping_window_helper(false, 0);
+    force_foreground(hung, None);
+
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+      || {
+        runtime.block_on(async {
+        reorder_z_order(&[WindowId(floater.0), WindowId(tile.0)])
+          .expect("seed floater-on-top");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+          unsafe { GetForegroundWindow() }.0,
+          hung.0,
+          "foreground left hung helper after seed reorder"
+        );
+
+        let reorder_at = Instant::now();
+        reorder_z_order(&[
+          WindowId(hung.0),
+          WindowId(tile.0),
+          WindowId(floater.0),
+        ])
+        .expect("reorder while focused tile GUI is not pumping");
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+          unsafe { GetForegroundWindow() }.0,
+          hung.0,
+          "foreground left hung helper during long-suspend window"
+        );
+        let mid = relative_order(&[hung, tile, floater]);
+        let tile_above = mid
+          .iter()
+          .position(|id| *id == tile.0)
+          .zip(mid.iter().position(|id| *id == floater.0))
+          .is_some_and(|(t, f)| t < f);
+        assert!(
+          tile_above,
+          "before late resume, responsive tile must beat floater: {mid:?}"
+        );
+        assert_ne!(
+          mid.first().copied(),
+          Some(hung.0),
+          "hung hwnd must stay skipped through early recovery window: {mid:?}"
+        );
+
+        hung_gate.release();
+        force_foreground(hung, None);
+
+        let deadline = reorder_at + Duration::from_millis(3500);
+        let mut order = relative_order(&[hung, tile, floater]);
+        let mut full_chain = false;
+        while Instant::now() < deadline {
+          order = relative_order(&[hung, tile, floater]);
+          full_chain = order == vec![hung.0, tile.0, floater.0];
+          if full_chain {
+            break;
+          }
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+          full_chain,
+          "after late resume, 1s backoff recovery must restore full chain; actual={order:?}"
+        );
+      });
+      },
+    ));
+
+    drop(hung_gate);
+    let _ = tile_helper.kill();
+    let _ = tile_helper.wait();
+    let _ = floater_helper.kill();
+    let _ = floater_helper.wait();
+    if let Err(payload) = result {
+      std::panic::resume_unwind(payload);
+    }
   }
 
   fn read_helper_hwnd(
@@ -3143,7 +3342,7 @@ mod reorder_z_order_tests {
     }
   }
 
-    fn assert_foreign_z_order_call_is_bounded(mode: &str) {
+  fn assert_foreign_z_order_call_is_bounded(mode: &str) {
     use std::{
       io::{BufRead, BufReader},
       process::{Command, Stdio},
@@ -3280,6 +3479,87 @@ mod reorder_z_order_tests {
     };
     assert_eq!(handles.len(), 2, "pumping helper must expose two HWNDs");
     (helper, [HWND(handles[0]), HWND(handles[1])])
+  }
+
+  /// Foreign window that fails `WM_NULL` until [`DeferredPump::release`].
+  struct DeferredPump {
+    helper: std::process::Child,
+    hwnd: HWND,
+    event: windows::Win32::Foundation::HANDLE,
+  }
+
+  impl Drop for DeferredPump {
+    fn drop(&mut self) {
+      let _ = self.helper.kill();
+      let _ = self.helper.wait();
+      unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(self.event);
+      }
+    }
+  }
+
+  impl DeferredPump {
+    fn release(&self) {
+      unsafe {
+        windows::Win32::System::Threading::SetEvent(self.event)
+          .expect("signal deferred-pump");
+      }
+    }
+  }
+
+  fn spawn_deferred_pump_helper() -> DeferredPump {
+    use std::{
+      io::{BufRead, BufReader},
+      process::{Command, Stdio},
+      sync::atomic::{AtomicU64, Ordering},
+      time::Duration,
+    };
+
+    use windows::Win32::{
+      Foundation::HANDLE, System::Threading::CreateEventW,
+    };
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = format!(
+      r"Local\GlazeWmDeferredPump{}-{}",
+      std::process::id(),
+      SEQ.fetch_add(1, Ordering::SeqCst)
+    );
+    let wide_name = wide(&name);
+    let event = unsafe {
+      CreateEventW(None, true, false, PCWSTR(wide_name.as_ptr()))
+    }
+    .expect("create deferred-pump event");
+    assert_ne!(event, HANDLE::default(), "deferred-pump event handle");
+
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut helper = Command::new(current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "deferred-pump")
+      .env("GLAZEWM_RESUME_EVENT", &name)
+      .arg("deferred_pump_helper_window")
+      .arg("--nocapture")
+      .stdout(Stdio::piped())
+      .spawn()
+      .expect("spawn deferred-pump helper");
+    let stdout = helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let hwnd = loop {
+      let line = lines
+        .next()
+        .expect("deferred-pump HWND")
+        .expect("read deferred-pump HWND");
+      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
+        break HWND(
+          hwnd.parse::<isize>().expect("parse deferred-pump HWND"),
+        );
+      }
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    DeferredPump {
+      helper,
+      hwnd,
+      event,
+    }
   }
 
   fn spawn_single_pumping_window_helper(
@@ -4384,18 +4664,129 @@ mod reorder_z_order_tests {
     gui: std::thread::JoinHandle<()>,
   }
 
+  /// Quit the probe GUI thread, join it, and close the thread handle.
+  ///
+  /// Avoids `CloseHandle` + `mem::forget(gui)` leaving
+  /// `GlazeWmSuspendProbe*` registered for later tests in the same
+  /// process.
+  fn shutdown_suspended_probe(probe: SuspendedProbe) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+      PostThreadMessageW, WM_QUIT,
+    };
+
+    unsafe {
+      let _ =
+        PostThreadMessageW(probe.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+      let _ = windows::Win32::Foundation::CloseHandle(probe.thread);
+    }
+    probe.gui.join().expect("probe gui thread");
+  }
+
+  /// Make `hwnd` foreground so hung-recovery matches production cancel
+  /// checks. Pumping helpers often steal FG after the probe is created.
+  ///
+  /// When `suspended_thread` is `Some`, briefly resume that GUI thread
+  /// around `SetForegroundWindow`. Call this ONLY before starting a
+  /// hung `reorder_z_order` recovery — a mid-recovery resume would make
+  /// the hwnd responsive and defeat suspend scenarios. Never
+  /// `AttachThreadInput` to the target TID (can deadlock when hung).
+  fn force_foreground(
+    hwnd: HWND,
+    suspended_thread: Option<windows::Win32::Foundation::HANDLE>,
+  ) {
+    use windows::Win32::{
+      System::Threading::{
+        GetCurrentThreadId, ResumeThread, SuspendThread,
+      },
+      UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+      },
+    };
+
+    #[link(name = "user32")]
+    extern "system" {
+      fn AttachThreadInput(
+        id_attach: u32,
+        id_attach_to: u32,
+        attach: i32,
+      ) -> i32;
+      fn AllowSetForegroundWindow(process_id: u32) -> i32;
+    }
+
+    // ASFW_ANY — allow this test process to set FG after helper churn.
+    unsafe {
+      AllowSetForegroundWindow(0xFFFFFFFF);
+    }
+
+    if let Some(thread) = suspended_thread {
+      assert_ne!(
+        unsafe { ResumeThread(thread) },
+        u32::MAX,
+        "resume probe for SetForegroundWindow"
+      );
+      std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Retry: Windows FG lock can deny the first attempt after a prior
+    // test's helpers exit.
+    for attempt in 0..10 {
+      unsafe {
+        let foreground = GetForegroundWindow();
+        let fg_tid = GetWindowThreadProcessId(foreground, None);
+        let cur_tid = GetCurrentThreadId();
+        if fg_tid != 0 && fg_tid != cur_tid {
+          AttachThreadInput(cur_tid, fg_tid, 1);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        if fg_tid != 0 && fg_tid != cur_tid {
+          AttachThreadInput(cur_tid, fg_tid, 0);
+        }
+      }
+      if unsafe { GetForegroundWindow() }.0 == hwnd.0 {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(
+        20 + attempt * 10,
+      ));
+    }
+
+    assert_eq!(
+      unsafe { GetForegroundWindow() }.0,
+      hwnd.0,
+      "could not make hung probe the foreground window"
+    );
+
+    if let Some(thread) = suspended_thread {
+      assert_ne!(
+        unsafe { SuspendThread(thread) },
+        u32::MAX,
+        "re-suspend probe after SetForegroundWindow"
+      );
+    }
+  }
+
   /// Hidden window whose GUI thread is suspended inside `GetMessage`.
   fn spawn_suspended_probe() -> SuspendedProbe {
-    use std::sync::mpsc;
+    use std::sync::{
+      atomic::{AtomicU64, Ordering},
+      mpsc,
+    };
 
     use windows::Win32::System::Threading::{
       GetCurrentThreadId, OpenThread, SuspendThread, THREAD_SUSPEND_RESUME,
     };
 
+    static PROBE_CLASS_SEQ: AtomicU64 = AtomicU64::new(0);
+    let class_seq = PROBE_CLASS_SEQ.fetch_add(1, Ordering::SeqCst);
     let (sender, receiver) = mpsc::channel();
     let gui = std::thread::spawn(move || {
-      let class_name =
-        wide(&format!("GlazeWmSuspendProbe{}", std::process::id()));
+      // Unique per invocation so a leaked prior probe cannot poison
+      // RegisterClassW for later tests in the same process.
+      let class_name = wide(&format!(
+        "GlazeWmSuspendProbe{}-{}",
+        std::process::id(),
+        class_seq
+      ));
       let class = WNDCLASSW {
         lpfnWndProc: Some(reorder_test_wnd_proc),
         lpszClassName: PCWSTR(class_name.as_ptr()),
@@ -4512,22 +4903,7 @@ mod reorder_z_order_tests {
       "SetLayeredWindowAttributes blocked on a suspended GUI thread"
     );
 
-    unsafe {
-      let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-        probe.thread_id,
-        WM_NULL,
-        WPARAM(0),
-        LPARAM(0),
-      );
-      let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-        HWND(hwnd),
-        windows::Win32::UI::WindowsAndMessaging::WM_QUIT,
-        WPARAM(0),
-        LPARAM(0),
-      );
-      let _ = windows::Win32::Foundation::CloseHandle(probe.thread);
-    }
-    probe.gui.join().expect("probe gui thread");
+    shutdown_suspended_probe(probe);
   }
 
   #[test]

@@ -599,7 +599,8 @@ mod tests {
     // Config flag alone must enable diagnostics. Env override is OR-ed at
     // read time; skip mutating process env (unsafe on recent Rust).
     let env_forced =
-      std::env::var("GLAZEWM_VERBOSE_Z_ORDER").ok().as_deref() == Some("1");
+      std::env::var("GLAZEWM_VERBOSE_Z_ORDER").ok().as_deref()
+        == Some("1");
     set_verbose_z_order_from_config(true);
     assert!(verbose_z_order_enabled());
     set_verbose_z_order_from_config(false);

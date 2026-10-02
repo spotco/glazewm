@@ -53,7 +53,9 @@ pub fn focus_in_direction(
     // so tiling/floating directional focus does not briefly rely on
     // per-window bring_to_front SWPs before the workspace chain apply.
     if let Some(workspace) = focus_target.workspace() {
-      state.pending_sync.queue_workspace_to_reorder(workspace.clone());
+      state
+        .pending_sync
+        .queue_workspace_to_reorder(workspace.clone());
       // Super+arrow between normal floaters must promote ONLY the
       // selected window (invariant). Mark as targeted so
       // windows_to_bring_to_front does not raise every peer floater and
@@ -67,9 +69,10 @@ pub fn focus_in_direction(
           window.state(),
           WindowState::Floating(config) if !config.shown_on_top
         ) {
-          state
-            .pending_sync
-            .queue_focused_window_to_bring_to_front(&workspace, window.id());
+          state.pending_sync.queue_focused_window_to_bring_to_front(
+            &workspace,
+            window.id(),
+          );
         }
       }
     }
