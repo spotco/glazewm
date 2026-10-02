@@ -73,10 +73,12 @@ fn move_tiling_window(
   let workspace = window_to_move.workspace().context("No workspace.")?;
   let arrow_axis = TilingDirection::from_direction(direction);
 
-  layout_debug_log(format!(
-    "move tiling: dir={direction:?} stack={stack_direction:?} ws_dir={:?} arrow_axis={arrow_axis:?}",
-    workspace.tiling_direction()
-  ));
+  if crate::commands::general::verbose_z_order_enabled() {
+    layout_debug_log(format!(
+      "move tiling: dir={direction:?} stack={stack_direction:?} ws_dir={:?} arrow_axis={arrow_axis:?}",
+      workspace.tiling_direction()
+    ));
+  }
 
   if arrow_axis == *stack_direction {
     move_parallel(

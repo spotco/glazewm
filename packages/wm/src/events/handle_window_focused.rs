@@ -29,14 +29,16 @@ pub fn handle_window_focused(
   // immediately so a later Alt-Tab does not replay a chain that still
   // has this window behind the tiled group.
   if is_ignored_window {
-    let native_debug = native_window.debug_info();
-    crate::commands::general::layout_debug_log(format!(
-      "ignored window focused handle={:?} title={:?} class={:?} z_order={:?}",
-      native_window.id(),
-      native_debug.title,
-      native_debug.class_name,
-      native_debug.z_order_index,
-    ));
+    if crate::commands::general::verbose_z_order_enabled() {
+      let native_debug = native_window.debug_info();
+      crate::commands::general::layout_debug_log(format!(
+        "ignored window focused handle={:?} title={:?} class={:?} z_order={:?}",
+        native_window.id(),
+        native_debug.title,
+        native_debug.class_name,
+        native_debug.z_order_index,
+      ));
+    }
     state.suspend_z_order_for_ignored_foreground(native_window);
     return Ok(());
   }
@@ -189,6 +191,7 @@ mod tests {
   }
 
   #[test]
+  #[allow(clippy::too_many_lines)]
   fn e2e_ignored_window_alt_tab_is_not_overridden_after_recent_unmanage() {
     let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
@@ -238,7 +241,7 @@ mod tests {
       None,
       NativeWindow::from_handle(2),
       test_properties("detached peer"),
-      WindowState::Floating(Default::default()),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
       RectDelta::zero(),
       None,

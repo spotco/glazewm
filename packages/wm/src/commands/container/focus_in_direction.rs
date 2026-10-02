@@ -49,6 +49,33 @@ pub fn focus_in_direction(
   if let Some(focus_target) = focus_target {
     set_focused_descendant(&focus_target, None);
     state.pending_sync.queue_focus_change().queue_cursor_jump();
+    // Queue layer reorder in the same platform_sync as SetForegroundWindow
+    // so tiling/floating directional focus does not briefly rely on
+    // per-window bring_to_front SWPs before the workspace chain apply.
+    if let Some(workspace) = focus_target.workspace() {
+      state
+        .pending_sync
+        .queue_workspace_to_reorder(workspace.clone());
+      // Super+arrow between normal floaters must promote ONLY the
+      // selected window (invariant). Mark as targeted so
+      // windows_to_bring_to_front does not raise every peer floater and
+      // so bring_to_front defers to reorder_focused_workspace_layers —
+      // matching the native floating focus path. Without this mark,
+      // focus_in_direction queued workspace reorder while defer still
+      // only covered tiling / focused_window_to_bring_to_front, so both
+      // applicators raced (3 floaters + tiles Super+Left/Right).
+      if let Ok(window) = focus_target.as_window_container() {
+        if matches!(
+          window.state(),
+          WindowState::Floating(config) if !config.shown_on_top
+        ) {
+          state.pending_sync.queue_focused_window_to_bring_to_front(
+            &workspace,
+            window.id(),
+          );
+        }
+      }
+    }
   }
 
   Ok(())
@@ -129,13 +156,15 @@ fn geometric_tiling_focus_target_in_workspace(
     .map(|(window, rect)| format!("{}={rect:?}", window.id()))
     .collect::<Vec<_>>()
     .join(", ");
-  layout_debug_log(format!(
-    "geometric focus: origin={} rect={origin_rect:?} dir={direction:?} candidates=[{candidate_summary}] target={}",
-    origin_id,
-    target_index
-      .and_then(|index| candidates.get(index))
-      .map_or_else(|| "none".into(), |window| window.id().to_string()),
-  ));
+  if crate::commands::general::verbose_z_order_enabled() {
+    layout_debug_log(format!(
+      "geometric focus: origin={} rect={origin_rect:?} dir={direction:?} candidates=[{candidate_summary}] target={}",
+      origin_id,
+      target_index
+        .and_then(|index| candidates.get(index))
+        .map_or_else(|| "none".into(), |window| window.id().to_string()),
+    ));
+  }
 
   Ok(
     target_index

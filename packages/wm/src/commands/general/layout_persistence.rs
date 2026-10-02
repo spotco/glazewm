@@ -11,7 +11,10 @@ use std::{
   io::Write,
   path::{Path, PathBuf},
   pin::Pin,
-  sync::Mutex,
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+  },
   time::{Duration, SystemTime},
 };
 
@@ -45,6 +48,30 @@ const LAYOUT_DEBUG_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Process-wide path for layout persistence debug logging (set at
 /// startup).
 static LAYOUT_DEBUG_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Config-driven verbose z-order / native-op diagnostics for `layout.log`.
+///
+/// Updated on startup and config reload from
+/// `general.verbose_z_order`. Env `GLAZEWM_VERBOSE_Z_ORDER=1` still forces
+/// on at read time.
+static VERBOSE_Z_ORDER_FROM_CONFIG: AtomicBool = AtomicBool::new(false);
+
+/// Sync the process-wide verbose flag from the parsed user config.
+pub fn set_verbose_z_order_from_config(enabled: bool) {
+  VERBOSE_Z_ORDER_FROM_CONFIG.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether verbose z-order / native-op layout.log lines are enabled.
+///
+/// True when `general.verbose_z_order` is set, or when env
+/// `GLAZEWM_VERBOSE_Z_ORDER=1` is present.
+#[must_use]
+pub fn verbose_z_order_enabled() -> bool {
+  if VERBOSE_Z_ORDER_FROM_CONFIG.load(Ordering::Relaxed) {
+    return true;
+  }
+  std::env::var("GLAZEWM_VERBOSE_Z_ORDER").ok().as_deref() == Some("1")
+}
 
 /// Resolve `layout.json` next to the active config file (same directory
 /// resolution as `UserConfig` / `%USERPROFILE%\.glzr\glazewm`).
@@ -565,6 +592,19 @@ mod tests {
       layout_snapshot_path_from_config_path(&config),
       PathBuf::from("/home/user/.glzr/glazewm/layout.json")
     );
+  }
+
+  #[test]
+  fn verbose_z_order_defaults_off_and_respects_config_flag() {
+    // Config flag alone must enable diagnostics. Env override is OR-ed at
+    // read time; skip mutating process env (unsafe on recent Rust).
+    let env_forced =
+      std::env::var("GLAZEWM_VERBOSE_Z_ORDER").ok().as_deref()
+        == Some("1");
+    set_verbose_z_order_from_config(true);
+    assert!(verbose_z_order_enabled());
+    set_verbose_z_order_from_config(false);
+    assert_eq!(verbose_z_order_enabled(), env_forced);
   }
 
   #[test]
