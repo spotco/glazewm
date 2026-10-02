@@ -52,9 +52,11 @@ pub struct IpcServer {
     mpsc::UnboundedSender<Message>,
     broadcast::Sender<()>,
   )>,
-  _event_rx: broadcast::Receiver<(SubscribableEvent, WmEvent)>,
+  #[allow(dead_code)]
+  event_rx: broadcast::Receiver<(SubscribableEvent, WmEvent)>,
   event_tx: broadcast::Sender<(SubscribableEvent, WmEvent)>,
-  _unsubscribe_rx: broadcast::Receiver<Uuid>,
+  #[allow(dead_code)]
+  unsubscribe_rx: broadcast::Receiver<Uuid>,
   unsubscribe_tx: broadcast::Sender<Uuid>,
 }
 
@@ -65,8 +67,8 @@ impl IpcServer {
   /// returned as a disabled server so startup can continue.
   pub async fn start(dispatcher: &Dispatcher) -> Self {
     let (message_tx, message_rx) = mpsc::unbounded_channel();
-    let (event_tx, _event_rx) = broadcast::channel(16);
-    let (unsubscribe_tx, _unsubscribe_rx) = broadcast::channel(16);
+    let (event_tx, event_rx) = broadcast::channel(16);
+    let (unsubscribe_tx, unsubscribe_rx) = broadcast::channel(16);
 
     let (server, server_addr) =
       match crate::ipc_conflict::bind_ipc_listener().await {
@@ -89,9 +91,9 @@ impl IpcServer {
           return Self::disabled(
             message_rx,
             event_tx,
-            _event_rx,
+            event_rx,
             unsubscribe_tx,
-            _unsubscribe_rx,
+            unsubscribe_rx,
           );
         }
       };
@@ -144,12 +146,12 @@ impl IpcServer {
       join_handle: Some(task),
       shutdown_tx: Some(shutdown_tx),
       #[allow(clippy::used_underscore_binding)]
-      _event_rx,
+      event_rx,
       event_tx,
       message_rx,
       unsubscribe_tx,
       #[allow(clippy::used_underscore_binding)]
-      _unsubscribe_rx,
+      unsubscribe_rx,
     }
   }
 
@@ -166,19 +168,19 @@ impl IpcServer {
       broadcast::Sender<()>,
     )>,
     event_tx: broadcast::Sender<(SubscribableEvent, WmEvent)>,
-    _event_rx: broadcast::Receiver<(SubscribableEvent, WmEvent)>,
+    event_rx: broadcast::Receiver<(SubscribableEvent, WmEvent)>,
     unsubscribe_tx: broadcast::Sender<Uuid>,
-    _unsubscribe_rx: broadcast::Receiver<Uuid>,
+    unsubscribe_rx: broadcast::Receiver<Uuid>,
   ) -> Self {
     Self {
       enabled: false,
       join_handle: None,
       shutdown_tx: None,
       message_rx,
-      _event_rx,
+      event_rx,
       event_tx,
       unsubscribe_tx,
-      _unsubscribe_rx,
+      unsubscribe_rx,
     }
   }
 

@@ -1921,9 +1921,8 @@ pub(crate) fn reorder_z_order(
             return;
           }
           match apply_z_order_chain(&recovery_ids) {
-            Ok(false) => return, // full chain placed; stop early
-            Ok(true) => {}       // still skipping; try later checkpoint
-            Err(_) => return,
+            Ok(true) => {} // still skipping; try later checkpoint
+            Ok(false) | Err(_) => return,
           }
         }
         loop {
@@ -1932,9 +1931,8 @@ pub(crate) fn reorder_z_order(
             return;
           }
           match apply_z_order_chain(&recovery_ids) {
-            Ok(false) => return,
             Ok(true) => {}
-            Err(_) => return,
+            Ok(false) | Err(_) => return,
           }
         }
       });
@@ -2098,8 +2096,7 @@ fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<bool> {
       }
     }
 
-    let insert_after =
-      last_responsive.map_or(HWND_TOP, |previous| HWND(previous));
+    let insert_after = last_responsive.map_or(HWND_TOP, HWND);
     unsafe {
       SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)?;
     }

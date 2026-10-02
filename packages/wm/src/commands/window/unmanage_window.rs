@@ -37,7 +37,7 @@ pub fn unmanage_window(
     native_debug.class_name,
     native_debug.owner_handle,
     window.state(),
-    focus_target.as_ref().map(|target| target.id()),
+    focus_target.as_ref().map(CommonGetters::id),
   ));
 
   detach_container(window.clone().into())?;

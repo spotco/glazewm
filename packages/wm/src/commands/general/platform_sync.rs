@@ -140,7 +140,7 @@ fn sync_focus(
 ///
 /// Tiling focus, targeted floating focus, and any focus that already
 /// queued `workspace_to_reorder` (including Super+arrow) rely on
-/// `reorder_focused_workspace_layers`. Skipping the legacy AfterWindow
+/// `reorder_focused_workspace_layers`. Skipping the legacy `AfterWindow`
 /// swarm prevents floaters from flashing between tiles / peer floaters
 /// under `SWP_ASYNCWINDOWPOS` (layout.log 2026-10-02 ~00:33 ET; floating
 /// Super+arrow dual-applicator race).
@@ -654,7 +654,7 @@ fn reorder_focused_workspace_layers_in_workspace(
           workspace_monitor_id == Some(monitor.id())
         })
     })
-    .map(|window| window.id())
+    .map(wm_platform::NativeWindow::id)
     .collect::<Vec<_>>();
 
   // Ignored windows are native detached windows from the z-order manager's
@@ -1215,9 +1215,9 @@ mod tests {
     // Bug B intent: even when the focused tile is a hung debug helper, the
     // *intended* chain remains tiles-then-floaters. Native apply must then
     // raise responsive peers without using the hung hwnd as an anchor.
-    let hung_helper = window(2168898, NormalZOrderLayer::Tiling);
-    let tile = window(265086, NormalZOrderLayer::Tiling);
-    let steam = window(330202, NormalZOrderLayer::Floating);
+    let hung_helper = window(2_168_898, NormalZOrderLayer::Tiling);
+    let tile = window(265_086, NormalZOrderLayer::Tiling);
+    let steam = window(330_202, NormalZOrderLayer::Floating);
 
     let previous = [steam.0, tile.0, hung_helper.0];
     assert_eq!(

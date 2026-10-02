@@ -36,6 +36,7 @@ use crate::{
 pub(crate) const DEFAULT_GLOBAL_TILING_DIRECTION: TilingDirection =
   TilingDirection::Horizontal;
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct WmState {
   /// Root node of the container tree. Monitors are the children of the
   /// root node, followed by workspaces, then split containers/windows.
@@ -749,10 +750,9 @@ impl WmState {
     if matches!(removed_window.state(), WindowState::Floating(_)) {
       let previous_focus =
         descendant_focus_order.iter().find(|descendant| {
-          descendant
-            .as_window_container()
-            .map(|window| window.state() != WindowState::Minimized)
-            .unwrap_or(true)
+          descendant.as_window_container().map_or(true, |window| {
+            window.state() != WindowState::Minimized
+          })
         });
       return previous_focus
         .cloned()
@@ -833,7 +833,7 @@ impl WmState {
 
     self.ignored_native_foreground = Some(window_id);
     self.pending_sync.cancel_foreground_assertions();
-    self.invalidate_pending_z_order_retries();
+    Self::invalidate_pending_z_order_retries();
     // Promote after cancelling stale work, so the saved chain matches
     // the window the user just Alt-Tabbed to.
     crate::commands::general::promote_ignored_window(self, native_window);
@@ -896,7 +896,7 @@ impl WmState {
       let dropped_foreground_work =
         self.pending_sync.has_foreground_assertions();
       self.pending_sync.cancel_foreground_assertions();
-      self.invalidate_pending_z_order_retries();
+      Self::invalidate_pending_z_order_retries();
       if dropped_foreground_work
         && crate::commands::general::verbose_z_order_enabled()
       {
@@ -911,7 +911,7 @@ impl WmState {
   }
 
   /// Bumps the Windows z-order generation so delayed retries abort.
-  fn invalidate_pending_z_order_retries(&self) {
+  fn invalidate_pending_z_order_retries() {
     #[cfg(target_os = "windows")]
     {
       let _ = wm_platform::begin_z_order_batch();
@@ -1106,7 +1106,7 @@ mod tests {
       None,
       NativeWindow::from_handle(3),
       test_properties("owned popup"),
-      WindowState::Floating(Default::default()),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
       RectDelta::zero(),
       None,
@@ -1119,7 +1119,7 @@ mod tests {
       None,
       NativeWindow::from_handle(2),
       test_properties("detached peer"),
-      WindowState::Floating(Default::default()),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
       RectDelta::zero(),
       None,
@@ -1198,7 +1198,7 @@ mod tests {
       None,
       NativeWindow::from_handle(2),
       test_properties("devenv"),
-      WindowState::Floating(Default::default()),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
       RectDelta::zero(),
       None,
@@ -1211,7 +1211,7 @@ mod tests {
       None,
       NativeWindow::from_handle(3),
       test_properties("p4merge"),
-      WindowState::Floating(Default::default()),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
       RectDelta::zero(),
       None,
@@ -1255,8 +1255,8 @@ mod tests {
     let mut state = WmState::new(dispatcher, event_tx, exit_tx);
     state
       .ignored_windows
-      .push(NativeWindow::from_handle(2688654));
-    state.ignored_native_foreground = Some(WindowId(2688654));
+      .push(NativeWindow::from_handle(2_688_654));
+    state.ignored_native_foreground = Some(WindowId(2_688_654));
     state.startup_z_order_pending = true;
 
     assert!(!state.ignored_foreground_suspends_z_order());

@@ -191,6 +191,7 @@ mod tests {
   }
 
   #[test]
+  #[allow(clippy::too_many_lines)]
   fn e2e_ignored_window_alt_tab_is_not_overridden_after_recent_unmanage() {
     let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
@@ -240,7 +241,7 @@ mod tests {
       None,
       NativeWindow::from_handle(2),
       test_properties("detached peer"),
-      WindowState::Floating(Default::default()),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
       RectDelta::zero(),
       None,
