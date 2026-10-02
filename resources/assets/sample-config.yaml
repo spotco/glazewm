@@ -4,7 +4,7 @@ general:
   # Example: The below command launches Zebar.
   # Launch the spotcobuild bar with the global tiling-direction chip
   startup_commands:
-    - 'shell-exec zebar start-widget-preset --pack spotco.tokyo-silence --widget-name bar --preset default'
+    - 'shell-exec zebar start-widget-preset --pack spotcobuild-zebar-theme --widget-name bar --preset default'
 
 
   # Kill Zebar on WM exit so restart leaves a clean bar process.
@@ -146,6 +146,8 @@ window_rules:
       - window_process: { equals: 'ccollabgui' }
       - window_process: { equals: 'CreationKit' }
       - window_process: { equals: 'PowerToys' }
+      - window_process: { equals: 'steam' }
+      - window_process: { equals: 'steamwebhelper' }
       
   - commands: ['ignore']
     match:
@@ -154,6 +156,9 @@ window_rules:
 
       # Ignore Final Fantasy XIV.
       - window_process: { equals: 'ffxiv_dx11' }
+
+      # Ignore Crimson Desert.
+      - window_process: { equals: 'CrimsonDesert' }
 
       # Ignores picture-in-picture windows for browsers.
       - window_title: { regex: '[Pp]icture.in.[Pp]icture' }
