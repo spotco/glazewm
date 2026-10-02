@@ -304,6 +304,14 @@ fn redraw_containers(
     //
     // NOTE: macOS doesn't have a robust public API for setting the z-order
     // of a window. See `NativeWindow::raise` for more details.
+    //
+    // On Windows, skip per-window bring_to_front `set_z_order` when a
+    // workspace layer reorder will own the outcome. `AfterWindow(focused)`
+    // under `SWP_ASYNCWINDOWPOS` races `SetForegroundWindow` and
+    // `reorder_z_order`, leaving detached windows between tiles (confirmed
+    // layout.log 2026-10-02 ~00:33 ET). Targeted floating focus already
+    // skipped this path; tiling group promotion must skip too. Geometry
+    // redraws still pass `z_order` through `reposition_window`.
     #[cfg(target_os = "windows")]
     if !preserve_z_order
       && should_bring_to_front
@@ -314,7 +322,33 @@ fn redraw_containers(
         .focused_window_to_bring_to_front(&workspace)
         .is_some_and(|window_id| window_id == window.id());
 
-      if !has_targeted_floating_focus {
+      let focused_is_tiling = workspace
+        .descendant_focus_order()
+        .next()
+        .and_then(|container| container.as_window_container().ok())
+        .is_some_and(|focused| {
+          matches!(focused.state(), WindowState::Tiling)
+        });
+
+      // Defer to `reorder_focused_workspace_layers` for tiling groups and
+      // targeted detached focus. Legacy non-targeted floating group raise
+      // still uses set_z_order.
+      let defer_to_workspace_reorder =
+        has_targeted_floating_focus || focused_is_tiling;
+
+      if defer_to_workspace_reorder {
+        if verbose_z_order_enabled() {
+          let reason = if has_targeted_floating_focus {
+            "targeted_floating"
+          } else {
+            "tiling_group_defer_workspace_reorder"
+          };
+          crate::commands::general::layout_debug_log(format!(
+            "verbose z-order skip bring_to_front hwnd={:?} z_order={z_order:?} reason={reason}",
+            window.native().id(),
+          ));
+        }
+      } else {
         if verbose_z_order_enabled() {
           tracing::info!("Updating window z-order: {window}");
           crate::commands::general::layout_debug_log(format!(

@@ -49,6 +49,12 @@ pub fn focus_in_direction(
   if let Some(focus_target) = focus_target {
     set_focused_descendant(&focus_target, None);
     state.pending_sync.queue_focus_change().queue_cursor_jump();
+    // Queue layer reorder in the same platform_sync as SetForegroundWindow
+    // so tiling focus does not briefly rely on per-window bring_to_front
+    // SWPs before the workspace chain apply runs.
+    if let Some(workspace) = focus_target.workspace() {
+      state.pending_sync.queue_workspace_to_reorder(workspace);
+    }
   }
 
   Ok(())
