@@ -687,8 +687,7 @@ fn reorder_focused_workspace_layers_in_workspace(
   state.set_normal_z_order_for_workspace(workspace.id(), window_ids);
   let native_window_ids = state
     .normal_z_order_for_workspace(workspace.id())
-    .map(<[WindowId]>::to_vec)
-    .unwrap_or_default();
+    .map_or_default(<[WindowId]>::to_vec);
 
   if verbose_z_order_enabled() {
     crate::commands::general::layout_debug_log(format!(
