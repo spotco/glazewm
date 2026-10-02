@@ -1866,11 +1866,11 @@ pub(crate) fn sample_z_order_ranks(
 
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
-/// The first window is placed at the top of the normal z-order. Each
-/// subsequent window is placed immediately after the previous one. Native
-/// requests are asynchronous so a suspended foreign GUI thread cannot
-/// block the WM loop; the generation-aware retry reconciles ordering after
-/// the target threads process their queued requests.
+/// The first *responsive* window is placed at the top of the normal
+/// z-order. Each subsequent responsive window is placed immediately after
+/// the previous responsive one. Hung / non-pumping hwnds are skipped so they
+/// cannot block the WM loop or anchor peers below floaters. A generation-
+/// aware retry still re-applies after focus settles.
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -1917,9 +1917,76 @@ fn current_or_new_z_order_generation() -> u64 {
   }
 }
 
+
+/// Whether `hwnd` can accept a synchronous z-order change without blocking.
+///
+/// Same-thread windows are treated as responsive. Cross-thread targets must
+/// answer `WM_NULL` within [`FOREIGN_GUI_PROBE_TIMEOUT_MS`]. Hung / debugger
+/// suspended helpers fail this probe and must be skipped by the chain apply.
+fn hwnd_gui_responsive(hwnd: HWND) -> bool {
+  if !unsafe { IsWindow(hwnd) }.as_bool() {
+    return false;
+  }
+
+  let mut process_id = 0u32;
+  let thread_id =
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+  if thread_id == 0 {
+    return false;
+  }
+  if thread_id == unsafe { GetCurrentThreadId() } {
+    return true;
+  }
+
+  let mut result = 0usize;
+  let returned = unsafe {
+    SendMessageTimeoutW(
+      hwnd,
+      WM_NULL,
+      WPARAM(0),
+      LPARAM(0),
+      SMTO_ABORTIFHUNG | SMTO_NORMAL,
+      FOREIGN_GUI_PROBE_TIMEOUT_MS,
+      Some(&raw mut result),
+    )
+  };
+  returned.0 != 0
+}
+
+/// Planned insert-after target for one responsive window in a chain.
+///
+/// `None` means `HWND_TOP`. Hung predecessors are skipped so a non-pumping
+/// focused tile cannot anchor responsive peers below floaters.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZOrderInsertAfter {
+  Top,
+  After(WindowId),
+}
+
+/// Resolves insert-after for `index`, skipping non-responsive predecessors.
+#[cfg(test)]
+fn planned_insert_after(
+  window_ids: &[WindowId],
+  responsive: &[bool],
+  index: usize,
+) -> ZOrderInsertAfter {
+  debug_assert_eq!(window_ids.len(), responsive.len());
+  for previous in (0..index).rev() {
+    if responsive[previous] {
+      return ZOrderInsertAfter::After(window_ids[previous]);
+    }
+  }
+  ZOrderInsertAfter::Top
+}
+
 fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
-  // Always use asynchronous cross-thread requests. A debugger-suspended or
-  // otherwise hung target GUI thread must not block GlazeWM's event loop.
+  // Keep SWP_ASYNCWINDOWPOS so a slow-but-pumping foreign queue (or a hung
+  // helper) cannot block the WM loop. Hung / non-pumping hwnds are skipped
+  // as placement targets *and* as insert-after anchors so responsive tiles
+  // still rise to HWND_TOP above floaters (layout.log hung helper 2168898).
+  // Only clear TOPMOST when present — unconditional HWND_NOTOPMOST raises
+  // normal floaters and races the follow-up insert_after under ASYNC.
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
@@ -1927,19 +1994,30 @@ fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<()> {
     | SWP_ASYNCWINDOWPOS
     | SWP_NOOWNERZORDER;
 
-  for (index, window_id) in window_ids.iter().enumerate() {
-    let insert_after = index
-      .checked_sub(1)
-      .and_then(|previous| window_ids.get(previous))
-      .map_or(HWND_TOP, |previous| HWND(previous.0));
+  let mut last_responsive: Option<isize> = None;
 
-    // HWND_TOP does not clear TOPMOST. Drop that bit, then immediately
-    // place the window. HWND_NOTOPMOST alone would leave it above every
-    // non-topmost window, which is the wrong band for an ignored window.
-    unsafe {
-      SetWindowPos(HWND(window_id.0), HWND_NOTOPMOST, 0, 0, 0, 0, flags)?;
-      SetWindowPos(HWND(window_id.0), insert_after, 0, 0, 0, 0, flags)?;
+  for window_id in window_ids {
+    let hwnd = HWND(window_id.0);
+    if !hwnd_gui_responsive(hwnd) {
+      continue;
     }
+
+    #[allow(clippy::cast_possible_wrap)]
+    let is_topmost = (unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
+      & WS_EX_TOPMOST.0 as isize)
+      != 0;
+    if is_topmost {
+      unsafe {
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)?;
+      }
+    }
+
+    let insert_after =
+      last_responsive.map_or(HWND_TOP, |previous| HWND(previous));
+    unsafe {
+      SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)?;
+    }
+    last_responsive = Some(window_id.0);
   }
 
   Ok(())
@@ -2776,7 +2854,125 @@ mod reorder_z_order_tests {
     );
   }
 
-  fn assert_foreign_z_order_call_is_bounded(mode: &str) {
+
+  #[test]
+  fn planned_insert_after_skips_hung_predecessors() {
+    let hung = WindowId(1);
+    let tile = WindowId(2);
+    let floater = WindowId(3);
+    let chain = [hung, tile, floater];
+    let responsive = [false, true, true];
+
+    assert_eq!(
+      super::planned_insert_after(&chain, &responsive, 0),
+      super::ZOrderInsertAfter::Top
+    );
+    assert_eq!(
+      super::planned_insert_after(&chain, &responsive, 1),
+      super::ZOrderInsertAfter::Top,
+      "first responsive after hung focused tile must rise to HWND_TOP"
+    );
+    assert_eq!(
+      super::planned_insert_after(&chain, &responsive, 2),
+      super::ZOrderInsertAfter::After(tile)
+    );
+  }
+
+  #[test]
+  fn reorder_z_order_raises_responsive_tiles_above_floaters_when_focused_tile_is_hung()
+  {
+    use std::time::Duration;
+
+    // Cross-process layout matching layout.log hung helper @ 05:02Z:
+    // hung tiled focus + responsive tile peer + foreign floater (Steam).
+    let current_exe = std::env::current_exe().expect("test executable");
+    let mut hung_helper = std::process::Command::new(&current_exe)
+      .env("GLAZEWM_Z_ORDER_HELPER", "window")
+      .arg("z_order_test_helper_window")
+      .arg("--nocapture")
+      .stdout(std::process::Stdio::piped())
+      .spawn()
+      .expect("spawn hung helper");
+    let hung = read_helper_hwnd(&mut hung_helper, "GLAZEWM_Z_ORDER_HWND:");
+
+    let (mut tile_helper, tile) =
+      spawn_single_pumping_window_helper(false, 0);
+    let (mut floater_helper, floater) =
+      spawn_single_pumping_window_helper(false, 0);
+
+    // Steam-on-top starting shape.
+    let initial = [floater.0, tile.0, hung.0];
+    reorder_z_order(&[
+      WindowId(floater.0),
+      WindowId(tile.0),
+      WindowId(hung.0),
+    ])
+    .expect("seed floater-on-top order");
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Super+arrow onto hung tiled helper.
+    let intended = [hung.0, tile.0, floater.0];
+    reorder_z_order(&[
+      WindowId(hung.0),
+      WindowId(tile.0),
+      WindowId(floater.0),
+    ])
+    .expect("reorder with hung focused tile");
+
+    // Fixed apply skips the hung hwnd as an anchor and avoids raising
+    // floaters via HWND_NOTOPMOST, so the responsive tile reaches HWND_TOP
+    // without waiting on the 10ms retry. Allow a short foreign-queue drain
+    // (well under the old +25ms failure window).
+    use std::time::Instant;
+    let deadline = Instant::now() + Duration::from_millis(40);
+    let mut order = relative_order(&[hung, tile, floater]);
+    let mut tile_above_floater = false;
+    while Instant::now() < deadline {
+      order = relative_order(&[hung, tile, floater]);
+      tile_above_floater = order
+        .iter()
+        .position(|id| *id == tile.0)
+        .zip(order.iter().position(|id| *id == floater.0))
+        .is_some_and(|(t, f)| t < f);
+      if tile_above_floater {
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let _ = hung_helper.kill();
+    let _ = hung_helper.wait();
+    let _ = tile_helper.kill();
+    let _ = tile_helper.wait();
+    let _ = floater_helper.kill();
+    let _ = floater_helper.wait();
+
+    assert!(
+      tile_above_floater,
+      "responsive foreign tile must rise above foreign floater when focused        tile is hung (no 10ms/25ms race); initial={initial:?}        intended={intended:?} actual={order:?}"
+    );
+  }
+
+  fn read_helper_hwnd(
+    helper: &mut std::process::Child,
+    prefix: &str,
+  ) -> HWND {
+    use std::io::{BufRead, BufReader};
+
+    let stdout = helper.stdout.take().expect("helper stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+      let line = lines
+        .next()
+        .expect("helper HWND line")
+        .expect("read helper HWND line");
+      if let Some(hwnd) = line.strip_prefix(prefix) {
+        return HWND(hwnd.parse::<isize>().expect("parse helper HWND"));
+      }
+    }
+  }
+
+    fn assert_foreign_z_order_call_is_bounded(mode: &str) {
     use std::{
       io::{BufRead, BufReader},
       process::{Command, Stdio},

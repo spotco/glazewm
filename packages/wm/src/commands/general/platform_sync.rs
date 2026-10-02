@@ -136,6 +136,22 @@ fn sync_focus(
   Ok(())
 }
 
+
+/// Whether per-window `bring_to_front` `set_z_order` must defer to the
+/// workspace layer chain apply.
+///
+/// Tiling focus and targeted floating focus both rely on
+/// `reorder_focused_workspace_layers`. Skipping the legacy AfterWindow
+/// swarm prevents floaters from flashing between tiles under
+/// `SWP_ASYNCWINDOWPOS` (layout.log 2026-10-02 ~00:33 ET).
+#[cfg(target_os = "windows")]
+fn should_defer_bring_to_front_to_workspace_reorder(
+  has_targeted_floating_focus: bool,
+  focused_is_tiling: bool,
+) -> bool {
+  has_targeted_floating_focus || focused_is_tiling
+}
+
 /// Finds windows that should be brought to the top of their workspace's
 /// z-order.
 ///
@@ -334,7 +350,10 @@ fn redraw_containers(
       // targeted detached focus. Legacy non-targeted floating group raise
       // still uses set_z_order.
       let defer_to_workspace_reorder =
-        has_targeted_floating_focus || focused_is_tiling;
+        should_defer_bring_to_front_to_workspace_reorder(
+          has_targeted_floating_focus,
+          focused_is_tiling,
+        );
 
       if defer_to_workspace_reorder {
         if verbose_z_order_enabled() {
@@ -1077,6 +1096,80 @@ mod tests {
         Some(&[t1.0, t2.0, d1.0, d2.0]),
       ),
       Some(vec![d1.0, t1.0, t2.0, d2.0])
+    );
+  }
+
+  #[test]
+  fn tiling_focus_defers_bring_to_front_to_workspace_reorder() {
+    assert!(should_defer_bring_to_front_to_workspace_reorder(
+      false, true
+    ));
+    assert!(
+      should_defer_bring_to_front_to_workspace_reorder(true, false),
+      "targeted floating also defers"
+    );
+    assert!(
+      !should_defer_bring_to_front_to_workspace_reorder(false, false),
+      "legacy non-targeted floating group raise still uses set_z_order"
+    );
+  }
+
+  #[test]
+  fn tiling_focus_chain_keeps_floaters_below_contiguous_tiles() {
+    // Bug A regression: Super+arrow tiling focus must not leave floaters
+    // between tiles. The chain builder places the whole tiled group first.
+    let tile_a = window(10, NormalZOrderLayer::Tiling);
+    let tile_b = window(11, NormalZOrderLayer::Tiling);
+    let tile_c = window(12, NormalZOrderLayer::Tiling);
+    let steam = window(20, NormalZOrderLayer::Floating);
+    let grok = window(21, NormalZOrderLayer::Floating);
+
+    let previous = [steam.0, tile_a.0, grok.0, tile_b.0, tile_c.0];
+    let chain = normal_z_order_chain(
+      vec![tile_b, tile_a, tile_c, steam, grok],
+      tile_b.0,
+      Some(&previous),
+    )
+    .expect("tiling focus chain");
+
+    assert_eq!(
+      &chain[..3],
+      &[tile_b.0, tile_a.0, tile_c.0],
+      "tiled block must be contiguous at the front"
+    );
+    assert!(
+      chain[3..].iter().all(|id| *id == steam.0 || *id == grok.0),
+      "floaters must stay below the tiled block: {chain:?}"
+    );
+    assert!(
+      !chain.windows(3).any(|w| {
+        let is_tile = |id: WindowId| {
+          id == tile_a.0 || id == tile_b.0 || id == tile_c.0
+        };
+        let is_floater = |id: WindowId| id == steam.0 || id == grok.0;
+        is_tile(w[0]) && is_floater(w[1]) && is_tile(w[2])
+      }),
+      "no floater may sit between tiles: {chain:?}"
+    );
+  }
+
+  #[test]
+  fn hung_focused_tile_chain_still_intends_tiles_then_floaters() {
+    // Bug B intent: even when the focused tile is a hung debug helper, the
+    // *intended* chain remains tiles-then-floaters. Native apply must then
+    // raise responsive peers without using the hung hwnd as an anchor.
+    let hung_helper = window(2168898, NormalZOrderLayer::Tiling);
+    let tile = window(265086, NormalZOrderLayer::Tiling);
+    let steam = window(330202, NormalZOrderLayer::Floating);
+
+    let previous = [steam.0, tile.0, hung_helper.0];
+    assert_eq!(
+      normal_z_order_chain(
+        vec![hung_helper, tile, steam],
+        hung_helper.0,
+        Some(&previous),
+      ),
+      Some(vec![hung_helper.0, tile.0, steam.0])
     );
   }
 }
