@@ -96,6 +96,12 @@ pub struct GeneralConfig {
 
   /// Affects which windows get shown in the native Windows taskbar.
   pub show_all_in_taskbar: bool,
+
+  /// When true, append detailed z-order / native-op diagnostics to
+  /// `layout.log` (rotated at 2 MiB). Off by default. Env override:
+  /// `GLAZEWM_VERBOSE_Z_ORDER=1` forces on regardless of this setting.
+  #[serde(default)]
+  pub verbose_z_order: bool,
 }
 
 impl Default for GeneralConfig {
@@ -118,6 +124,7 @@ impl Default for GeneralConfig {
         }
       },
       show_all_in_taskbar: false,
+      verbose_z_order: false,
     }
   }
 }

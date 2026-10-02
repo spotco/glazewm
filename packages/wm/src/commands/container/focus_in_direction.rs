@@ -129,13 +129,15 @@ fn geometric_tiling_focus_target_in_workspace(
     .map(|(window, rect)| format!("{}={rect:?}", window.id()))
     .collect::<Vec<_>>()
     .join(", ");
-  layout_debug_log(format!(
-    "geometric focus: origin={} rect={origin_rect:?} dir={direction:?} candidates=[{candidate_summary}] target={}",
-    origin_id,
-    target_index
-      .and_then(|index| candidates.get(index))
-      .map_or_else(|| "none".into(), |window| window.id().to_string()),
-  ));
+  if crate::commands::general::verbose_z_order_enabled() {
+    layout_debug_log(format!(
+      "geometric focus: origin={} rect={origin_rect:?} dir={direction:?} candidates=[{candidate_summary}] target={}",
+      origin_id,
+      target_index
+        .and_then(|index| candidates.get(index))
+        .map_or_else(|| "none".into(), |window| window.id().to_string()),
+    ));
+  }
 
   Ok(
     target_index

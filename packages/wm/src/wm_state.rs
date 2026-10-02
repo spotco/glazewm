@@ -838,7 +838,9 @@ impl WmState {
     // the window the user just Alt-Tabbed to.
     crate::commands::general::promote_ignored_window(self, native_window);
 
-    if dropped_foreground_work {
+    if dropped_foreground_work
+      && crate::commands::general::verbose_z_order_enabled()
+    {
       crate::commands::general::layout_debug_log(format!(
         "ignored foreground suspended z-order handle={window_id:?}"
       ));
@@ -879,7 +881,9 @@ impl WmState {
         foreground.is_desktop_window().unwrap_or(false);
 
       if foreground_is_managed || foreground_is_desktop {
-        if self.ignored_native_foreground.take().is_some() {
+        if self.ignored_native_foreground.take().is_some()
+          && crate::commands::general::verbose_z_order_enabled()
+        {
           crate::commands::general::layout_debug_log(
             "ignored foreground suspension cleared by native focus",
           );
@@ -893,7 +897,9 @@ impl WmState {
         self.pending_sync.has_foreground_assertions();
       self.pending_sync.cancel_foreground_assertions();
       self.invalidate_pending_z_order_retries();
-      if dropped_foreground_work {
+      if dropped_foreground_work
+        && crate::commands::general::verbose_z_order_enabled()
+      {
         crate::commands::general::layout_debug_log(
           "skipped z-order reconcile while ignored window owns native foreground",
         );

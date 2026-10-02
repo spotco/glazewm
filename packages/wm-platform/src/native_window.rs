@@ -105,6 +105,15 @@ pub fn reorder_z_order(window_ids: &[WindowId]) -> crate::Result<()> {
   platform_impl::reorder_z_order(window_ids)
 }
 
+/// Samples native top-to-bottom z-order ranks for the given window IDs.
+///
+/// Used by optional verbose diagnostics (`GLAZEWM_VERBOSE_Z_ORDER=1`).
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn sample_z_order_ranks(window_ids: &[WindowId]) -> Vec<(WindowId, u32)> {
+  platform_impl::sample_z_order_ranks(window_ids)
+}
+
 /// Starts one generation for a logical z-order reconciliation batch.
 #[cfg(target_os = "windows")]
 #[must_use]

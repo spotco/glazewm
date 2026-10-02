@@ -26,6 +26,9 @@ pub fn reload_config(
 
   // Re-evaluate user config file and set its values in state.
   config.reload()?;
+  super::set_verbose_z_order_from_config(
+    config.value.general.verbose_z_order,
+  );
 
   // Re-run window rules on all active windows.
   for window in state.windows() {

@@ -10,12 +10,16 @@ use wm_platform::begin_z_order_batch;
 #[cfg(target_os = "windows")]
 use wm_platform::reorder_z_order;
 #[cfg(target_os = "windows")]
+use wm_platform::sample_z_order_ranks;
+#[cfg(target_os = "windows")]
 use wm_platform::SWP_NOZORDER;
 #[cfg(target_os = "windows")]
 use wm_platform::{CornerStyle, OpacityValue};
 #[cfg(target_os = "windows")]
 use wm_platform::{NativeWindowWindowsExt, WindowId};
 use wm_platform::{Rect, WindowZOrder};
+
+use super::verbose_z_order_enabled;
 
 use crate::{
   models::{Container, WindowContainer, Workspace},
@@ -101,10 +105,23 @@ fn sync_focus(
   // In either case, a `PlatformEvent::WindowFocused` event is subsequently
   // triggered.
   let result = if let Some(window) = native_window {
-    tracing::info!("Setting focus to window: {window}");
+    if verbose_z_order_enabled() {
+      tracing::info!("Setting focus to window: {window}");
+      #[cfg(target_os = "windows")]
+      crate::commands::general::layout_debug_log(format!(
+        "verbose z-order SetForegroundWindow hwnd={:?}",
+        window.native().id(),
+      ));
+    } else {
+      tracing::debug!("Setting focus to window: {window}");
+    }
     window.native().focus()
   } else {
-    tracing::info!("Setting focus to the desktop window.");
+    if verbose_z_order_enabled() {
+      tracing::info!("Setting focus to the desktop window.");
+    } else {
+      tracing::debug!("Setting focus to the desktop window.");
+    }
     state.dispatcher.reset_focus()
   };
 
@@ -298,7 +315,15 @@ fn redraw_containers(
         .is_some_and(|window_id| window_id == window.id());
 
       if !has_targeted_floating_focus {
-        tracing::info!("Updating window z-order: {window}");
+        if verbose_z_order_enabled() {
+          tracing::info!("Updating window z-order: {window}");
+          crate::commands::general::layout_debug_log(format!(
+            "verbose z-order bring_to_front hwnd={:?} z_order={z_order:?}",
+            window.native().id(),
+          ));
+        } else {
+          tracing::debug!("Updating window z-order: {window}");
+        }
 
         if let Err(err) = window.native().set_z_order(&z_order) {
           tracing::warn!("Failed to set window z-order: {}", err);
@@ -393,6 +418,55 @@ fn redraw_containers(
   }
 
   Ok(())
+}
+
+
+
+#[cfg(target_os = "windows")]
+fn log_verbose_native_z_order(label: &str, intended: &[WindowId]) {
+  if !verbose_z_order_enabled() || intended.is_empty() {
+    return;
+  }
+
+  let mut ranks = sample_z_order_ranks(intended);
+  ranks.sort_by_key(|(_, rank)| *rank);
+  let native_order: Vec<WindowId> =
+    ranks.iter().map(|(window_id, _)| *window_id).collect();
+  let native_top_to_bottom = ranks
+    .iter()
+    .map(|(window_id, rank)| format!("{window_id:?}@{rank}"))
+    .collect::<Vec<_>>()
+    .join(", ");
+  let rank_by_id: std::collections::HashMap<WindowId, u32> =
+    ranks.iter().copied().collect();
+  let intended_ranks = intended
+    .iter()
+    .map(|window_id| {
+      rank_by_id.get(window_id).map_or_else(
+        || format!("{window_id:?}=?"),
+        |rank| format!("{window_id:?}@{rank}"),
+      )
+    })
+    .collect::<Vec<_>>()
+    .join(", ");
+  let sorted_ok = native_order == intended;
+
+  crate::commands::general::layout_debug_log(format!(
+    "verbose z-order {label}: match_intended={sorted_ok} native_top_to_bottom=[{native_top_to_bottom}] intended_ranks=[{intended_ranks}]"
+  ));
+}
+
+#[cfg(target_os = "windows")]
+fn schedule_verbose_z_order_recheck(label: String, intended: Vec<WindowId>) {
+  if !verbose_z_order_enabled() || intended.is_empty() {
+    return;
+  }
+  if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+    runtime.spawn(async move {
+      tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+      log_verbose_native_z_order(&format!("{label}+25ms"), &intended);
+    });
+  }
 }
 
 /// Restores the normal floating/tiling layers after a focus or state
@@ -549,18 +623,29 @@ fn reorder_focused_workspace_layers_in_workspace(
     .map(<[WindowId]>::to_vec)
     .unwrap_or_default();
 
-  crate::commands::general::layout_debug_log(format!(
-    "normal z reconcile workspace={:?} focused={:?} layer={:?} chain={:?}",
-    workspace.id(),
-    focused_window_id,
-    focused_layer,
-    native_window_ids,
-  ));
+  if verbose_z_order_enabled() {
+    crate::commands::general::layout_debug_log(format!(
+      "normal z reconcile workspace={:?} focused={:?} layer={:?} chain={:?}",
+      workspace.id(),
+      focused_window_id,
+      focused_layer,
+      native_window_ids,
+    ));
+    log_verbose_native_z_order("pre-reorder", &native_window_ids);
+  }
 
   if let Err(err) = reorder_z_order(&native_window_ids) {
     tracing::warn!(
       "Failed to reorder focused workspace window layers: {}",
       err
+    );
+  }
+
+  if verbose_z_order_enabled() {
+    log_verbose_native_z_order("post-reorder", &native_window_ids);
+    schedule_verbose_z_order_recheck(
+      "post-reorder".into(),
+      native_window_ids.clone(),
     );
   }
 }

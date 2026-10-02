@@ -1824,6 +1824,46 @@ pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
   }
 }
 
+/// Returns top-to-bottom z-order ranks for the requested window IDs.
+///
+/// Rank 0 is closest to the top of the desktop among currently enumerated
+/// top-level windows. Missing HWNDs are omitted. Used by verbose z-order
+/// diagnostics (`GLAZEWM_VERBOSE_Z_ORDER=1`).
+pub(crate) fn sample_z_order_ranks(
+  window_ids: &[WindowId],
+) -> Vec<(WindowId, u32)> {
+  if window_ids.is_empty() {
+    return Vec::new();
+  }
+
+  let wanted: HashSet<isize> =
+    window_ids.iter().map(|window_id| window_id.0).collect();
+  let mut handles: Vec<isize> = Vec::new();
+
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn sample_proc(handle: HWND, data: LPARAM) -> BOOL {
+    let handles = data.0 as *mut Vec<isize>;
+    unsafe { (*handles).push(handle.0) };
+    true.into()
+  }
+
+  let _ = unsafe {
+    EnumWindows(
+      Some(sample_proc),
+      LPARAM(std::ptr::from_mut(&mut handles) as _),
+    )
+  };
+
+  let mut ranks = Vec::new();
+  for (index, handle) in handles.into_iter().enumerate() {
+    if wanted.contains(&handle) {
+      #[allow(clippy::cast_possible_truncation)]
+      ranks.push((WindowId(handle), index as u32));
+    }
+  }
+  ranks
+}
+
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
 /// The first window is placed at the top of the normal z-order. Each

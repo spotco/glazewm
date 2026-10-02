@@ -34,6 +34,7 @@ use crate::{
     layout_debug_log_path, layout_snapshot_path, load_layout_snapshot,
     pick_layout_snapshot_path, platform_sync, read_layout_snapshot_file,
     save_layout_snapshot_with_dialog, set_layout_debug_log_path,
+    set_verbose_z_order_from_config, verbose_z_order_enabled,
     show_desktop, try_load_persisted_layout_snapshot,
     wm_event_affects_layout_snapshot, LayoutAutoSave,
   },
@@ -139,6 +140,7 @@ async fn start_wm(
   let layout_path = layout_snapshot_path(&config);
   let layout_log_path = layout_debug_log_path(&config);
   set_layout_debug_log_path(layout_log_path.clone());
+  set_verbose_z_order_from_config(config.value.general.verbose_z_order);
   #[cfg(target_os = "windows")]
   wm_platform::set_native_op_logger(log_native_op_to_layout_log);
   tracing::info!(
@@ -152,6 +154,12 @@ async fn start_wm(
   startup_log(format!(
     "startup: layout log -> {}",
     layout_log_path.display()
+  ));
+  startup_log(format!(
+    "startup: verbose_z_order={} (config={}, env_override={})",
+    verbose_z_order_enabled(),
+    config.value.general.verbose_z_order,
+    std::env::var("GLAZEWM_VERBOSE_Z_ORDER").ok().as_deref() == Some("1"),
   ));
 
   #[cfg(target_os = "windows")]
@@ -606,7 +614,9 @@ async fn start_wm(
 /// Writes one native-operation timing line to `layout.log`.
 #[cfg(target_os = "windows")]
 fn log_native_op_to_layout_log(message: &str) {
-  crate::commands::general::layout_debug_log(message);
+  if verbose_z_order_enabled() {
+    crate::commands::general::layout_debug_log(message);
+  }
 }
 
 /// Writes one startup step to tracing and `layout.log`.
