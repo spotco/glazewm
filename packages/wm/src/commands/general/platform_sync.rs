@@ -542,8 +542,8 @@ fn schedule_verbose_z_order_recheck(
 /// Normal detached windows are individual z-order items. Tiled windows are
 /// treated as one z-order group. Focusing a detached window promotes that
 /// window and its managed Win32 owner group (owned above owner); unrelated
-/// detached peers keep their position relative to the tiled block. Focusing
-/// a tiled window promotes the complete tiled group.
+/// detached peers keep their position relative to the tiled block.
+/// Focusing a tiled window promotes the complete tiled group.
 ///
 /// When a focused tiled window is detached, the newly detached window is
 /// promoted while the remaining tiled group keeps its position relative to
@@ -614,6 +614,7 @@ pub fn promote_ignored_window(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_lines)]
 fn reorder_focused_workspace_layers_in_workspace(
   workspace: &Workspace,
   focused_window_id: WindowId,
@@ -735,8 +736,9 @@ fn reorder_focused_workspace_layers_in_workspace(
     }
   }
 
-  let owner_of =
-    |id: WindowId| -> Option<WindowId> { owner_by_window.get(&id).copied() };
+  let owner_of = |id: WindowId| -> Option<WindowId> {
+    owner_by_window.get(&id).copied()
+  };
 
   let Some(window_ids) = normal_z_order_chain(
     normal_windows,
@@ -913,26 +915,28 @@ fn normalize_tiled_window_block(
   chain.splice(insertion_index..insertion_index, tiled_windows);
 }
 
-
-/// Pure helper for the owned-popup Alt-Tab fix (wired into `normal_z_order_chain`).
-/// Covers both **modal** (parent disabled) and **non-modal** owned caption children.
+/// Pure helper for the owned-popup Alt-Tab fix (wired into
+/// `normal_z_order_chain`). Covers both **modal** (parent disabled) and
+/// **non-modal** owned caption children.
 ///
-/// When focusing a floating/ignored HWND that has a managed `GW_OWNER`, the
-/// intended normal-layer chain must promote the focused window **and** its
-/// managed owner chain as one contiguous group (focused first, then other
-/// owned siblings in prior order, then the owner). Peers outside the group
-/// keep their relative order — same spirit as tiling-as-one-group, but for
-/// Win32 owner relationships.
+/// When focusing a floating/ignored HWND that has a managed `GW_OWNER`,
+/// the intended normal-layer chain must promote the focused window **and**
+/// its managed owner chain as one contiguous group (focused first, then
+/// other owned siblings in prior order, then the owner). Peers outside the
+/// group keep their relative order — same spirit as tiling-as-one-group,
+/// but for Win32 owner relationships.
 ///
-/// `owner_of(id)` returns the managed owner WindowId when `GetWindow(GW_OWNER)`
-/// points at another window in the workspace chain; `None` otherwise.
+/// `owner_of(id)` returns the managed owner `WindowId` when
+/// `GetWindow(GW_OWNER)` points at another window in the workspace chain;
+/// `None` otherwise.
 #[cfg(target_os = "windows")]
 fn floating_focus_owner_group(
   previous_order: &[WindowId],
   focused: WindowId,
   owner_of: &dyn Fn(WindowId) -> Option<WindowId>,
 ) -> Vec<WindowId> {
-  // Walk owner links from focused until we leave the managed set / hit root.
+  // Walk owner links from focused until we leave the managed set / hit
+  // root.
   let mut owner_chain = Vec::new();
   let mut cursor = focused;
   while let Some(owner) = owner_of(cursor) {
@@ -970,7 +974,8 @@ fn floating_focus_owner_group(
       group.push(*id);
     }
   }
-  // Ensure every owner-chain member is present even if missing from previous.
+  // Ensure every owner-chain member is present even if missing from
+  // previous.
   for owner in &owner_chain {
     if !group.contains(owner) {
       group.push(*owner);
@@ -1031,21 +1036,13 @@ mod tests {
 
     // Alt-Tab to detached Window2: only that detached window is promoted.
     assert_eq!(
-      chain(
-        vec![d2, d1, w3, w4],
-        d2.0,
-        Some(&[d1.0, d2.0, w3.0, w4.0]),
-      ),
+      chain(vec![d2, d1, w3, w4], d2.0, Some(&[d1.0, d2.0, w3.0, w4.0]),),
       Some(vec![d2.0, d1.0, w3.0, w4.0])
     );
 
     // Alt-Tab to tiled Window3: the complete tiled group is promoted.
     assert_eq!(
-      chain(
-        vec![w3, w4, d2, d1],
-        w3.0,
-        Some(&[d2.0, d1.0, w3.0, w4.0]),
-      ),
+      chain(vec![w3, w4, d2, d1], w3.0, Some(&[d2.0, d1.0, w3.0, w4.0]),),
       Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
@@ -1063,12 +1060,9 @@ mod tests {
       [tiled_a.0, tiled_b.0, visual_studio.0, snipping.0];
 
     // Alt-Tab to Snipping Tool promotes only that window.
-    let snipping_focused = chain(
-      windows.clone(),
-      snipping.0,
-      Some(&tiles_focused),
-    )
-    .expect("snipping focus");
+    let snipping_focused =
+      chain(windows.clone(), snipping.0, Some(&tiles_focused))
+        .expect("snipping focus");
     assert_eq!(
       snipping_focused,
       vec![snipping.0, tiled_a.0, tiled_b.0, visual_studio.0]
@@ -1076,12 +1070,9 @@ mod tests {
 
     // The next Alt-Tab lands on Visual Studio. Only Visual Studio
     // moves. Snipping Tool stays above the tiled group.
-    let visual_studio_focused = chain(
-      windows,
-      visual_studio.0,
-      Some(&snipping_focused),
-    )
-    .expect("visual studio focus");
+    let visual_studio_focused =
+      chain(windows, visual_studio.0, Some(&snipping_focused))
+        .expect("visual studio focus");
     assert_eq!(
       visual_studio_focused,
       vec![visual_studio.0, snipping.0, tiled_a.0, tiled_b.0]
@@ -1228,22 +1219,14 @@ mod tests {
     // to the front, while the remaining tiled group stays ahead of old
     // peers.
     assert_eq!(
-      chain(
-        vec![d3, w4, d2, d1],
-        d3.0,
-        Some(&[d3.0, w4.0, d2.0, d1.0]),
-      ),
+      chain(vec![d3, w4, d2, d1], d3.0, Some(&[d3.0, w4.0, d2.0, d1.0]),),
       Some(vec![d3.0, w4.0, d2.0, d1.0])
     );
 
     // Reattaching Window3 makes it part of the tiled group again.
     let w3 = window(3, NormalZOrderLayer::Tiling);
     assert_eq!(
-      chain(
-        vec![w3, w4, d2, d1],
-        w3.0,
-        Some(&[d3.0, w4.0, d2.0, d1.0]),
-      ),
+      chain(vec![w3, w4, d2, d1], w3.0, Some(&[d3.0, w4.0, d2.0, d1.0]),),
       Some(vec![w3.0, w4.0, d2.0, d1.0])
     );
   }
@@ -1304,11 +1287,7 @@ mod tests {
     // Prior: f1 on top of tiles, f2/f3 below the tiled block.
     let previous = [f1.0, t1.0, t2.0, f2.0, f3.0];
     assert_eq!(
-      chain(
-        vec![f2, f1, f3, t1, t2],
-        f2.0,
-        Some(&previous),
-      ),
+      chain(vec![f2, f1, f3, t1, t2], f2.0, Some(&previous),),
       Some(vec![f2.0, f1.0, t1.0, t2.0, f3.0]),
       "only f2 moves to front; f1 stays above tiles; f3 stays below"
     );
@@ -1365,11 +1344,10 @@ mod tests {
     );
   }
 
-
-  /// **Non-modal** owned popup Alt-Tab (GW_OWNER + caption + WS_EX_APPWINDOW,
-  /// parent still enabled): floating focus promotes the popup and its
-  /// managed owner as one group above tiles (Asus helper hwnd 4720436 /
-  /// owner 330456).
+  /// **Non-modal** owned popup Alt-Tab (`GW_OWNER` + caption +
+  /// `WS_EX_APPWINDOW`, parent still enabled): floating focus promotes the
+  /// popup and its managed owner as one group above tiles (Asus helper
+  /// hwnd 4720436 / owner 330456).
   #[test]
   fn non_modal_owned_focus_raises_managed_owner_above_tiles() {
     let popup = window(4_720_436, NormalZOrderLayer::Floating);
@@ -1401,8 +1379,8 @@ mod tests {
   }
 
   /// **Modal** owned dialog Alt-Tab (EnableWindow(parent, FALSE) +
-  /// WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW). Same owner-group raise as
-  /// non-modal — both are managed Floating peers linked by GW_OWNER.
+  /// `WS_EX_DLGMODALFRAME` | `WS_EX_APPWINDOW`). Same owner-group raise as
+  /// non-modal — both are managed Floating peers linked by `GW_OWNER`.
   /// Asus layout.log modal 724112 / owner 330456.
   #[test]
   fn modal_owned_focus_raises_managed_owner_above_tiles() {
@@ -1489,7 +1467,8 @@ mod tests {
     let owner = WindowId(200);
     let other_float = WindowId(300);
     let tile = WindowId(400);
-    // Prior: tiles, then other floater, then owner group (sibling above popup).
+    // Prior: tiles, then other floater, then owner group (sibling above
+    // popup).
     let previous = [tile, other_float, sibling, popup, owner];
 
     let owner_of = |id: WindowId| -> Option<WindowId> {
@@ -1837,6 +1816,3 @@ fn apply_transparency_effect(
 
   _ = window.native().set_transparency(transparency);
 }
-
-
-

@@ -560,6 +560,7 @@ mod tests {
   }
 
   #[test]
+  #[allow(clippy::too_many_lines)]
   fn floating_cycle_includes_window_after_workspace_transfer_both_ways() {
     let (event_loop, dispatcher) = EventLoop::new().expect("event loop");
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
