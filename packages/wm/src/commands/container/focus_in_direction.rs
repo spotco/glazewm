@@ -59,7 +59,7 @@ pub fn focus_in_direction(
       // Super+arrow between normal floaters must promote ONLY the
       // selected window (invariant). Mark as targeted so
       // windows_to_bring_to_front does not raise every peer floater and
-      // so bring_to_front defers to reorder_focused_workspace_layers —
+      // so bring_to_front defers to reorder_focused_workspace_layers -
       // matching the native floating focus path. Without this mark,
       // focus_in_direction queued workspace reorder while defer still
       // only covered tiling / focused_window_to_bring_to_front, so both
@@ -81,32 +81,85 @@ pub fn focus_in_direction(
   Ok(())
 }
 
+/// Super+arrow cycle among detached/floating windows on the focused
+/// workspace.
+///
+/// Membership is workspace-scoped (not merely immediate siblings) so a
+/// floater stays in the cycle after detach/reattach and after transfers
+/// between workspaces. Order follows workspace `descendant_focus_order`
+/// among floating windows is *not* used — child-tree order under the
+/// workspace (stable across focus) matches the historical sibling walk.
+///
+/// Wrap is a true ring: Left = next, Right = previous, modulo len. The
+/// old sibling wrap used `floating_siblings.last()` / `.next()`, which
+/// failed to reach the opposite end. After `move --workspace`, the
+/// transferred floater is appended last, so Super+Right from an older
+/// floater never landed on it (Steam WKS2→back repro).
 fn floating_focus_target(
   origin_container: &Container,
   direction: &Direction,
 ) -> Option<Container> {
-  let is_floating = |sibling: &Container| {
-    sibling.as_non_tiling_window().is_some_and(|window| {
+  let workspace = origin_container.workspace()?;
+  let floating = floating_windows_on_workspace(&workspace);
+
+  // Need at least one peer to cycle to.
+  if floating.len() < 2 {
+    return None;
+  }
+
+  let current_index = floating
+    .iter()
+    .position(|container| container.id() == origin_container.id())?;
+
+  let target_index = match direction {
+    // Preserve historical left=next / right=prev relative to child order.
+    Direction::Left => (current_index + 1) % floating.len(),
+    Direction::Right => {
+      (current_index + floating.len() - 1) % floating.len()
+    }
+    // Cannot focus vertically from a floating window.
+    _ => return None,
+  };
+
+  floating.into_iter().nth(target_index)
+}
+
+/// Floating windows that belong to `workspace`, in stable cycle order.
+///
+/// Prefers direct workspace children (the invariant for non-tiling
+/// windows). Also includes any nested floating descendants so a floater
+/// that landed under a split still joins the Super+arrow cycle until it
+/// is reparented.
+fn floating_windows_on_workspace(
+  workspace: &crate::models::Workspace,
+) -> Vec<Container> {
+  let is_floating = |container: &Container| {
+    container.as_non_tiling_window().is_some_and(|window| {
       matches!(window.state(), WindowState::Floating(_))
     })
   };
 
-  let mut floating_siblings =
-    origin_container.siblings().filter(is_floating);
+  let mut floating = workspace
+    .children()
+    .into_iter()
+    .filter(is_floating)
+    .collect::<Vec<_>>();
 
-  // Wrap if next/previous floating window is not found.
-  match direction {
-    Direction::Left => origin_container
-      .next_siblings()
-      .find(is_floating)
-      .or_else(|| floating_siblings.last()),
-    Direction::Right => origin_container
-      .prev_siblings()
-      .find(is_floating)
-      .or_else(|| floating_siblings.next()),
-    // Cannot focus vertically from a floating window.
-    _ => None,
+  // Nested floaters (should not happen if invariants hold) still count.
+  for descendant in workspace.descendants() {
+    if !is_floating(&descendant) {
+      continue;
+    }
+    if floating
+      .iter()
+      .any(|existing| existing.id() == descendant.id())
+    {
+      continue;
+    }
+    floating.push(descendant);
   }
+
+  floating
 }
 
 /// Gets a focus target within the current workspace using the focused
@@ -173,22 +226,87 @@ fn geometric_tiling_focus_target_in_workspace(
   )
 }
 
+/// Gets a focus target outside of the current workspace in the given
+/// direction.
+///
+/// This will descend into the workspace in the given direction, and will
+/// always return a tiling container. This makes it different from the
+/// `focus_workspace` command with `FocusWorkspaceTarget::Direction`.
+fn workspace_focus_target(
+  origin_container: &Container,
+  direction: &Direction,
+  state: &WmState,
+) -> anyhow::Result<Option<Container>> {
+  let monitor = origin_container.monitor().context("No monitor.")?;
+
+  let target_workspace = state
+    .monitor_in_direction(&monitor, direction)?
+    .and_then(|monitor| monitor.displayed_workspace());
+
+  let focused_fullscreen = target_workspace
+    .as_ref()
+    .and_then(|workspace| workspace.descendant_focus_order().next())
+    .filter(|focused| match focused {
+      Container::NonTilingWindow(window) => {
+        matches!(window.state(), WindowState::Fullscreen(_))
+      }
+      _ => false,
+    });
+
+  let geometric_target = target_workspace
+    .as_ref()
+    .map(|workspace| {
+      let origin_rect = origin_container.to_rect()?;
+      geometric_tiling_focus_target_in_workspace(
+        origin_container.id(),
+        &origin_rect,
+        workspace,
+        direction,
+      )
+    })
+    .transpose()?
+    .flatten();
+
+  let focus_target = focused_fullscreen
+    .or(geometric_target)
+    .or_else(|| {
+      target_workspace.as_ref().and_then(|workspace| {
+        workspace
+          .descendant_in_direction(&direction.inverse())
+          .map(Into::into)
+      })
+    })
+    .or(target_workspace.map(Into::into));
+
+  Ok(focus_target)
+}
+
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
   use uuid::Uuid;
-  use wm_common::{GapsConfig, TilingDirection, WorkspaceConfig};
+  use wm_common::{
+    FloatingStateConfig, GapsConfig, TilingDirection, WindowState,
+    WorkspaceConfig,
+  };
   use wm_platform::{
-    EventLoop, NativeWindow, NativeWindowWindowsExt, Rect, RectDelta,
+    Direction, EventLoop, NativeWindow, NativeWindowWindowsExt, Rect,
+    RectDelta,
   };
 
   use super::*;
   use crate::{
-    commands::{container::attach_container, monitor::add_monitor},
+    commands::{
+      container::{attach_container, set_focused_descendant},
+      monitor::add_monitor,
+      window::{move_window_to_workspace, update_window_state},
+    },
     models::{
       Container, NativeMonitorProperties, NativeWindowProperties,
-      SplitContainer, Workspace,
+      NonTilingWindow, SplitContainer, TilingWindow, Workspace,
+      WorkspaceTarget,
     },
     traits::{CommonGetters, TilingSizeGetters},
+    user_config::UserConfig,
   };
 
   fn test_window(id: u128) -> TilingWindow {
@@ -214,6 +332,59 @@ mod tests {
       Vec::new(),
       None,
     )
+  }
+
+  fn floating_window(id: u128, title: &str) -> NonTilingWindow {
+    NonTilingWindow::new(
+      Some(Uuid::from_u128(id)),
+      NativeWindow::from_handle(id as isize),
+      NativeWindowProperties {
+        title: title.into(),
+        class_name: "test".into(),
+        process_name: title.into(),
+        process_path: None,
+        frame: Rect::from_xy(0, 0, 100, 100),
+        is_minimized: false,
+        is_maximized: false,
+        is_resizable: true,
+        shadow_borders: RectDelta::zero(),
+      },
+      WindowState::Floating(FloatingStateConfig {
+        centered: false,
+        shown_on_top: false,
+      }),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    )
+  }
+
+  fn test_config() -> UserConfig {
+    let path = std::env::temp_dir().join(format!(
+      "glazewm-floating-cycle-test-{}.yaml",
+      Uuid::new_v4()
+    ));
+    UserConfig::new(Some(path)).expect("test config")
+  }
+
+  fn cycle_ids(
+    origin: &Container,
+    direction: &Direction,
+    steps: usize,
+  ) -> Vec<Uuid> {
+    let mut current = origin.clone();
+    let mut ids = Vec::new();
+    for _ in 0..steps {
+      let next = floating_focus_target(&current, direction)
+        .expect("floating cycle peer");
+      ids.push(next.id());
+      current = next;
+    }
+    ids
   }
 
   #[test]
@@ -332,59 +503,304 @@ mod tests {
     assert_eq!(target.id(), window_two.id());
     drop(event_loop);
   }
-}
 
-/// Gets a focus target outside of the current workspace in the given
-/// direction.
-///
-/// This will descend into the workspace in the given direction, and will
-/// always return a tiling container. This makes it different from the
-/// `focus_workspace` command with `FocusWorkspaceTarget::Direction`.
-fn workspace_focus_target(
-  origin_container: &Container,
-  direction: &Direction,
-  state: &WmState,
-) -> anyhow::Result<Option<Container>> {
-  let monitor = origin_container.monitor().context("No monitor.")?;
+  #[test]
+  fn floating_cycle_is_full_ring_including_appended_peer() {
+    // Old wrap used siblings.last()/next() and skipped the opposite end.
+    // A floater appended last (typical after move --workspace) was
+    // unreachable via Super+Right from the first floater.
+    let workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "1".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let workspace_container: Container = workspace.clone().into();
+    let tiling = test_window(10);
+    let floater_a = floating_window(1, "floater-a");
+    let floater_b = floating_window(2, "floater-b");
+    let steam = floating_window(3, "Steam");
 
-  let target_workspace = state
-    .monitor_in_direction(&monitor, direction)?
-    .and_then(|monitor| monitor.displayed_workspace());
+    attach_container(&tiling.clone().into(), &workspace_container, None)
+      .expect("attach tiling");
+    attach_container(
+      &floater_a.clone().into(),
+      &workspace_container,
+      None,
+    )
+    .expect("attach a");
+    attach_container(
+      &floater_b.clone().into(),
+      &workspace_container,
+      None,
+    )
+    .expect("attach b");
+    // Appended last — same as move_window_to_workspace target index.
+    attach_container(&steam.clone().into(), &workspace_container, None)
+      .expect("attach steam");
 
-  let focused_fullscreen = target_workspace
-    .as_ref()
-    .and_then(|workspace| workspace.descendant_focus_order().next())
-    .filter(|focused| match focused {
-      Container::NonTilingWindow(window) => {
-        matches!(window.state(), WindowState::Fullscreen(_))
-      }
-      _ => false,
-    });
+    let from_a = floater_a.clone().into();
+    let right_cycle = cycle_ids(&from_a, &Direction::Right, 3);
+    assert_eq!(
+      right_cycle,
+      vec![steam.id(), floater_b.id(), floater_a.id()],
+      "Super+Right from first floater must wrap to appended Steam"
+    );
 
-  let geometric_target = target_workspace
-    .as_ref()
-    .map(|workspace| {
-      let origin_rect = origin_container.to_rect()?;
-      geometric_tiling_focus_target_in_workspace(
-        origin_container.id(),
-        &origin_rect,
-        workspace,
-        direction,
-      )
-    })
-    .transpose()?
-    .flatten();
+    let left_cycle = cycle_ids(&from_a, &Direction::Left, 3);
+    assert_eq!(
+      left_cycle,
+      vec![floater_b.id(), steam.id(), floater_a.id()],
+      "Super+Left must visit every floater including Steam"
+    );
+  }
 
-  let focus_target = focused_fullscreen
-    .or(geometric_target)
-    .or_else(|| {
-      target_workspace.as_ref().and_then(|workspace| {
-        workspace
-          .descendant_in_direction(&direction.inverse())
-          .map(Into::into)
-      })
-    })
-    .or(target_workspace.map(Into::into));
+  #[test]
+  fn floating_cycle_includes_window_after_workspace_transfer_both_ways() {
+    let (event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut state =
+      crate::wm_state::WmState::new(dispatcher, event_tx, exit_tx);
+    let mut config = test_config();
 
-  Ok(focus_target)
+    let display = state
+      .dispatcher
+      .sorted_displays()
+      .expect("test display")
+      .into_iter()
+      .next()
+      .expect("at least one display");
+    let monitor_properties = NativeMonitorProperties::try_from(&display)
+      .expect("monitor properties");
+    let monitor = add_monitor(display, monitor_properties, &mut state)
+      .expect("attach test monitor");
+
+    let workspace_one = Workspace::new(
+      WorkspaceConfig {
+        name: "1".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: true,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let workspace_two = Workspace::new(
+      WorkspaceConfig {
+        name: "2".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: true,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    attach_container(
+      &workspace_one.clone().into(),
+      &monitor.clone().into(),
+      None,
+    )
+    .expect("attach wks1");
+    attach_container(
+      &workspace_two.clone().into(),
+      &monitor.clone().into(),
+      None,
+    )
+    .expect("attach wks2");
+
+    let peer = floating_window(1, "peer");
+    let steam = floating_window(2, "Steam");
+    attach_container(
+      &peer.clone().into(),
+      &workspace_one.clone().into(),
+      None,
+    )
+    .expect("attach peer");
+    attach_container(
+      &steam.clone().into(),
+      &workspace_one.clone().into(),
+      None,
+    )
+    .expect("attach steam");
+    set_focused_descendant(&steam.clone().into(), None);
+
+    move_window_to_workspace(
+      steam.clone().into(),
+      WorkspaceTarget::Name("2".into()),
+      &mut state,
+      &config,
+    )
+    .expect("move steam to wks2");
+
+    assert!(
+      floating_focus_target(&peer.clone().into(), &Direction::Left)
+        .is_none(),
+      "peer alone on wks1 has no floating cycle peer"
+    );
+    assert_eq!(
+      steam.workspace().map(|ws| ws.config().name),
+      Some("2".into())
+    );
+
+    // Focus follows to wks2 in the user repro; focus steam then move back.
+    set_focused_descendant(&steam.clone().into(), None);
+    move_window_to_workspace(
+      steam.clone().into(),
+      WorkspaceTarget::Name("1".into()),
+      &mut state,
+      &config,
+    )
+    .expect("move steam back to wks1");
+
+    assert_eq!(
+      steam.workspace().map(|ws| ws.config().name),
+      Some("1".into())
+    );
+
+    let from_peer = peer.clone().into();
+    let right_ids = cycle_ids(&from_peer, &Direction::Right, 2);
+    assert!(
+      right_ids.contains(&steam.id()),
+      "after WKS2→back, Super+Right cycle from peer must include Steam: {right_ids:?}"
+    );
+    let left_ids = cycle_ids(&from_peer, &Direction::Left, 2);
+    assert!(
+      left_ids.contains(&steam.id()),
+      "after WKS2→back, Super+Left cycle from peer must include Steam: {left_ids:?}"
+    );
+
+    // Floaters on the other workspace must not enter this cycle.
+    let foreign = floating_window(9, "foreign");
+    attach_container(
+      &foreign.clone().into(),
+      &workspace_two.clone().into(),
+      None,
+    )
+    .expect("attach foreign on wks2");
+    let cycle_after_foreign = cycle_ids(&from_peer, &Direction::Left, 4);
+    assert!(
+      !cycle_after_foreign.contains(&foreign.id()),
+      "cycle must stay on focused workspace: {cycle_after_foreign:?}"
+    );
+
+    let _ = &mut config;
+    drop(event_loop);
+  }
+
+  #[test]
+  fn floating_cycle_survives_detach_reattach_and_nested_floater() {
+    let (event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut state =
+      crate::wm_state::WmState::new(dispatcher, event_tx, exit_tx);
+    let config = test_config();
+
+    let display = state
+      .dispatcher
+      .sorted_displays()
+      .expect("test display")
+      .into_iter()
+      .next()
+      .expect("at least one display");
+    let monitor_properties = NativeMonitorProperties::try_from(&display)
+      .expect("monitor properties");
+    let monitor = add_monitor(display, monitor_properties, &mut state)
+      .expect("attach test monitor");
+
+    let workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "1".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: true,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    attach_container(
+      &workspace.clone().into(),
+      &monitor.clone().into(),
+      None,
+    )
+    .expect("attach workspace");
+
+    let peer = floating_window(1, "peer");
+    let steam = floating_window(2, "Steam");
+    attach_container(
+      &peer.clone().into(),
+      &workspace.clone().into(),
+      None,
+    )
+    .expect("attach peer");
+    attach_container(
+      &steam.clone().into(),
+      &workspace.clone().into(),
+      None,
+    )
+    .expect("attach steam");
+
+    // Detach (tile) then reattach (float) Steam.
+    let tiled = update_window_state(
+      steam.clone().into(),
+      WindowState::Tiling,
+      &mut state,
+      &config,
+    )
+    .expect("tile steam");
+    let floated = update_window_state(
+      tiled,
+      WindowState::Floating(FloatingStateConfig {
+        centered: false,
+        shown_on_top: false,
+      }),
+      &mut state,
+      &config,
+    )
+    .expect("float steam again");
+
+    let from_peer = peer.clone().into();
+    let after_reattach = cycle_ids(&from_peer, &Direction::Left, 2);
+    assert!(
+      after_reattach.contains(&floated.id()),
+      "detach/reattach must keep Steam in cycle: {after_reattach:?}"
+    );
+
+    // Nested floater under a split still belongs to the workspace cycle.
+    let nested_split = SplitContainer::new(
+      TilingDirection::Horizontal,
+      GapsConfig::default(),
+    );
+    let nested = floating_window(3, "nested");
+    attach_container(
+      &nested_split.clone().into(),
+      &workspace.clone().into(),
+      None,
+    )
+    .expect("attach split");
+    attach_container(
+      &nested.clone().into(),
+      &nested_split.clone().into(),
+      None,
+    )
+    .expect("attach nested floater");
+
+    let with_nested = floating_windows_on_workspace(&workspace);
+    assert!(
+      with_nested.iter().any(|c| c.id() == nested.id()),
+      "nested floater must be in workspace cycle membership"
+    );
+    let cycle_with_nested = cycle_ids(&from_peer, &Direction::Left, 3);
+    assert!(
+      cycle_with_nested.contains(&nested.id()),
+      "Super+arrow must reach nested floater on same workspace: {cycle_with_nested:?}"
+    );
+
+    drop(event_loop);
+  }
 }
