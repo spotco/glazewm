@@ -3039,6 +3039,35 @@ mod reorder_z_order_tests {
     );
   }
 
+  /// layout.log 2026-10-02 22:35:50.830 ET and 22:35:53.793 ET:
+  /// focused Grok `131888` had `bring_to_front` skipped
+  /// (`tiling_group_defer_workspace_reorder`). The chain was
+  /// Grok, tiles, floater, toast `984154` (`EnumWindows` rank `=?`),
+  /// Notepad `67996`. Post-reorder Notepad was above Grok; +25ms
+  /// Notepad snapped to rank 8. At 22:35:59 the toast left the chain
+  /// and the same Grok focus kept Grok above Notepad.
+  ///
+  /// The toast still answers `WM_NULL`, so it is not skipped as hung.
+  /// `planned_insert_after` therefore anchors Notepad on it. Native
+  /// `SetWindowPos` after a live hwnd that is missing from the
+  /// top-level z-order (notification z-band) places Notepad at the top
+  /// of the normal band. Desired anchor is Grok. This fails until
+  /// unenumerated hwnds are skipped the same way hung hwnds are.
+  #[test]
+  fn insert_after_skips_unenumerated_notification_before_notepad() {
+    let grok = WindowId(131_888);
+    let notification = WindowId(984_154);
+    let notepad = WindowId(67_996);
+    let chain = [grok, notification, notepad];
+    let responsive = [true, true, true];
+
+    assert_eq!(
+      super::planned_insert_after(&chain, &responsive, 2),
+      super::ZOrderInsertAfter::After(grok),
+      "Notepad must not insert after toast 984154; that hwnd is not in EnumWindows and lifts Notepad above focused Grok"
+    );
+  }
+
   #[test]
   fn tid_probe_cache_reuses_result_per_thread() {
     let mut probes = 0usize;

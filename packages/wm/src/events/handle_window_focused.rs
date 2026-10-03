@@ -66,13 +66,6 @@ pub fn handle_window_focused(
     return Ok(());
   }
 
-  // Ignore the focus event if window is being hidden by the WM.
-  if let Some(window) = &found_window {
-    if window.display_state() == DisplayState::Hiding {
-      return Ok(());
-    }
-  }
-
   // Focus effect should be updated for any change in focus that shouldn't
   // be overwritten. The incoming focus event at this point is either:
   //  1. WM's focus container (window or workspace). This is the desktop
@@ -103,7 +96,13 @@ pub fn handle_window_focused(
     // Handle focus events from windows on hidden workspaces. For example,
     // if Discord is forcefully shown by the OS when it's on a hidden
     // workspace, switch focus to Discord's workspace.
-    if window.display_state() == DisplayState::Hidden {
+    // `Hiding` is included so a window stuck there (reposition failed
+    // before cloak, so the state never reached `Hidden`) can still be
+    // recovered from Alt-Tab instead of the focus event being dropped.
+    if matches!(
+      window.display_state(),
+      DisplayState::Hidden | DisplayState::Hiding
+    ) {
       info!("Focusing off-screen window: {window}");
 
       focus_workspace(

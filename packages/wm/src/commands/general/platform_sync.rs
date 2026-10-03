@@ -425,7 +425,10 @@ fn redraw_containers(
     let is_show_desktop_minimized =
       state.is_show_desktop_minimized(window.id());
 
-    if let Err(err) = reposition_window(
+    // `SetWindowPos` failure (maximized fullscreen) returns before
+    // `set_cloaked`. Remember that so the caller can cloak before any
+    // taskbar `DeleteTab`.
+    let repositioned = reposition_window(
       window,
       *hide_corner,
       &z_order,
@@ -433,7 +436,8 @@ fn redraw_containers(
       is_show_desktop_minimized,
       preserve_z_order,
       config,
-    ) {
+    );
+    if let Err(err) = &repositioned {
       tracing::warn!("Failed to set window position: {}", err);
     }
 
@@ -463,17 +467,40 @@ fn redraw_containers(
     // effect). Since cloaked windows are normally always visible in the
     // taskbar, we only need to set visibility if `show_all_in_taskbar` is
     // `false`.
+    //
+    // A failed reposition returns before `set_cloaked`. Cloak here before
+    // any taskbar change. Hiding must not `DeleteTab` unless that cloak
+    // has begun, or the window stays `Hiding` and drops out of Alt-Tab.
     #[cfg(target_os = "windows")]
-    if config.value.general.hide_method == HideMethod::Cloak
-      && !config.value.general.show_all_in_taskbar
-      && matches!(
-        window.display_state(),
-        DisplayState::Showing | DisplayState::Hiding
-      )
     {
-      if let Err(err) = window.native().set_taskbar_visibility(is_visible)
+      let hide_with_cloak =
+        config.value.general.hide_method == HideMethod::Cloak;
+      let mut cloak_begun = hide_with_cloak && repositioned.is_ok();
+      if hide_with_cloak && repositioned.is_err() {
+        match window.native().set_cloaked(!is_visible) {
+          Ok(()) => cloak_begun = true,
+          Err(err) => {
+            tracing::warn!(
+              "Failed to cloak window after reposition: {}",
+              err
+            );
+          }
+        }
+      }
+
+      if hide_with_cloak
+        && !config.value.general.show_all_in_taskbar
+        && matches!(
+          window.display_state(),
+          DisplayState::Showing | DisplayState::Hiding
+        )
+        && (is_visible || cloak_begun)
       {
-        tracing::warn!("Failed to set taskbar visibility: {}", err);
+        if let Err(err) =
+          window.native().set_taskbar_visibility(is_visible)
+        {
+          tracing::warn!("Failed to set taskbar visibility: {}", err);
+        }
       }
     }
   }
@@ -1098,6 +1125,57 @@ mod tests {
     );
   }
 
+  /// layout.log 2026-10-02 22:35:50 ET: after an ignored toast
+  /// (`WindowId(984154)`, absent from `EnumWindows`) has been promoted,
+  /// tiling focus on Grok keeps that toast in the detached tail,
+  /// immediately before Notepad. `apply_z_order_chain` then uses the
+  /// toast as Notepad's insert-after hwnd.
+  #[test]
+  fn tiling_focus_leaves_unenumerated_ignored_window_directly_before_notepad(
+  ) {
+    let grok = window(131_888, NormalZOrderLayer::Tiling);
+    let peer = window(67_798, NormalZOrderLayer::Tiling);
+    let other = window(1_575_680, NormalZOrderLayer::Tiling);
+    let floater = window(3_803_134, NormalZOrderLayer::Floating);
+    let notification = window(984_154, NormalZOrderLayer::Ignored);
+    let notepad = window(67_996, NormalZOrderLayer::Floating);
+
+    // Saved order after the toast was focused, then the floater above it
+    // (layout.log 02:35:47Z chain).
+    let previous = [
+      floater.0,
+      notification.0,
+      grok.0,
+      peer.0,
+      other.0,
+      notepad.0,
+    ];
+    let chain = chain(
+      vec![grok, peer, other, floater, notepad, notification],
+      grok.0,
+      Some(&previous),
+    )
+    .expect("tiling focus chain");
+
+    assert_eq!(
+      chain,
+      vec![
+        grok.0,
+        peer.0,
+        other.0,
+        floater.0,
+        notification.0,
+        notepad.0,
+      ]
+    );
+    let notepad_at = chain.iter().position(|id| *id == notepad.0).unwrap();
+    assert_eq!(
+      chain[notepad_at - 1],
+      notification.0,
+      "Notepad's chain predecessor is the ignored toast, not a tiled window"
+    );
+  }
+
   #[test]
   fn e2e_leaving_ignored_focus_rejoins_ignored_before_detached_and_after_tiled(
   ) {
@@ -1517,6 +1595,218 @@ mod tests {
         Some(&previous),
       ),
       Some(vec![hung_helper.0, tile.0, steam.0])
+    );
+  }
+  #[test]
+  #[allow(clippy::too_many_lines)]
+  fn workspace_hide_taskbar_delete_requires_prior_cloak() {
+    use std::sync::Mutex;
+
+    use tokio::sync::mpsc;
+    use wm_common::{
+      FullscreenStateConfig, GapsConfig, TilingDirection, WindowState,
+      WorkspaceConfig,
+    };
+    use wm_platform::{
+      EventLoop, NativeWindow, NativeWindowWindowsExt, Rect, RectDelta,
+    };
+
+    use crate::{
+      commands::{container::attach_container, monitor::add_monitor},
+      models::{
+        NativeMonitorProperties, NativeWindowProperties, NonTilingWindow,
+        TilingWindow, Workspace,
+      },
+      traits::WindowGetters,
+    };
+
+    static NATIVE_OPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn record_native_op(line: &str) {
+      if let Ok(mut lines) = NATIVE_OPS.lock() {
+        lines.push(line.to_string());
+      }
+    }
+
+    // Invalid HWND: SetWindowPos fails inside reposition_window before
+    // set_cloaked. Same early return as a fullscreen maximize /
+    // SetWindowPos error. Live windows are refused below.
+    const GAME_HWND: isize = 0x0EE0_EE01;
+    const ANCHOR_HWND: isize = 0x0EE0_EE02;
+
+    let game_native = NativeWindow::from_handle(GAME_HWND);
+    let anchor_native = NativeWindow::from_handle(ANCHOR_HWND);
+    assert!(
+      !game_native.is_valid() && !anchor_native.is_valid(),
+      "refusing to run hide sync against a live HWND"
+    );
+
+    let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+    let mut state =
+      crate::wm_state::WmState::new(dispatcher, event_tx, exit_tx);
+
+    let display = state
+      .dispatcher
+      .sorted_displays()
+      .expect("displays")
+      .into_iter()
+      .next()
+      .expect("display");
+    let monitor_properties =
+      NativeMonitorProperties::try_from(&display).expect("monitor");
+    let monitor = add_monitor(display, monitor_properties, &mut state)
+      .expect("attach monitor");
+
+    let visible_workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "visible-ws".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: true,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let hidden_workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "hidden-ws".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: true,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    attach_container(
+      &visible_workspace.clone().into(),
+      &monitor.clone().into(),
+      None,
+    )
+    .expect("attach visible workspace");
+    attach_container(
+      &hidden_workspace.clone().into(),
+      &monitor.into(),
+      None,
+    )
+    .expect("attach hidden workspace");
+
+    let properties = |title: &str| NativeWindowProperties {
+      title: title.into(),
+      class_name: "test".into(),
+      process_name: "test".into(),
+      process_path: None,
+      frame: Rect::from_xy(0, 0, 100, 100),
+      is_minimized: false,
+      is_maximized: true,
+      is_resizable: true,
+      shadow_borders: RectDelta::zero(),
+    };
+
+    let anchor = TilingWindow::new(
+      None,
+      anchor_native,
+      properties("anchor"),
+      None,
+      RectDelta::zero(),
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      GapsConfig::default(),
+      Vec::new(),
+      None,
+    );
+    let game = NonTilingWindow::new(
+      None,
+      game_native,
+      properties("SoC"),
+      WindowState::Fullscreen(FullscreenStateConfig {
+        maximized: true,
+        shown_on_top: false,
+      }),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 1920, 1080),
+      false,
+      Vec::new(),
+      None,
+    );
+    attach_container(
+      &anchor.clone().into(),
+      &visible_workspace.clone().into(),
+      None,
+    )
+    .expect("attach anchor");
+    attach_container(
+      &game.clone().into(),
+      &hidden_workspace.clone().into(),
+      None,
+    )
+    .expect("attach fullscreen window");
+    crate::commands::container::set_focused_descendant(
+      &anchor.into(),
+      None,
+    );
+
+    assert!(visible_workspace.is_displayed());
+    assert!(
+      !hidden_workspace.is_displayed(),
+      "fullscreen window must sit on a hidden workspace"
+    );
+    assert_eq!(game.display_state(), wm_common::DisplayState::Shown);
+
+    state.pending_sync.clear();
+    state.pending_sync.queue_container_to_redraw(game.clone());
+
+    let config_path = std::env::temp_dir().join(format!(
+      "glazewm-hide-cloak-order-{}.yaml",
+      uuid::Uuid::new_v4()
+    ));
+    let config = crate::user_config::UserConfig::new(Some(config_path))
+      .expect("config");
+    assert_eq!(
+      config.value.general.hide_method,
+      wm_common::HideMethod::Cloak
+    );
+    assert!(!config.value.general.show_all_in_taskbar);
+
+    NATIVE_OPS.lock().expect("ops").clear();
+    wm_platform::set_native_op_logger(record_native_op);
+
+    platform_sync(&mut state, &config).expect("sync");
+
+    assert_eq!(
+      game.display_state(),
+      wm_common::DisplayState::Hiding,
+      "a failed reposition must leave the hide transition in place"
+    );
+
+    #[allow(clippy::cast_sign_loss)]
+    let hwnd_token = format!("hwnd={:#x}", GAME_HWND as usize);
+    let lines = NATIVE_OPS.lock().expect("ops").clone();
+    let began = |op: &str| {
+      lines.iter().position(|line| {
+        line.contains("native-op begin")
+          && line.contains(op)
+          && line.contains(&hwnd_token)
+      })
+    };
+    let cloak_at = began("op=set_cloaked");
+    let taskbar_at = began("op=set_taskbar_visibility");
+
+    // Contract: if taskbar hide runs, cloak must already have begun.
+    // Current code returns from reposition_window on SetWindowPos
+    // failure, then the caller still calls DeleteTab.
+    let taskbar_before_cloak = match (cloak_at, taskbar_at) {
+      (None, Some(_)) => true,
+      (Some(cloak), Some(taskbar)) => cloak > taskbar,
+      _ => false,
+    };
+    assert!(
+      !taskbar_before_cloak,
+      "taskbar hide ran before cloak for {hwnd_token}; window stays \
+       Hiding and drops out of Alt-Tab: {lines:?}"
     );
   }
 }
