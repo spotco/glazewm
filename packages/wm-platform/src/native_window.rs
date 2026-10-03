@@ -92,6 +92,9 @@ pub struct NativeWindowDebugInfo {
   pub is_child: Option<bool>,
   pub is_popup: Option<bool>,
   pub z_order_index: Option<u32>,
+  /// `IsHungAppWindow` on Windows. Lags a suspended thread by
+  /// several seconds. `None` when the platform has no equivalent.
+  pub is_hung: Option<bool>,
   pub errors: Vec<String>,
 }
 

@@ -40,6 +40,12 @@ pub fn handle_window_focused(
       ));
     }
     state.suspend_z_order_for_ignored_foreground(native_window);
+    record_focus_diagnostic(
+      state,
+      native_window,
+      crate::diagnostic_history::FocusOutcome::IgnoredSuspend,
+      None,
+    );
     return Ok(());
   }
 
@@ -63,6 +69,12 @@ pub fn handle_window_focused(
   // focus target and then to the WM's focus target.
   if should_override_focus(state) {
     state.pending_sync.queue_focus_change();
+    record_focus_diagnostic(
+      state,
+      native_window,
+      crate::diagnostic_history::FocusOutcome::OverrideRecentUnmanage,
+      found_window.as_ref(),
+    );
     return Ok(());
   }
 
@@ -78,6 +90,12 @@ pub fn handle_window_focused(
   // not reconcile z-order. Doing so raises the logical tiled focus and
   // pulls every other window behind the tiled group mid-gesture.
   if found_window.is_none() {
+    record_focus_diagnostic(
+      state,
+      native_window,
+      crate::diagnostic_history::FocusOutcome::UnknownForeground,
+      None,
+    );
     return Ok(());
   }
 
@@ -88,6 +106,12 @@ pub fn handle_window_focused(
     if focused_container == window.clone().into() {
       state.is_focus_synced = true;
       state.pending_sync.queue_workspace_to_reorder(workspace);
+      record_focus_diagnostic(
+        state,
+        native_window,
+        crate::diagnostic_history::FocusOutcome::AlreadySynced,
+        Some(&window),
+      );
       return Ok(());
     }
 
@@ -140,9 +164,93 @@ pub fn handle_window_focused(
     state.emit_event(WmEvent::FocusChanged {
       focused_container: window.to_dto()?,
     });
+    record_focus_diagnostic(
+      state,
+      native_window,
+      crate::diagnostic_history::FocusOutcome::ManualFocus,
+      Some(&window),
+    );
   }
 
   Ok(())
+}
+
+fn record_focus_diagnostic(
+  state: &mut WmState,
+  native_window: &NativeWindow,
+  outcome: crate::diagnostic_history::FocusOutcome,
+  window: Option<&crate::models::WindowContainer>,
+) {
+  use crate::diagnostic_history::{
+    hwnd_i64, truncate_title, DiagnosticBody,
+  };
+
+  let props = window.map(WindowGetters::native_properties);
+  let title = props
+    .as_ref()
+    .map(|props| truncate_title(&props.title))
+    .or_else(|| {
+      native_window
+        .debug_info()
+        .title
+        .map(|title| truncate_title(&title))
+    });
+  #[cfg(target_os = "windows")]
+  let class_name = props
+    .as_ref()
+    .map(|props| truncate_title(&props.class_name))
+    .or_else(|| {
+      native_window
+        .debug_info()
+        .class_name
+        .map(|class_name| truncate_title(&class_name))
+    });
+  #[cfg(not(target_os = "windows"))]
+  let class_name = None;
+  let workspace = window.and_then(CommonGetters::workspace);
+  let shown_on_top = window.and_then(|window| match window.state() {
+    wm_common::WindowState::Floating(config) => Some(config.shown_on_top),
+    wm_common::WindowState::Fullscreen(config) => {
+      Some(config.shown_on_top)
+    }
+    wm_common::WindowState::Minimized | wm_common::WindowState::Tiling => {
+      None
+    }
+  });
+  state.push_diagnostic(DiagnosticBody::Focus {
+    hwnd: hwnd_i64(native_window.id().0),
+    title,
+    class_name,
+    outcome,
+    wm_container_id: window.map(CommonGetters::id),
+    workspace_id: workspace.as_ref().map(CommonGetters::id),
+    workspace_name: workspace.map(|workspace| workspace.config().name),
+    display_state: window.map(|window| {
+      display_state_name(&window.display_state()).to_string()
+    }),
+    window_state: window
+      .map(|window| window_state_name(&window.state()).to_string()),
+    shown_on_top,
+    focus_synced: state.is_focus_synced,
+  });
+}
+
+fn display_state_name(state: &wm_common::DisplayState) -> &'static str {
+  match state {
+    wm_common::DisplayState::Shown => "shown",
+    wm_common::DisplayState::Showing => "showing",
+    wm_common::DisplayState::Hidden => "hidden",
+    wm_common::DisplayState::Hiding => "hiding",
+  }
+}
+
+fn window_state_name(state: &wm_common::WindowState) -> &'static str {
+  match state {
+    wm_common::WindowState::Tiling => "tiling",
+    wm_common::WindowState::Floating(_) => "floating",
+    wm_common::WindowState::Fullscreen(_) => "fullscreen",
+    wm_common::WindowState::Minimized => "minimized",
+  }
 }
 
 /// Returns true if focus should be reassigned to the WM's focus container.

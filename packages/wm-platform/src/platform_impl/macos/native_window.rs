@@ -455,6 +455,7 @@ pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
     is_child: None,
     is_popup: None,
     z_order_index: None,
+    is_hung: None,
     errors,
   }
 }

@@ -31,12 +31,13 @@ use wm_platform::{
 
 use crate::{
   commands::general::{
-    layout_debug_log_path, layout_snapshot_path, load_layout_snapshot,
-    pick_layout_snapshot_path, platform_sync, read_layout_snapshot_file,
-    save_layout_snapshot_with_dialog, set_layout_debug_log_path,
-    set_verbose_z_order_from_config, show_desktop,
-    try_load_persisted_layout_snapshot, verbose_z_order_enabled,
-    wm_event_affects_layout_snapshot, LayoutAutoSave,
+    dump_wm_state, layout_debug_log_path, layout_snapshot_path,
+    load_layout_snapshot, pick_layout_snapshot_path, platform_sync,
+    read_layout_snapshot_file, save_layout_snapshot_with_dialog,
+    set_layout_debug_log_path, set_verbose_z_order_from_config,
+    show_desktop, try_load_persisted_layout_snapshot,
+    verbose_z_order_enabled, wm_event_affects_layout_snapshot,
+    LayoutAutoSave,
   },
   ipc_server::IpcServer,
   sys_tray::SystemTray,
@@ -45,6 +46,7 @@ use crate::{
 };
 
 mod commands;
+mod diagnostic_history;
 mod events;
 mod ipc_conflict;
 mod ipc_server;
@@ -550,6 +552,9 @@ async fn start_wm(
       },
       () = layout_auto_save.sleep_mut(), if layout_auto_save.is_armed() => {
         layout_auto_save.flush(&wm.state)
+      },
+      Some(()) = tray.dump_state_rx.recv() => {
+        dump_wm_state(&wm.state, &config).map(|_| ())
       },
       Some(()) = tray.config_reload_rx.recv() => {
         wm.process_commands(

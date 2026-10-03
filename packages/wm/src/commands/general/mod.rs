@@ -10,6 +10,7 @@ mod reload_config;
 mod save_layout_snapshot;
 mod shell_exec;
 mod show_desktop;
+mod state_dump;
 mod toggle_pause;
 
 pub use cycle_focus::*;
@@ -24,4 +25,5 @@ pub use reload_config::*;
 pub use save_layout_snapshot::*;
 pub use shell_exec::*;
 pub use show_desktop::*;
+pub use state_dump::*;
 pub use toggle_pause::*;

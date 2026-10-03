@@ -34,9 +34,9 @@ use windows::{
         EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow,
         GetForegroundWindow, GetLayeredWindowAttributes, GetParent,
         GetShellWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-        IsWindowVisible, IsZoomed, SendMessageTimeoutW,
-        SendNotifyMessageW, SetForegroundWindow,
+        GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow,
+        IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+        SendMessageTimeoutW, SendNotifyMessageW, SetForegroundWindow,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
         SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
         GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
@@ -1820,6 +1820,7 @@ pub(crate) fn debug_info(window: &NativeWindow) -> NativeWindowDebugInfo {
     is_child: Some((style & WS_CHILD.0) != 0),
     is_popup: Some((style & WS_POPUP.0) != 0),
     z_order_index: None,
+    is_hung: Some(unsafe { IsHungAppWindow(hwnd) }.as_bool()),
     errors,
   }
 }

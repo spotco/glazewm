@@ -340,6 +340,8 @@ pub enum InvokeCommand {
     #[clap(long)]
     name: String,
   },
+  /// Write a timestamped JSON dump of WM and z-order state.
+  WmDumpState,
   WmExit,
   /// Uncloak DWM-cloaked top-level windows not currently managed
   /// (Windows).

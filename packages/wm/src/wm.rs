@@ -977,6 +977,10 @@ impl WindowManager {
       InvokeCommand::WmEnableBindingMode { name } => {
         enable_binding_mode(name, state, config)
       }
+      InvokeCommand::WmDumpState => {
+        crate::commands::general::dump_wm_state(state, config)?;
+        Ok(())
+      }
       InvokeCommand::WmExit => state.emit_exit(),
       InvokeCommand::WmUncloakNonTracked => {
         #[cfg(target_os = "windows")]

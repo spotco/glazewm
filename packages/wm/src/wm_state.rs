@@ -1,5 +1,5 @@
 use std::{
-  collections::{HashMap, HashSet},
+  collections::{HashMap, HashSet, VecDeque},
   time::Instant,
 };
 
@@ -23,6 +23,9 @@ use crate::{
     general::{platform_sync, LayoutHistory},
     monitor::{add_monitor, move_bounded_workspaces_to_new_monitor},
     window::{manage_window, unmanage_window},
+  },
+  diagnostic_history::{
+    DiagnosticBody, DiagnosticHistory, DiagnosticRecord,
   },
   models::{
     Container, Monitor, NativeMonitorProperties, RootContainer,
@@ -111,6 +114,9 @@ pub struct WmState {
   /// Exact, bounded undo/redo history for structural tiling moves.
   pub layout_history: LayoutHistory,
 
+  /// Bounded focus and z-order samples for a later state dump.
+  diagnostic_history: DiagnosticHistory,
+
   /// Whether the WM is paused.
   pub is_paused: bool,
 
@@ -149,6 +155,7 @@ impl WmState {
       ignored_native_foreground: None,
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
       layout_history: LayoutHistory::default(),
+      diagnostic_history: DiagnosticHistory::default(),
       is_paused: false,
       is_focus_synced: false,
       has_initialized: false,
@@ -676,6 +683,28 @@ impl WmState {
     self
       .normal_z_order_by_workspace
       .insert(workspace_id, window_ids);
+  }
+
+  #[must_use]
+  pub fn startup_z_order_pending(&self) -> bool {
+    self.startup_z_order_pending
+  }
+
+  #[must_use]
+  pub fn show_desktop_minimized_ids(&self) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> =
+      self.show_desktop_minimized.iter().copied().collect();
+    ids.sort();
+    ids
+  }
+
+  pub fn push_diagnostic(&mut self, body: DiagnosticBody) {
+    self.diagnostic_history.push(body);
+  }
+
+  #[must_use]
+  pub fn diagnostic_records(&self) -> &VecDeque<DiagnosticRecord> {
+    self.diagnostic_history.records()
   }
 
   /// Emits a WM event through an MSPC channel.

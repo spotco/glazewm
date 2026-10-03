@@ -792,12 +792,43 @@ fn reorder_focused_workspace_layers_in_workspace(
     log_verbose_native_z_order("pre-reorder", &native_window_ids);
   }
 
-  if let Err(err) = reorder_z_order(&native_window_ids) {
-    tracing::warn!(
-      "Failed to reorder focused workspace window layers: {}",
-      err
-    );
-  }
+  let reorder_error = match reorder_z_order(&native_window_ids) {
+    Ok(()) => None,
+    Err(err) => {
+      tracing::warn!(
+        "Failed to reorder focused workspace window layers: {}",
+        err
+      );
+      Some(crate::diagnostic_history::truncate_error(&err.to_string()))
+    }
+  };
+  let mut native_ranks = sample_z_order_ranks(&native_window_ids)
+    .into_iter()
+    .map(|(window_id, z_order_index)| {
+      crate::diagnostic_history::NativeZRank {
+        hwnd: crate::diagnostic_history::hwnd_i64(window_id.0),
+        z_order_index,
+      }
+    })
+    .collect::<Vec<_>>();
+  native_ranks.sort_by_key(|rank| rank.z_order_index);
+  state.push_diagnostic(
+    crate::diagnostic_history::DiagnosticBody::ZOrderReconcile {
+      workspace_id: workspace.id(),
+      workspace_name: workspace.config().name,
+      focused_hwnd: crate::diagnostic_history::hwnd_i64(
+        focused_window_id.0,
+      ),
+      focused_layer: focused_layer.map(NormalZOrderLayer::as_str),
+      intended_top_to_bottom: native_window_ids
+        .iter()
+        .map(|window_id| crate::diagnostic_history::hwnd_i64(window_id.0))
+        .collect(),
+      native_ranks,
+      native_sample_timing: "immediate_after_reorder_request",
+      reorder_error,
+    },
+  );
 
   if verbose_z_order_enabled() {
     log_verbose_native_z_order("post-reorder", &native_window_ids);
@@ -816,6 +847,16 @@ enum NormalZOrderLayer {
   /// Ignored windows such as Snipping Tool. Same promotion rule as
   /// `Floating`: only the focused one moves.
   Ignored,
+}
+
+impl NormalZOrderLayer {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::Tiling => "tiling",
+      Self::Floating => "floating",
+      Self::Ignored => "ignored",
+    }
+  }
 }
 
 /// Builds the normal-window z-order chain while treating all tiled windows
