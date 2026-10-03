@@ -788,6 +788,32 @@ impl Dispatcher {
       });
     }
   }
+
+  /// Shows `text` in a small dialog the user can select and copy.
+  ///
+  /// The text is also placed on the clipboard when the dialog opens.
+  /// Blocks until the dialog is dismissed. On Windows the dialog runs on
+  /// the event-loop thread.
+  pub fn show_copyable_text_dialog(&self, title: &str, text: &str) {
+    #[cfg(target_os = "windows")]
+    {
+      let title = title.to_string();
+      let text = text.to_string();
+      let owner = self
+        .source
+        .as_ref()
+        .map_or(0, |source| source.message_window_handle);
+      if let Err(err) = self.dispatch_sync(move || {
+        crate::platform_impl::show_copyable_text(owner, &title, &text);
+      }) {
+        tracing::warn!("copyable text dialog failed: {err}");
+      }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+      let _ = (self, title, text);
+    }
+  }
 }
 
 impl std::fmt::Debug for Dispatcher {

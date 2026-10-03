@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+  collections::HashMap,
+  fs,
+  path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -6,11 +10,10 @@ use serde_json::Value;
 use uuid::Uuid;
 use wm_common::{
   ContainerDto, DisplayState, HideMethod, TilingDirection, WindowDto,
-  WindowState,
 };
-use wm_platform::NativeWindowDebugInfo;
 #[cfg(target_os = "windows")]
 use wm_platform::{sample_z_order_ranks, WindowId};
+use wm_platform::{Dispatcher, NativeWindowDebugInfo};
 
 use crate::{
   diagnostic_history::{
@@ -36,6 +39,63 @@ pub fn dump_wm_state(
   let path = write_state_dump(&dump)?;
   tracing::info!("dumped wm state to {}", path.display());
   Ok(path)
+}
+
+/// Writes the same dump to `path`, overwriting an existing file.
+///
+/// A missing `.json` extension is appended. No file picker.
+pub fn dump_wm_state_to_path(
+  state: &WmState,
+  config: &UserConfig,
+  path: &Path,
+) -> anyhow::Result<PathBuf> {
+  let dump = build_state_dump(state, config)?;
+  let path = ensure_json_extension(path.to_path_buf());
+  write_dump_file(&path, &dump, true)?;
+  tracing::info!("dumped wm state to {}", path.display());
+  Ok(path)
+}
+
+/// Tray path: save picker, then a copyable dialog with the written path.
+///
+/// Cancel leaves state untouched and shows nothing. The CLI command does
+/// not call this.
+pub fn dump_wm_state_with_dialog(
+  state: &WmState,
+  config: &UserConfig,
+  dispatcher: &Dispatcher,
+) -> anyhow::Result<()> {
+  let directory = state_dump_directory();
+  fs::create_dir_all(&directory).with_context(|| {
+    format!("create dumps directory {}", directory.display())
+  })?;
+  let default_name =
+    default_state_dump_filename(&diagnostic_history::local_file_stamp());
+  let directory_for_dialog = directory.clone();
+  let picked = dispatcher
+    .dispatch_sync(move || {
+      rfd::FileDialog::new()
+        .set_title("GlazeWM state dump")
+        .add_filter("JSON", &["json"])
+        .set_directory(&directory_for_dialog)
+        .set_file_name(&default_name)
+        .save_file()
+    })
+    .map_err(|err| {
+      anyhow::anyhow!("state dump file dialog failed: {err}")
+    })?;
+
+  let Some(path) = picked else {
+    tracing::info!("State dump cancelled.");
+    return Ok(());
+  };
+
+  let path = dump_wm_state_to_path(state, config, &path)?;
+  dispatcher.show_copyable_text_dialog(
+    "GlazeWM state dump",
+    &path.display().to_string(),
+  );
+  Ok(())
 }
 
 fn build_state_dump(
@@ -275,7 +335,7 @@ fn hide_method_name(hide_method: &HideMethod) -> &'static str {
   }
 }
 
-fn state_dump_directory() -> PathBuf {
+pub(crate) fn state_dump_directory() -> PathBuf {
   home::home_dir()
     .unwrap_or_else(|| PathBuf::from(r"C:\Users\mooto"))
     .join(".glzr")
@@ -283,13 +343,28 @@ fn state_dump_directory() -> PathBuf {
     .join("dumps")
 }
 
-fn write_state_dump(dump: &StateDump) -> anyhow::Result<PathBuf> {
-  let directory = state_dump_directory();
-  fs::create_dir_all(&directory).with_context(|| {
-    format!("create dumps directory {}", directory.display())
-  })?;
-  let stamp = diagnostic_history::local_file_stamp();
-  let mut path = directory.join(format!("state-{stamp}.json"));
+pub(crate) fn default_state_dump_filename(stamp: &str) -> String {
+  format!("state-{stamp}.json")
+}
+
+/// Appends `.json` when the chosen name does not already end with it.
+pub(crate) fn ensure_json_extension(path: PathBuf) -> PathBuf {
+  match path.extension().and_then(|ext| ext.to_str()) {
+    Some(ext) if ext.eq_ignore_ascii_case("json") => path,
+    Some(_) => {
+      let mut os = path.into_os_string();
+      os.push(".json");
+      PathBuf::from(os)
+    }
+    None => path.with_extension("json"),
+  }
+}
+
+fn unique_state_dump_path(
+  directory: &Path,
+  stamp: &str,
+) -> anyhow::Result<PathBuf> {
+  let mut path = directory.join(default_state_dump_filename(stamp));
   let mut suffix = 2u32;
   while path.exists() {
     path = directory.join(format!("state-{stamp}-{suffix}.json"));
@@ -298,14 +373,48 @@ fn write_state_dump(dump: &StateDump) -> anyhow::Result<PathBuf> {
       anyhow::bail!("too many state dumps in the same millisecond");
     }
   }
+  Ok(path)
+}
+
+fn write_state_dump(dump: &StateDump) -> anyhow::Result<PathBuf> {
+  let directory = state_dump_directory();
+  fs::create_dir_all(&directory).with_context(|| {
+    format!("create dumps directory {}", directory.display())
+  })?;
+  let path = unique_state_dump_path(
+    &directory,
+    &diagnostic_history::local_file_stamp(),
+  )?;
+  write_dump_file(&path, dump, false)?;
+  Ok(path)
+}
+
+fn write_dump_file(
+  path: &Path,
+  dump: &StateDump,
+  overwrite: bool,
+) -> anyhow::Result<()> {
+  if let Some(parent) = path.parent() {
+    if !parent.as_os_str().is_empty() {
+      fs::create_dir_all(parent).with_context(|| {
+        format!("create dumps directory {}", parent.display())
+      })?;
+    }
+  }
   let json = serde_json::to_string_pretty(dump)?;
   let partial = path.with_extension("json.partial");
-  fs::write(&partial, format!("{json}\n"))?;
-  fs::rename(&partial, &path).or_else(|err| {
-    let _ = fs::remove_file(&path);
-    fs::rename(&partial, &path).or(Err(err))
+  fs::write(&partial, format!("{json}\n"))
+    .with_context(|| format!("write state dump {}", partial.display()))?;
+  if overwrite && path.exists() {
+    fs::remove_file(path).with_context(|| {
+      format!("replace existing state dump {}", path.display())
+    })?;
+  }
+  fs::rename(&partial, path).or_else(|err| {
+    let _ = fs::remove_file(path);
+    fs::rename(&partial, path).or(Err(err))
   })?;
-  Ok(path)
+  Ok(())
 }
 
 #[derive(Serialize)]
@@ -397,9 +506,15 @@ struct ManagedWindowDump {
 
 #[cfg(test)]
 mod tests {
+  use std::path::PathBuf;
+
   use wm_common::{DisplayState, HideMethod, TilingDirection};
 
-  use super::{taskbar_visibility, StateDump, KEY_STYLE, SCHEMA_VERSION};
+  use super::{
+    default_state_dump_filename, ensure_json_extension,
+    state_dump_directory, taskbar_visibility, unique_state_dump_path,
+    StateDump, KEY_STYLE, SCHEMA_VERSION,
+  };
 
   #[test]
   fn envelope_keys_stay_in_schema_order() {
@@ -490,5 +605,59 @@ mod tests {
       taskbar_visibility(&HideMethod::Hide, false, &DisplayState::Shown),
       ("not_tracked", None)
     );
+  }
+
+  #[test]
+  fn default_filename_includes_the_timestamp_stamp() {
+    let name = default_state_dump_filename("20261003-002530-123");
+    assert_eq!(name, "state-20261003-002530-123.json");
+    assert!(name.contains("20261003-002530-123"));
+  }
+
+  #[test]
+  fn dump_directory_is_glazewm_dumps_under_home() {
+    let dir = state_dump_directory();
+    let rendered = dir.to_string_lossy().replace('\\', "/");
+    assert!(rendered.ends_with(".glzr/glazewm/dumps"), "{rendered}");
+  }
+
+  #[test]
+  fn json_extension_is_kept_or_appended() {
+    assert_eq!(
+      ensure_json_extension(PathBuf::from("state-1.json")),
+      PathBuf::from("state-1.json")
+    );
+    assert_eq!(
+      ensure_json_extension(PathBuf::from("state-1.JSON")),
+      PathBuf::from("state-1.JSON")
+    );
+    assert_eq!(
+      ensure_json_extension(PathBuf::from("state-1")),
+      PathBuf::from("state-1.json")
+    );
+    assert_eq!(
+      ensure_json_extension(PathBuf::from("notes.txt")),
+      PathBuf::from("notes.txt.json")
+    );
+  }
+
+  #[test]
+  fn unique_path_adds_a_suffix_when_the_stamp_exists() {
+    let nanos = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+      "glazewm-dump-name-{}-{}",
+      std::process::id(),
+      nanos
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stamp = "20261003-002530-123";
+    let first = dir.join(default_state_dump_filename(stamp));
+    std::fs::write(&first, b"{}").unwrap();
+    let next = unique_state_dump_path(&dir, stamp).unwrap();
+    assert_eq!(next, dir.join(format!("state-{stamp}-2.json")));
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

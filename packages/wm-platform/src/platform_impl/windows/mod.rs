@@ -1,4 +1,5 @@
 pub(crate) mod com;
+mod copyable_dialog;
 mod display;
 mod display_listener;
 mod event_loop;
@@ -8,6 +9,7 @@ mod native_window;
 mod single_instance;
 mod window_listener;
 
+pub(crate) use copyable_dialog::show_copyable_text;
 pub(crate) use display::*;
 pub(crate) use display_listener::*;
 pub(crate) use event_loop::*;

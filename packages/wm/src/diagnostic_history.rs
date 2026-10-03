@@ -207,8 +207,8 @@ fn local_system_time() -> LocalStamp {
       milliseconds: 0,
     };
     // SAFETY: `raw` is a valid `SYSTEMTIME` out-buffer.
-    unsafe { GetLocalTime(&mut raw) };
-    return LocalStamp {
+    unsafe { GetLocalTime(std::ptr::from_mut(&mut raw)) };
+    LocalStamp {
       year: raw.year,
       month: raw.month,
       day: raw.day,
@@ -216,7 +216,7 @@ fn local_system_time() -> LocalStamp {
       minute: raw.minute,
       second: raw.second,
       milliseconds: raw.milliseconds,
-    };
+    }
   }
 
   #[cfg(not(windows))]

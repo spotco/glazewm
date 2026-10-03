@@ -341,7 +341,15 @@ pub enum InvokeCommand {
     name: String,
   },
   /// Write a timestamped JSON dump of WM and z-order state.
-  WmDumpState,
+  ///
+  /// With no path, writes state-YYYYMMDD-HHMMSS-mmm.json under the
+  /// dumps folder. An optional path writes there instead and does not
+  /// open a file picker (the tray item does that).
+  WmDumpState {
+    /// Destination JSON path. Defaults to the timestamped dumps file.
+    #[clap(value_hint = clap::ValueHint::FilePath)]
+    path: Option<PathBuf>,
+  },
   WmExit,
   /// Uncloak DWM-cloaked top-level windows not currently managed
   /// (Windows).

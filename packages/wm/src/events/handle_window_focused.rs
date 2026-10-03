@@ -14,6 +14,7 @@ use crate::{
   wm_state::WmState,
 };
 
+#[allow(clippy::too_many_lines)]
 pub fn handle_window_focused(
   native_window: &NativeWindow,
   state: &mut WmState,
