@@ -1865,17 +1865,39 @@ pub(crate) fn sample_z_order_ranks(
   ranks
 }
 
+fn z_order_chain_matches(window_ids: &[WindowId]) -> bool {
+  let ranks = sample_z_order_ranks(window_ids);
+  let present_ids: HashSet<WindowId> =
+    ranks.iter().map(|(window_id, _)| *window_id).collect();
+  let expected: Vec<WindowId> = window_ids
+    .iter()
+    .filter(|window_id| present_ids.contains(window_id))
+    .copied()
+    .collect();
+  let actual: Vec<WindowId> =
+    ranks.into_iter().map(|(window_id, _)| window_id).collect();
+  actual == expected
+}
+
+fn foreground_is_in_z_order_chain(window_ids: &[WindowId]) -> bool {
+  let foreground = unsafe { GetForegroundWindow() }.0;
+  window_ids.iter().any(|window_id| window_id.0 == foreground)
+}
+
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
 /// The first *responsive* window is placed at the top of the normal
 /// z-order. Each subsequent responsive window is placed immediately after
 /// the previous responsive one. Hung / non-pumping hwnds are skipped so
-/// they cannot block the WM loop or anchor peers below floaters. A
-/// generation- aware 10ms retry still re-applies after focus settles. When
-/// any hwnd was skipped as hung, delayed recovery retries re-apply the
-/// same chain (100/250/500ms then once per second) so a later-resumed GUI
-/// thread eventually joins full order (cancelled when `Z_ORDER_GENERATION`
-/// advances or focus leaves the intended foreground window).
+/// they cannot block the WM loop or anchor peers below floaters. Because
+/// asynchronous requests to independent GUI queues can complete out of
+/// order, a generation-aware worker re-applies the chain until native
+/// ranks remain correct across two samples. When any hwnd was skipped as
+/// hung, delayed recovery retries re-apply the same chain (100/250/500ms
+/// then once per second) so a later-resumed GUI thread eventually joins
+/// full order. Workers stop when a newer z-order generation starts or the
+/// foreground leaves this workspace chain. Hung recovery also requires
+/// the original chain head to remain foreground.
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -1884,29 +1906,64 @@ pub(crate) fn reorder_z_order(
   }
 
   let generation = next_z_order_generation();
-  let skipped_hung = apply_z_order_chain(window_ids)?;
+  let initial_result = apply_z_order_chain(window_ids)?;
+  let skipped_hung = initial_result.skipped_hung;
 
   let window_ids = window_ids.to_vec();
-  let focused_window = window_ids[0];
   if let Ok(runtime) = Handle::try_current() {
+    let focused_window = window_ids[0];
     let retry_ids = window_ids.clone();
     runtime.spawn(async move {
-      tokio::time::sleep(Duration::from_millis(10)).await;
+      const VERIFY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 250, 500, 1000];
+      let stale = || {
+        Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
+          || !foreground_is_in_z_order_chain(&retry_ids)
+      };
+      let mut delay_index = 0;
+      let mut stable_sample_seen = false;
+      let mut apply_result = initial_result;
 
-      if Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
-        || unsafe { GetForegroundWindow() } != HWND(focused_window.0)
-      {
-        return;
+      loop {
+        tokio::time::sleep(Duration::from_millis(
+          VERIFY_DELAYS_MS[delay_index],
+        ))
+        .await;
+        if stale() {
+          return;
+        }
+
+        if !apply_result.skipped_hung
+          && z_order_chain_matches(&apply_result.responsive_window_ids)
+        {
+          if stable_sample_seen {
+            return;
+          }
+          stable_sample_seen = true;
+        } else {
+          stable_sample_seen = false;
+          match apply_z_order_chain(&retry_ids) {
+            Ok(result) => apply_result = result,
+            Err(_) => return,
+          }
+          if apply_result.skipped_hung {
+            // A probe can briefly time out while a pumping window handles
+            // an earlier queued position change. Wait for those queues to
+            // drain before probing again instead of escalating the normal
+            // convergence backoff.
+            delay_index = delay_index.max(2);
+          }
+        }
+
+        delay_index = (delay_index + 1).min(VERIFY_DELAYS_MS.len() - 1);
       }
-
-      let _ = apply_z_order_chain(&retry_ids);
     });
 
     if skipped_hung {
       // Early absolute checkpoints, then low-frequency 1s backoff until
       // the full chain applies or generation/focus cancels. TID-cached
-      // WM_NULL probes keep each attempt cheap. Foreground abort matches
-      // the 10ms retry: unmanaged Alt-Tab does not bump generation.
+      // WM_NULL probes keep each attempt cheap. Recovery requires the
+      // original chain head to remain foreground so an old hung target
+      // cannot rejoin after focus moves elsewhere.
       const HUNG_RECOVERY_EARLY_AT_MS: &[u64] = &[100, 250, 500];
       let recovery_ids = window_ids;
       runtime.spawn(async move {
@@ -1922,8 +1979,8 @@ pub(crate) fn reorder_z_order(
             return;
           }
           match apply_z_order_chain(&recovery_ids) {
-            Ok(true) => {} // still skipping; try later checkpoint
-            Ok(false) | Err(_) => return,
+            Ok(result) if result.skipped_hung => {}
+            Ok(_) | Err(_) => return,
           }
         }
         loop {
@@ -1932,8 +1989,8 @@ pub(crate) fn reorder_z_order(
             return;
           }
           match apply_z_order_chain(&recovery_ids) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => return,
+            Ok(result) if result.skipped_hung => {}
+            Ok(_) | Err(_) => return,
           }
         }
       });
@@ -2057,9 +2114,17 @@ fn planned_insert_after(
   ZOrderInsertAfter::Top
 }
 
-/// Applies the z-order chain. Returns `true` when any hwnd was skipped as
-/// hung/non-responsive (caller may schedule recovery retries).
-fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<bool> {
+struct ZOrderApplyResult {
+  skipped_hung: bool,
+  responsive_window_ids: Vec<WindowId>,
+}
+
+/// Applies the z-order chain. Reports responsive hwnds separately from
+/// skipped hung windows so convergence checks only include windows that
+/// this pass could place.
+fn apply_z_order_chain(
+  window_ids: &[WindowId],
+) -> crate::Result<ZOrderApplyResult> {
   // Keep SWP_ASYNCWINDOWPOS so a slow-but-pumping foreign queue (or a hung
   // helper) cannot block the WM loop. Prefer ASYNC over sync SetWindowPos
   // even for responsive hwnds — a slow pump must never stall the WM
@@ -2079,6 +2144,7 @@ fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<bool> {
   let mut last_responsive: Option<isize> = None;
   let mut tid_cache: Option<HashMap<u32, bool>> = Some(HashMap::new());
   let mut skipped_hung = false;
+  let mut responsive_window_ids = Vec::new();
 
   for window_id in window_ids {
     let hwnd = HWND(window_id.0);
@@ -2102,9 +2168,13 @@ fn apply_z_order_chain(window_ids: &[WindowId]) -> crate::Result<bool> {
       SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)?;
     }
     last_responsive = Some(window_id.0);
+    responsive_window_ids.push(*window_id);
   }
 
-  Ok(skipped_hung)
+  Ok(ZOrderApplyResult {
+    skipped_hung,
+    responsive_window_ids,
+  })
 }
 
 impl PartialEq for NativeWindow {
@@ -2392,11 +2462,11 @@ mod reorder_z_order_tests {
       Foundation::{HWND, LPARAM, LRESULT, WPARAM},
       UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetLayeredWindowAttributes, GetMessageW, GetTopWindow, GetWindow,
-        GetWindowLongPtrW, InSendMessage, RegisterClassW,
-        SetLayeredWindowAttributes, SetWindowLongPtrW, TranslateMessage,
-        UnregisterClassW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
-        GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
+        GetForegroundWindow, GetLayeredWindowAttributes, GetMessageW,
+        GetTopWindow, GetWindow, GetWindowLongPtrW, InSendMessage,
+        RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW,
+        TranslateMessage, UnregisterClassW, EVENT_OBJECT_DESTROY,
+        EVENT_OBJECT_SHOW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
         LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG, OBJID_WINDOW,
         WINDOW_EX_STYLE, WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW,
         WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
@@ -3677,6 +3747,90 @@ mod reorder_z_order_tests {
     let _ = delayed_helper.wait();
     let _ = prompt_helper.kill();
     let _ = prompt_helper.wait();
+  }
+
+  #[test]
+  fn reorder_z_order_converges_for_eight_independent_gui_queues() {
+    use std::{
+      panic::{catch_unwind, AssertUnwindSafe},
+      time::{Duration, Instant},
+    };
+
+    // Model the captured workspace chain: focused floating VS, six tiled
+    // peers, and a second floating VS. Each HWND owns an independent GUI
+    // queue. The delay gradient makes later requests complete before
+    // earlier ones, while keeping every queue responsive to the 50 ms
+    // `WM_NULL` probe.
+    let delays_ms = [0, 5, 10, 15, 20, 25, 30, 35];
+    let mut helpers = Vec::new();
+    let mut windows = Vec::new();
+    for delay_ms in delays_ms {
+      let (helper, hwnd) =
+        spawn_single_pumping_window_helper(false, delay_ms);
+      helpers.push(helper);
+      windows.push(hwnd);
+    }
+
+    let focused = windows[7];
+    let expected_hwnds = [
+      focused, windows[1], windows[2], windows[3], windows[4], windows[5],
+      windows[6], windows[0],
+    ];
+    let targets = windows.clone();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+      force_foreground(focused, None);
+      assert_eq!(
+        unsafe { GetForegroundWindow() }.0,
+        focused.0,
+        "last helper should retain foreground as the requested chain head"
+      );
+
+      let initial_order = relative_order(&targets);
+      assert_ne!(
+        initial_order,
+        expected_hwnds.iter().map(|hwnd| hwnd.0).collect::<Vec<_>>(),
+        "test must start with a native order different from its target"
+      );
+
+      let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+      runtime.block_on(async {
+        reorder_z_order(
+          &expected_hwnds
+            .iter()
+            .map(|hwnd| WindowId(hwnd.0))
+            .collect::<Vec<_>>(),
+        )
+        .expect("queue focused floating window chain");
+
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let expected = expected_hwnds
+          .iter()
+          .map(|hwnd| hwnd.0)
+          .collect::<Vec<_>>();
+        let mut actual = relative_order(&targets);
+        while Instant::now() < deadline {
+          actual = relative_order(&targets);
+          if actual == expected {
+            break;
+          }
+          tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+          actual, expected,
+          "async cross-queue requests must converge to the eight-window chain"
+        );
+      });
+    }));
+
+    for helper in &mut helpers {
+      let _ = helper.kill();
+      let _ = helper.wait();
+    }
+    if let Err(payload) = result {
+      std::panic::resume_unwind(payload);
+    }
   }
 
   #[test]
