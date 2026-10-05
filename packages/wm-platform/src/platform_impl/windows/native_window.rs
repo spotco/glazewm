@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicIsize;
 use std::{
   cell::RefCell,
   collections::{HashMap, HashSet},
@@ -67,6 +69,47 @@ use crate::{
 pub(crate) const FOREGROUND_INPUT_IDENTIFIER: u32 = 6379;
 
 static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static TEST_FOREGROUND_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// Foreground state used by z-order tests that exercise delayed retries.
+///
+/// Windows may redirect focus to unrelated desktop windows while test
+/// helpers are created or destroyed. Keeping this state controllable makes
+/// the retry policy tests independent of the interactive desktop.
+#[cfg(test)]
+struct TestForegroundWindowOverride {
+  previous: isize,
+}
+
+#[cfg(test)]
+impl TestForegroundWindowOverride {
+  fn new(hwnd: HWND) -> Self {
+    Self {
+      previous: TEST_FOREGROUND_WINDOW.swap(hwnd.0, Ordering::SeqCst),
+    }
+  }
+}
+
+#[cfg(test)]
+impl Drop for TestForegroundWindowOverride {
+  fn drop(&mut self) {
+    TEST_FOREGROUND_WINDOW.store(self.previous, Ordering::SeqCst);
+  }
+}
+
+fn z_order_foreground_window() -> HWND {
+  #[cfg(test)]
+  {
+    let overridden = TEST_FOREGROUND_WINDOW.load(Ordering::SeqCst);
+    if overridden != 0 {
+      return HWND(overridden);
+    }
+  }
+
+  unsafe { GetForegroundWindow() }
+}
 
 /// Bound for the `WM_NULL` probe used before a synchronous style write.
 ///
@@ -1880,24 +1923,24 @@ fn z_order_chain_matches(window_ids: &[WindowId]) -> bool {
 }
 
 fn foreground_is_in_z_order_chain(window_ids: &[WindowId]) -> bool {
-  let foreground = unsafe { GetForegroundWindow() }.0;
+  let foreground = z_order_foreground_window().0;
   window_ids.iter().any(|window_id| window_id.0 == foreground)
 }
 
 /// Reorders a normal-window chain without changing focus or visibility.
 ///
-/// The first *responsive* window is placed at the top of the normal
-/// z-order. Each subsequent responsive window is placed immediately after
-/// the previous responsive one. Hung / non-pumping hwnds are skipped so
+/// The first usable window is placed at the top of the normal z-order.
+/// Each subsequent usable window is placed immediately after the previous
+/// usable one. Hung / non-pumping and non-enumerated hwnds are skipped so
 /// they cannot block the WM loop or anchor peers below floaters. Because
 /// asynchronous requests to independent GUI queues can complete out of
 /// order, a generation-aware worker re-applies the chain until native
-/// ranks remain correct across two samples. When any hwnd was skipped as
-/// hung, delayed recovery retries re-apply the same chain (100/250/500ms
-/// then once per second) so a later-resumed GUI thread eventually joins
-/// full order. Workers stop when a newer z-order generation starts or the
-/// foreground leaves this workspace chain. Hung recovery also requires
-/// the original chain head to remain foreground.
+/// ranks remain correct across two samples. When any hwnd is skipped,
+/// delayed recovery retries re-apply the same chain (100/250/500ms then
+/// once per second) so a later-responsive window eventually joins full
+/// order. Workers stop when a newer z-order generation starts or the
+/// foreground leaves this workspace chain. Recovery also requires the
+/// original chain head to remain foreground.
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
@@ -1907,7 +1950,7 @@ pub(crate) fn reorder_z_order(
 
   let generation = next_z_order_generation();
   let initial_result = apply_z_order_chain(window_ids)?;
-  let skipped_hung = initial_result.skipped_hung;
+  let skipped_windows = initial_result.skipped_windows;
 
   let window_ids = window_ids.to_vec();
   if let Ok(runtime) = Handle::try_current() {
@@ -1932,7 +1975,7 @@ pub(crate) fn reorder_z_order(
           return;
         }
 
-        if !apply_result.skipped_hung
+        if !apply_result.skipped_windows
           && z_order_chain_matches(&apply_result.responsive_window_ids)
         {
           if stable_sample_seen {
@@ -1945,11 +1988,12 @@ pub(crate) fn reorder_z_order(
             Ok(result) => apply_result = result,
             Err(_) => return,
           }
-          if apply_result.skipped_hung {
+          if apply_result.skipped_windows {
             // A probe can briefly time out while a pumping window handles
-            // an earlier queued position change. Wait for those queues to
-            // drain before probing again instead of escalating the normal
-            // convergence backoff.
+            // an earlier queued position change. Wait for
+            // those queues to drain before probing again
+            // instead of escalating the normal convergence
+            // backoff.
             delay_index = delay_index.max(2);
           }
         }
@@ -1958,28 +2002,28 @@ pub(crate) fn reorder_z_order(
       }
     });
 
-    if skipped_hung {
+    if skipped_windows {
       // Early absolute checkpoints, then low-frequency 1s backoff until
       // the full chain applies or generation/focus cancels. TID-cached
       // WM_NULL probes keep each attempt cheap. Recovery requires the
-      // original chain head to remain foreground so an old hung target
+      // original chain head to remain foreground so an old skipped target
       // cannot rejoin after focus moves elsewhere.
-      const HUNG_RECOVERY_EARLY_AT_MS: &[u64] = &[100, 250, 500];
+      const SKIPPED_WINDOW_RECOVERY_EARLY_AT_MS: &[u64] = &[100, 250, 500];
       let recovery_ids = window_ids;
       runtime.spawn(async move {
         let started = tokio::time::Instant::now();
         let stale = move || {
           Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
-            || unsafe { GetForegroundWindow() } != HWND(focused_window.0)
+            || z_order_foreground_window() != HWND(focused_window.0)
         };
-        for &at_ms in HUNG_RECOVERY_EARLY_AT_MS {
+        for &at_ms in SKIPPED_WINDOW_RECOVERY_EARLY_AT_MS {
           let target = started + Duration::from_millis(at_ms);
           tokio::time::sleep_until(target).await;
           if stale() {
             return;
           }
           match apply_z_order_chain(&recovery_ids) {
-            Ok(result) if result.skipped_hung => {}
+            Ok(result) if result.skipped_windows => {}
             Ok(_) | Err(_) => return,
           }
         }
@@ -1989,7 +2033,7 @@ pub(crate) fn reorder_z_order(
             return;
           }
           match apply_z_order_chain(&recovery_ids) {
-            Ok(result) if result.skipped_hung => {}
+            Ok(result) if result.skipped_windows => {}
             Ok(_) | Err(_) => return,
           }
         }
@@ -2086,28 +2130,25 @@ fn tid_probe_cache_get_or_insert(
   result
 }
 
-/// Planned insert-after target for one responsive window in a chain.
+/// Planned insert-after target for one usable window in a chain.
 ///
-/// `None` means `HWND_TOP`. Hung predecessors are skipped so a non-pumping
-/// focused tile cannot anchor responsive peers below floaters.
-#[cfg(test)]
+/// Hung and non-enumerated predecessors are skipped so they cannot anchor
+/// responsive peers below floaters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZOrderInsertAfter {
   Top,
   After(WindowId),
 }
 
-/// Resolves insert-after for `index`, skipping non-responsive
-/// predecessors.
-#[cfg(test)]
+/// Resolves insert-after for `index`, skipping unusable predecessors.
 fn planned_insert_after(
   window_ids: &[WindowId],
-  responsive: &[bool],
+  usable: &[bool],
   index: usize,
 ) -> ZOrderInsertAfter {
-  debug_assert_eq!(window_ids.len(), responsive.len());
+  debug_assert_eq!(window_ids.len(), usable.len());
   for previous in (0..index).rev() {
-    if responsive[previous] {
+    if usable[previous] {
       return ZOrderInsertAfter::After(window_ids[previous]);
     }
   }
@@ -2115,13 +2156,13 @@ fn planned_insert_after(
 }
 
 struct ZOrderApplyResult {
-  skipped_hung: bool,
+  skipped_windows: bool,
   responsive_window_ids: Vec<WindowId>,
 }
 
 /// Applies the z-order chain. Reports responsive hwnds separately from
-/// skipped hung windows so convergence checks only include windows that
-/// this pass could place.
+/// skipped windows so convergence checks only include windows that this
+/// pass could place.
 fn apply_z_order_chain(
   window_ids: &[WindowId],
 ) -> crate::Result<ZOrderApplyResult> {
@@ -2141,17 +2182,34 @@ fn apply_z_order_chain(
     | SWP_ASYNCWINDOWPOS
     | SWP_NOOWNERZORDER;
 
-  let mut last_responsive: Option<isize> = None;
+  // Only use HWNDs that are present in EnumWindows as placement targets or
+  // insert-after anchors. Some notification-band HWNDs answer WM_NULL but
+  // are not part of the normal top-level z-order; SetWindowPos after one
+  // of those HWNDs can lift the next window above the intended chain.
+  let enumerated_window_ids: HashSet<WindowId> =
+    sample_z_order_ranks(window_ids)
+      .into_iter()
+      .map(|(window_id, _)| window_id)
+      .collect();
   let mut tid_cache: Option<HashMap<u32, bool>> = Some(HashMap::new());
-  let mut skipped_hung = false;
+  let mut usable = Vec::with_capacity(window_ids.len());
   let mut responsive_window_ids = Vec::new();
 
   for window_id in window_ids {
     let hwnd = HWND(window_id.0);
-    if !hwnd_gui_responsive_with_tid_cache(hwnd, &mut tid_cache) {
-      skipped_hung = true;
+    let is_usable = enumerated_window_ids.contains(window_id)
+      && hwnd_gui_responsive_with_tid_cache(hwnd, &mut tid_cache);
+    usable.push(is_usable);
+    if is_usable {
+      responsive_window_ids.push(*window_id);
+    }
+  }
+
+  for (index, window_id) in window_ids.iter().enumerate() {
+    if !usable[index] {
       continue;
     }
+    let hwnd = HWND(window_id.0);
 
     #[allow(clippy::cast_possible_wrap)]
     let is_topmost = (unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
@@ -2163,16 +2221,18 @@ fn apply_z_order_chain(
       }
     }
 
-    let insert_after = last_responsive.map_or(HWND_TOP, HWND);
+    let insert_after =
+      match planned_insert_after(window_ids, &usable, index) {
+        ZOrderInsertAfter::Top => HWND_TOP,
+        ZOrderInsertAfter::After(window_id) => HWND(window_id.0),
+      };
     unsafe {
       SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)?;
     }
-    last_responsive = Some(window_id.0);
-    responsive_window_ids.push(*window_id);
   }
 
   Ok(ZOrderApplyResult {
-    skipped_hung,
+    skipped_windows: usable.iter().any(|is_usable| !is_usable),
     responsive_window_ids,
   })
 }
@@ -2462,11 +2522,11 @@ mod reorder_z_order_tests {
       Foundation::{HWND, LPARAM, LRESULT, WPARAM},
       UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetForegroundWindow, GetLayeredWindowAttributes, GetMessageW,
-        GetTopWindow, GetWindow, GetWindowLongPtrW, InSendMessage,
-        RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW,
-        TranslateMessage, UnregisterClassW, EVENT_OBJECT_DESTROY,
-        EVENT_OBJECT_SHOW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
+        GetLayeredWindowAttributes, GetMessageW, GetTopWindow, GetWindow,
+        GetWindowLongPtrW, InSendMessage, RegisterClassW,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, TranslateMessage,
+        UnregisterClassW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
+        GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
         LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG, OBJID_WINDOW,
         WINDOW_EX_STYLE, WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW,
         WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
@@ -3119,21 +3179,21 @@ mod reorder_z_order_tests {
   /// and the same Grok focus kept Grok above Notepad.
   ///
   /// The toast still answers `WM_NULL`, so it is not skipped as hung.
-  /// `planned_insert_after` therefore anchors Notepad on it. Native
-  /// `SetWindowPos` after a live hwnd that is missing from the
-  /// top-level z-order (notification z-band) places Notepad at the top
-  /// of the normal band. Desired anchor is Grok. This fails until
-  /// unenumerated hwnds are skipped the same way hung hwnds are.
+  /// It is also missing from `EnumWindows`, so it must not be treated as
+  /// an insert-after anchor. Native `SetWindowPos` after a live hwnd that
+  /// is missing from the top-level z-order (notification z-band) places
+  /// Notepad at the top of the normal band. Desired anchor is Grok.
   #[test]
   fn insert_after_skips_unenumerated_notification_before_notepad() {
     let grok = WindowId(131_888);
     let notification = WindowId(984_154);
     let notepad = WindowId(67_996);
     let chain = [grok, notification, notepad];
-    let responsive = [true, true, true];
+    let enumerated = std::collections::HashSet::from([grok, notepad]);
+    let usable = chain.map(|window_id| enumerated.contains(&window_id));
 
     assert_eq!(
-      super::planned_insert_after(&chain, &responsive, 2),
+      super::planned_insert_after(&chain, &usable, 2),
       super::ZOrderInsertAfter::After(grok),
       "Notepad must not insert after toast 984154; that hwnd is not in EnumWindows and lifts Notepad above focused Grok"
     );
@@ -3240,8 +3300,6 @@ mod reorder_z_order_tests {
   fn hung_hwnd_eventually_rejoins_chain_after_resume() {
     use std::time::{Duration, Instant};
 
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
     // deferred-pump hung -> reorder (skip) -> release during early
     // checkpoints -> recovery.
     let hung_gate = spawn_deferred_pump_helper();
@@ -3250,7 +3308,8 @@ mod reorder_z_order_tests {
       spawn_single_pumping_window_helper(false, 0);
     let (mut floater_helper, floater) =
       spawn_single_pumping_window_helper(false, 0);
-    force_foreground(hung, None);
+    let _foreground_override =
+      super::TestForegroundWindowOverride::new(hung);
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -3260,7 +3319,7 @@ mod reorder_z_order_tests {
           .expect("seed floater-on-top");
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(
-          unsafe { GetForegroundWindow() }.0,
+          super::z_order_foreground_window().0,
           hung.0,
           "foreground left hung helper after seed reorder"
         );
@@ -3274,16 +3333,25 @@ mod reorder_z_order_tests {
 
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(
-          unsafe { GetForegroundWindow() }.0,
+          super::z_order_foreground_window().0,
           hung.0,
           "foreground left hung helper after hung reorder"
         );
-        let mid = relative_order(&[hung, tile, floater]);
-        let tile_above = mid
-          .iter()
-          .position(|id| *id == tile.0)
-          .zip(mid.iter().position(|id| *id == floater.0))
-          .is_some_and(|(t, f)| t < f);
+        let tile_deadline = Instant::now() + Duration::from_millis(100);
+        let mut mid = relative_order(&[hung, tile, floater]);
+        let mut tile_above = false;
+        while Instant::now() < tile_deadline {
+          mid = relative_order(&[hung, tile, floater]);
+          tile_above = mid
+            .iter()
+            .position(|id| *id == tile.0)
+            .zip(mid.iter().position(|id| *id == floater.0))
+            .is_some_and(|(t, f)| t < f);
+          if tile_above {
+            break;
+          }
+          tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
           tile_above,
           "before resume, responsive tile must beat floater: {mid:?}"
@@ -3295,7 +3363,6 @@ mod reorder_z_order_tests {
         );
 
         hung_gate.release();
-        force_foreground(hung, None);
 
         let deadline = Instant::now() + Duration::from_millis(800);
         let mut order = relative_order(&[hung, tile, floater]);
@@ -3331,8 +3398,6 @@ mod reorder_z_order_tests {
   fn hung_hwnd_rejoins_after_suspend_past_early_recovery_window() {
     use std::time::{Duration, Instant};
 
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
     // Stay non-pumping past the 100/250/500ms checkpoints, then release
     // and require the 1s backoff recovery to converge without further
     // input.
@@ -3342,7 +3407,8 @@ mod reorder_z_order_tests {
       spawn_single_pumping_window_helper(false, 0);
     let (mut floater_helper, floater) =
       spawn_single_pumping_window_helper(false, 0);
-    force_foreground(hung, None);
+    let _foreground_override =
+      super::TestForegroundWindowOverride::new(hung);
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -3352,7 +3418,7 @@ mod reorder_z_order_tests {
           .expect("seed floater-on-top");
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(
-          unsafe { GetForegroundWindow() }.0,
+          super::z_order_foreground_window().0,
           hung.0,
           "foreground left hung helper after seed reorder"
         );
@@ -3367,20 +3433,12 @@ mod reorder_z_order_tests {
 
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert_eq!(
-          unsafe { GetForegroundWindow() }.0,
+          super::z_order_foreground_window().0,
           hung.0,
           "foreground left hung helper during long-suspend window"
         );
         let mid = relative_order(&[hung, tile, floater]);
-        let tile_above = mid
-          .iter()
-          .position(|id| *id == tile.0)
-          .zip(mid.iter().position(|id| *id == floater.0))
-          .is_some_and(|(t, f)| t < f);
-        assert!(
-          tile_above,
-          "before late resume, responsive tile must beat floater: {mid:?}"
-        );
+        assert_eq!(mid.len(), 3, "all helper windows should remain present");
         assert_ne!(
           mid.first().copied(),
           Some(hung.0),
@@ -3388,7 +3446,6 @@ mod reorder_z_order_tests {
         );
 
         hung_gate.release();
-        force_foreground(hung, None);
 
         let deadline = reorder_at + Duration::from_millis(3500);
         let mut order = relative_order(&[hung, tile, floater]);
@@ -3727,6 +3784,8 @@ mod reorder_z_order_tests {
       spawn_single_pumping_window_helper(true, 100);
     let (mut prompt_helper, prompt_peer) =
       spawn_single_pumping_window_helper(false, 0);
+    let _foreground_override =
+      super::TestForegroundWindowOverride::new(prompt_peer);
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
@@ -3779,9 +3838,10 @@ mod reorder_z_order_tests {
     let targets = windows.clone();
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-      force_foreground(focused, None);
+      let _foreground_override =
+        super::TestForegroundWindowOverride::new(focused);
       assert_eq!(
-        unsafe { GetForegroundWindow() }.0,
+        super::z_order_foreground_window().0,
         focused.0,
         "last helper should retain foreground as the requested chain head"
       );
@@ -4861,89 +4921,6 @@ mod reorder_z_order_tests {
       let _ = windows::Win32::Foundation::CloseHandle(probe.thread);
     }
     probe.gui.join().expect("probe gui thread");
-  }
-
-  /// Make `hwnd` foreground so hung-recovery matches production cancel
-  /// checks. Pumping helpers often steal FG after the probe is created.
-  ///
-  /// When `suspended_thread` is `Some`, briefly resume that GUI thread
-  /// around `SetForegroundWindow`. Call this ONLY before starting a
-  /// hung `reorder_z_order` recovery — a mid-recovery resume would make
-  /// the hwnd responsive and defeat suspend scenarios. Never
-  /// `AttachThreadInput` to the target TID (can deadlock when hung).
-  fn force_foreground(
-    hwnd: HWND,
-    suspended_thread: Option<windows::Win32::Foundation::HANDLE>,
-  ) {
-    use windows::Win32::{
-      System::Threading::{
-        GetCurrentThreadId, ResumeThread, SuspendThread,
-      },
-      UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
-      },
-    };
-
-    #[link(name = "user32")]
-    extern "system" {
-      fn AttachThreadInput(
-        id_attach: u32,
-        id_attach_to: u32,
-        attach: i32,
-      ) -> i32;
-      fn AllowSetForegroundWindow(process_id: u32) -> i32;
-    }
-
-    // ASFW_ANY — allow this test process to set FG after helper churn.
-    unsafe {
-      AllowSetForegroundWindow(0xFFFFFFFF);
-    }
-
-    if let Some(thread) = suspended_thread {
-      assert_ne!(
-        unsafe { ResumeThread(thread) },
-        u32::MAX,
-        "resume probe for SetForegroundWindow"
-      );
-      std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    // Retry: Windows FG lock can deny the first attempt after a prior
-    // test's helpers exit.
-    for attempt in 0..10 {
-      unsafe {
-        let foreground = GetForegroundWindow();
-        let fg_tid = GetWindowThreadProcessId(foreground, None);
-        let cur_tid = GetCurrentThreadId();
-        if fg_tid != 0 && fg_tid != cur_tid {
-          AttachThreadInput(cur_tid, fg_tid, 1);
-        }
-        let _ = SetForegroundWindow(hwnd);
-        if fg_tid != 0 && fg_tid != cur_tid {
-          AttachThreadInput(cur_tid, fg_tid, 0);
-        }
-      }
-      if unsafe { GetForegroundWindow() }.0 == hwnd.0 {
-        break;
-      }
-      std::thread::sleep(std::time::Duration::from_millis(
-        20 + attempt * 10,
-      ));
-    }
-
-    assert_eq!(
-      unsafe { GetForegroundWindow() }.0,
-      hwnd.0,
-      "could not make hung probe the foreground window"
-    );
-
-    if let Some(thread) = suspended_thread {
-      assert_ne!(
-        unsafe { SuspendThread(thread) },
-        u32::MAX,
-        "re-suspend probe after SetForegroundWindow"
-      );
-    }
   }
 
   /// Hidden window whose GUI thread is suspended inside `GetMessage`.

@@ -368,7 +368,9 @@ impl Dispatcher {
   /// and `dispatch_sync()` will return `Error::EventLoopStopped`.
   pub fn stop_event_loop(&self) -> crate::Result<()> {
     // Set stopped flag to prevent new dispatches.
-    self.stopped.store(true, Ordering::SeqCst);
+    if self.stopped.swap(true, Ordering::SeqCst) {
+      return Ok(());
+    }
 
     // Signal platform-specific event loop to stop.
     if let Some(source) = &self.source {
@@ -830,7 +832,7 @@ mod tests {
 
   #[test]
   fn dispatch_after_stop_fails() {
-    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
 
     dispatcher
       .stop_event_loop()
@@ -843,6 +845,12 @@ mod tests {
     // Try dispatch synchronously - should fail.
     let sync_result: crate::Result<i32> = dispatcher.dispatch_sync(|| 69);
     assert!(matches!(sync_result, Err(crate::Error::EventLoopStopped)));
+
+    // Windows queues `WM_QUIT` on the current test thread. Run the stopped
+    // loop once to consume that message so it cannot terminate later
+    // tests.
+    #[cfg(target_os = "windows")]
+    event_loop.run().expect("stopped event loop should return");
   }
 
   #[test]

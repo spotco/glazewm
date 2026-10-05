@@ -34,6 +34,10 @@ cargo build && cargo run
 
 After making your changes, push to your fork and [submit a pull request](https://github.com/glzr-io/zebar/pulls) against the `main` branch. Please try to address only a single feature or fix in the PR so that it's easy to review.
 
+### Validation before pushing or distributing builds
+
+Run all required tests and CI checks for the exact commit before pushing it or distributing a build archive. Do not push or deploy an archive while any required check is failing or has not run; fix the failure and rerun the checks first.
+
 ### Tips
 
 If using VSCode, it's recommended to use the [Rust Analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer) extension. Get automatic linting by adding this to your VSCode's `settings.json`:

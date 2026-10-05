@@ -74,3 +74,10 @@ pub fn my_function() { ... }
 - Write unit tests for core functionality.
 
 </test_guidelines>
+
+<release_safety_policy>
+
+- Never push a branch or deploy/share a build archive until all required CI checks and tests for that exact commit have passed.
+- If a check fails or has not run, fix it and rerun the required checks before pushing or distributing the archive.
+
+</release_safety_policy>

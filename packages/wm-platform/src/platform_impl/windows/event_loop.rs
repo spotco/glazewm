@@ -158,6 +158,7 @@ impl EventLoopSource {
 /// Platform-specific implementation of [`EventLoop`].
 pub(crate) struct EventLoop {
   source: EventLoopSource,
+  stopped: Arc<AtomicBool>,
 }
 
 impl EventLoop {
@@ -175,9 +176,10 @@ impl EventLoop {
     };
 
     let stopped = Arc::new(AtomicBool::new(false));
-    let dispatcher = Dispatcher::new(Some(source.clone()), stopped);
+    let dispatcher =
+      Dispatcher::new(Some(source.clone()), stopped.clone());
 
-    Ok((Self { source }, dispatcher))
+    Ok((Self { source, stopped }, dispatcher))
   }
 
   /// Implements [`EventLoop::run`].
@@ -197,6 +199,10 @@ impl EventLoop {
       }
     }
 
+    // `Drop` runs after this method returns. Mark the loop stopped so it
+    // does not enqueue a second `WM_QUIT` on the caller's thread queue.
+    self.stopped.store(true, Ordering::SeqCst);
+
     tracing::info!("Event loop thread exiting.");
     unsafe { DestroyWindow(HWND(self.source.message_window_handle)) }?;
 
@@ -206,7 +212,9 @@ impl EventLoop {
   /// Shuts down the event loop gracefully.
   pub(crate) fn shutdown(&mut self) -> crate::Result<()> {
     tracing::info!("Shutting down event loop.");
-    self.source.send_stop()?;
+    if !self.stopped.swap(true, Ordering::SeqCst) {
+      self.source.send_stop()?;
+    }
 
     Ok(())
   }
