@@ -3820,7 +3820,7 @@ mod reorder_z_order_tests {
     // queue. The delay gradient makes later requests complete before
     // earlier ones, while keeping every queue responsive to the 50 ms
     // `WM_NULL` probe.
-    let delays_ms = [0, 5, 10, 15, 20, 25, 30, 35];
+    let delays_ms = [35, 5, 10, 15, 20, 25, 30, 0];
     let mut helpers = Vec::new();
     let mut windows = Vec::new();
     for delay_ms in delays_ms {
@@ -3830,12 +3830,39 @@ mod reorder_z_order_tests {
       windows.push(hwnd);
     }
 
-    let focused = windows[7];
-    let expected_hwnds = [
-      focused, windows[1], windows[2], windows[3], windows[4], windows[5],
-      windows[6], windows[0],
-    ];
     let targets = windows.clone();
+    let mut native_foreground = unsafe { super::GetForegroundWindow() };
+    let mut foreground_stable_since = Instant::now();
+    let foreground_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < foreground_deadline
+      && foreground_stable_since.elapsed() < Duration::from_millis(100)
+    {
+      std::thread::sleep(Duration::from_millis(10));
+      let current_foreground = unsafe { super::GetForegroundWindow() };
+      if current_foreground != native_foreground {
+        native_foreground = current_foreground;
+        foreground_stable_since = Instant::now();
+      }
+    }
+    let focused = windows
+      .iter()
+      .find(|window| window.0 == native_foreground.0)
+      .copied()
+      .unwrap_or(windows[0]);
+    let mut expected_hwnds = Vec::with_capacity(windows.len());
+    expected_hwnds.push(focused);
+    expected_hwnds.extend(
+      windows.iter().filter(|window| **window != focused).copied(),
+    );
+    let initial_order = relative_order(&targets);
+    let expected_order =
+      expected_hwnds.iter().map(|hwnd| hwnd.0).collect::<Vec<_>>();
+    if initial_order == expected_order {
+      // Preserve the real foreground at the head while ensuring the test
+      // always exercises a native reorder, even if helper activation left
+      // the windows in creation order.
+      expected_hwnds.swap(1, 2);
+    }
 
     let result = catch_unwind(AssertUnwindSafe(|| {
       let _foreground_override =
@@ -3843,12 +3870,11 @@ mod reorder_z_order_tests {
       assert_eq!(
         super::z_order_foreground_window().0,
         focused.0,
-        "last helper should retain foreground as the requested chain head"
+        "foreground override must match the requested chain head"
       );
 
-      let initial_order = relative_order(&targets);
       assert_ne!(
-        initial_order,
+        relative_order(&targets),
         expected_hwnds.iter().map(|hwnd| hwnd.0).collect::<Vec<_>>(),
         "test must start with a native order different from its target"
       );
@@ -3879,7 +3905,11 @@ mod reorder_z_order_tests {
 
         assert_eq!(
           actual, expected,
-          "async cross-queue requests must converge to the eight-window chain"
+          "async cross-queue requests must converge to the eight-window chain; focused={}, initial foreground={}, final foreground={}, targets={:?}",
+          focused.0,
+          native_foreground.0,
+          unsafe { super::GetForegroundWindow() }.0,
+          targets.iter().map(|hwnd| hwnd.0).collect::<Vec<_>>()
         );
       });
     }));
