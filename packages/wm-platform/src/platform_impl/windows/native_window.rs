@@ -3790,8 +3790,8 @@ mod reorder_z_order_tests {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(async {
       reorder_z_order(&[
-        WindowId(delayed_topmost.0),
         WindowId(prompt_peer.0),
+        WindowId(delayed_topmost.0),
       ])
       .expect("reorder independently serviced foreign windows");
 
@@ -3800,7 +3800,7 @@ mod reorder_z_order_tests {
       tokio::time::sleep(Duration::from_millis(500)).await;
     });
 
-    assert_foreign_z_order_converges(&[delayed_topmost, prompt_peer]);
+    assert_foreign_z_order_converges(&[prompt_peer, delayed_topmost]);
 
     let _ = delayed_helper.kill();
     let _ = delayed_helper.wait();
