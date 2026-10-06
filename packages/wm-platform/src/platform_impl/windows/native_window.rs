@@ -2529,8 +2529,8 @@ mod reorder_z_order_tests {
         GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
         LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG, OBJID_WINDOW,
         WINDOW_EX_STYLE, WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW,
-        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
-        WS_VISIBLE,
+        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
       },
     },
   };
@@ -2629,7 +2629,7 @@ mod reorder_z_order_tests {
     let title = wide("GlazeWM deferred-pump z-order helper");
     let hwnd = unsafe {
       CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        WS_EX_NOACTIVATE,
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -2997,10 +2997,18 @@ mod reorder_z_order_tests {
 
     let topmost = std::env::var("GLAZEWM_Z_ORDER_TOPMOST").ok().as_deref()
       == Some("1");
+    let no_activate =
+      std::env::var("GLAZEWM_Z_ORDER_NO_ACTIVATE").ok().as_deref()
+        == Some("1");
     let ex_style = if topmost {
       WS_EX_TOPMOST
     } else {
       WINDOW_EX_STYLE::default()
+    };
+    let ex_style = if no_activate {
+      ex_style | WS_EX_NOACTIVATE
+    } else {
+      ex_style
     };
     let title = wide("GlazeWM independent z-order helper");
     let hwnd = unsafe {
@@ -3239,9 +3247,9 @@ mod reorder_z_order_tests {
     let hung = read_helper_hwnd(&mut hung_helper, "GLAZEWM_Z_ORDER_HWND:");
 
     let (mut tile_helper, tile) =
-      spawn_single_pumping_window_helper(false, 0);
+      spawn_single_pumping_window_helper(false, 0, true);
     let (mut floater_helper, floater) =
-      spawn_single_pumping_window_helper(false, 0);
+      spawn_single_pumping_window_helper(false, 0, true);
 
     // Steam-on-top starting shape.
     let initial = [floater.0, tile.0, hung.0];
@@ -3305,9 +3313,9 @@ mod reorder_z_order_tests {
     let hung_gate = spawn_deferred_pump_helper();
     let hung = hung_gate.hwnd;
     let (mut tile_helper, tile) =
-      spawn_single_pumping_window_helper(false, 0);
+      spawn_single_pumping_window_helper(false, 0, true);
     let (mut floater_helper, floater) =
-      spawn_single_pumping_window_helper(false, 0);
+      spawn_single_pumping_window_helper(false, 0, true);
     let _foreground_override =
       super::TestForegroundWindowOverride::new(hung);
 
@@ -3404,9 +3412,9 @@ mod reorder_z_order_tests {
     let hung_gate = spawn_deferred_pump_helper();
     let hung = hung_gate.hwnd;
     let (mut tile_helper, tile) =
-      spawn_single_pumping_window_helper(false, 0);
+      spawn_single_pumping_window_helper(false, 0, true);
     let (mut floater_helper, floater) =
-      spawn_single_pumping_window_helper(false, 0);
+      spawn_single_pumping_window_helper(false, 0, true);
     let _foreground_override =
       super::TestForegroundWindowOverride::new(hung);
 
@@ -3719,6 +3727,7 @@ mod reorder_z_order_tests {
   fn spawn_single_pumping_window_helper(
     topmost: bool,
     delay_ms: u64,
+    no_activate: bool,
   ) -> (std::process::Child, HWND) {
     use std::{
       io::{BufRead, BufReader},
@@ -3729,6 +3738,10 @@ mod reorder_z_order_tests {
     let mut helper = Command::new(current_exe)
       .env("GLAZEWM_Z_ORDER_HELPER", "single-pumping-window")
       .env("GLAZEWM_Z_ORDER_TOPMOST", if topmost { "1" } else { "0" })
+      .env(
+        "GLAZEWM_Z_ORDER_NO_ACTIVATE",
+        if no_activate { "1" } else { "0" },
+      )
       .env("GLAZEWM_Z_ORDER_DELAY_MS", delay_ms.to_string())
       .arg("z_order_test_helper_single_pumping_window")
       .arg("--nocapture")
@@ -3776,14 +3789,14 @@ mod reorder_z_order_tests {
   fn reorder_z_order_retries_across_independent_foreign_gui_queues() {
     use std::time::Duration;
 
-    // The first process deliberately stalls its queue while the second
-    // process services its requests immediately. This forces the
-    // production retry to run after the initial requests have been
-    // serviced out of order.
-    let (mut delayed_helper, delayed_topmost) =
-      spawn_single_pumping_window_helper(true, 100);
+    // The first process is the foreground chain head. The second process
+    // deliberately stalls its queue while servicing requests, forcing the
+    // retry to recover a delayed peer without relying on desktop
+    // activation.
     let (mut prompt_helper, prompt_peer) =
-      spawn_single_pumping_window_helper(false, 0);
+      spawn_single_pumping_window_helper(false, 0, false);
+    let (mut delayed_helper, delayed_topmost) =
+      spawn_single_pumping_window_helper(true, 100, true);
     let _foreground_override =
       super::TestForegroundWindowOverride::new(prompt_peer);
 
@@ -3824,8 +3837,9 @@ mod reorder_z_order_tests {
     let mut helpers = Vec::new();
     let mut windows = Vec::new();
     for delay_ms in delays_ms {
+      let no_activate = !helpers.is_empty();
       let (helper, hwnd) =
-        spawn_single_pumping_window_helper(false, delay_ms);
+        spawn_single_pumping_window_helper(false, delay_ms, no_activate);
       helpers.push(helper);
       windows.push(hwnd);
     }
