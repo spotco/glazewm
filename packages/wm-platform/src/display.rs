@@ -224,8 +224,15 @@ pub trait DisplayDeviceExtWindows {
   /// # Example usage
   ///
   /// ```rust,no_run
-  /// device.device_path(); // "\\?\DISPLAY#DEL40A3#5&1234abcd&0&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
-  /// device.hardware_id(); // Some("DEL40A3")
+  /// use wm_platform::{DisplayDeviceExtWindows, EventLoop};
+  ///
+  /// # fn main() -> wm_platform::Result<()> {
+  /// let (_event_loop, dispatcher) = EventLoop::new()?;
+  /// let device = dispatcher.primary_display()?.main_device()?;
+  /// let _device_path: Option<String> = device.device_path();
+  /// let _hardware_id: Option<String> = device.hardware_id();
+  /// # Ok(())
+  /// # }
   /// ```
   ///
   /// # Platform-specific

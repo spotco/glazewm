@@ -21,7 +21,7 @@ mod prelude {
 ///   `SubEnumTwo` share variant(s).
 ///
 /// Accepts a defaults block of attributes to be added to every subenum
-/// ```
+/// ```rust,ignore
 /// #[subenum(defaults, {
 ///   /// Subenum of [X]
 ///   #[derive(Clone, Debug)]
@@ -29,7 +29,7 @@ mod prelude {
 /// ```
 ///
 /// And any number of subenum declarations, which are defined as
-/// ```
+/// ```rust,ignore
 /// #[subenum(SubenumName, {
 ///   /// Subset of [X] that can be checked for equality.
 ///   #[derive(PartialEq)] // Will also derive [Clone] and [Debug] from the defaults block
@@ -38,6 +38,8 @@ mod prelude {
 ///
 /// # Example
 /// ```
+/// # use std::hash::Hash;
+/// # use std::path::PathBuf;
 /// /// Your main enum documentation
 /// // Note that the defaults block does not apply to the main enum itself.
 /// #[derive(Clone, Debug, wm_macros::SubEnum)]
@@ -62,11 +64,12 @@ mod prelude {
 /// }
 ///
 /// let name = String::from("example");
-/// let name_enum = MainEnum::from(name);
+/// let name_enum = MainEnum::Name(name);
 ///
 /// // Try to convert MainEnum to Hashable.
 /// let hashable_name = Hashable::try_from(name_enum).unwrap(); // Will succeed, as `Name` is present in the `Hashable` subenum.
-/// hashable_name.hash();
+/// let mut hasher = std::collections::hash_map::DefaultHasher::new();
+/// hashable_name.hash(&mut hasher);
 ///
 /// let similar_name = Similar::try_from(hashable_name.clone());
 /// assert!(similar_name.is_err()); // Will fail, as `Name` is not present in the `Similar` subenum.
@@ -75,7 +78,7 @@ mod prelude {
 /// let name_enum: MainEnum = hashable_name.into();
 ///
 /// let length = 42;
-/// let length_enum: MainEnum = length.into();
+/// let length_enum = MainEnum::Length(length);
 ///
 /// let similar_length = Similar::try_from(length_enum).unwrap();
 ///
@@ -105,12 +108,13 @@ pub fn sub_enum(input: TokenStream) -> TokenStream {
 /// let one = One;
 /// let my_enum: MyEnum = one.into(); // Converts One into MyEnum::One(One)
 ///
-/// let one = my_enum.try_into().unwrap(); // Attempts to convert MyEnum::One(One) into One
+/// let one: Result<One, &'static str> = my_enum.try_into(); // Attempts to convert MyEnum::One(One) into One
+/// assert!(one.is_ok());
 ///
 /// let two = Two;
 /// let my_enum: MyEnum = two.into(); // Converts Two into MyEnum::Two(Two)
 ///
-/// let one = my_enum.try_into(); // Will fail, as MyEnum::Two(Two) cannot be converted to One
+/// let one: Result<One, &'static str> = my_enum.try_into(); // Will fail, as MyEnum::Two(Two) cannot be converted to One
 /// assert!(one.is_err());
 /// ```
 #[proc_macro_derive(EnumFromInner)]
