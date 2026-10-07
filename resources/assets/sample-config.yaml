@@ -1,4 +1,10 @@
 general:
+  # Whether to request administrator privileges when GlazeWM starts.
+  # Windows shows a UAC prompt when enabled and GlazeWM is not already
+  # elevated. Commands launched by GlazeWM may also run as administrator.
+  # Changes take effect after restarting GlazeWM.
+  run_as_admin: false
+
   # Commands to run when the WM has started. This is useful for running a
   # script or launching another application.
   # Example: The below command launches Zebar.

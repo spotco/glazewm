@@ -78,8 +78,13 @@ fn main() -> anyhow::Result<()> {
 
     let task_handle = std::thread::spawn(move || {
       rt.block_on(async {
-        let start_res =
-          start_wm(config_path, verbosity, &dispatcher).await;
+        let start_res = start_wm(
+          config_path,
+          verbosity,
+          args.iter().skip(1).cloned().collect(),
+          &dispatcher,
+        )
+        .await;
 
         if let Err(err) = &start_res {
           // If unable to start the WM, the error is fatal and a message
@@ -115,6 +120,7 @@ fn main() -> anyhow::Result<()> {
 async fn start_wm(
   config_path: Option<PathBuf>,
   verbosity: Verbosity,
+  startup_args: Vec<String>,
   dispatcher: &Dispatcher,
 ) -> anyhow::Result<()> {
   setup_logging(&verbosity)?;
@@ -136,6 +142,40 @@ async fn start_wm(
 
   // Parse and validate user config.
   let mut config = UserConfig::new(config_path)?;
+
+  #[cfg(not(target_os = "windows"))]
+  let _ = &startup_args;
+
+  #[cfg(target_os = "windows")]
+  if config.value.general.run_as_admin
+    && !wm_platform::is_process_elevated()?
+  {
+    let mut elevated_args = startup_args;
+    if !elevated_args.iter().any(|arg| {
+      arg == "-c" || arg == "--config" || arg.starts_with("--config=")
+    }) {
+      if elevated_args.is_empty() {
+        elevated_args.push("start".into());
+      }
+      elevated_args.push("--config".into());
+      elevated_args.push(config.path.to_string_lossy().into_owned());
+    }
+
+    match wm_platform::relaunch_current_process_as_admin(&elevated_args) {
+      Ok(true) => {
+        startup_log("startup: elevated GlazeWM process launched");
+        drop(_single_instance);
+        return Ok(());
+      }
+      Ok(false) => {
+        startup_log("startup: UAC was canceled; GlazeWM did not start");
+        return Ok(());
+      }
+      Err(err) => {
+        anyhow::bail!("Unable to launch GlazeWM as administrator: {err}");
+      }
+    }
+  }
 
   // Debug trail: layout.log beside config.yaml / layout.json.
   // Set early so IPC AddrInUse recovery can log before the listener binds.

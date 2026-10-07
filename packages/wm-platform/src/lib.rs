@@ -42,6 +42,21 @@ pub fn set_native_op_logger(logger: fn(&str)) {
   #[cfg(not(target_os = "windows"))]
   let _ = logger;
 }
+
+/// Returns whether the current Windows process has a full elevated token.
+#[cfg(target_os = "windows")]
+pub fn is_process_elevated() -> Result<bool> {
+  platform_impl::is_process_elevated()
+}
+
+/// Starts the current executable again with the Windows `runas` verb.
+///
+/// Returns `true` when the elevated process was launched, and `false` when
+/// the user dismissed the UAC prompt.
+#[cfg(target_os = "windows")]
+pub fn relaunch_current_process_as_admin(args: &[String]) -> Result<bool> {
+  platform_impl::relaunch_current_process_as_admin(args)
+}
 // TODO: Avoid exposing `windows` crate types in the public API.
 #[cfg(target_os = "windows")]
 pub use windows::Win32::UI::WindowsAndMessaging::{
