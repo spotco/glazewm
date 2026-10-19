@@ -430,6 +430,8 @@ mod tests {
     state.pending_sync.clear();
     state.ignored_windows.push(ignored_native.native().clone());
     state
+      .set_focused_window_for_test(Some(ignored_native.native().clone()));
+    state
       .pending_sync
       .queue_workspace_to_reorder(workspace.clone());
     state.pending_sync.queue_focus_change();

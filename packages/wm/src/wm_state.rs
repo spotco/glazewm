@@ -119,6 +119,13 @@ pub struct WmState {
   /// foreground is a managed window or the desktop.
   pub ignored_native_foreground: Option<WindowId>,
 
+  /// Test override for the OS foreground observation used while draining
+  /// pending z-order work. Focus events are injected by tests, so they
+  /// need an explicit matching native foreground observation when
+  /// exercising the live `platform_sync` path.
+  #[cfg(test)]
+  test_focused_window: Option<NativeWindow>,
+
   /// WM-wide insertion / stack axis for directional moves (spotcobuild).
   pub global_tiling_direction: TilingDirection,
 
@@ -164,6 +171,8 @@ impl WmState {
       ignored_windows: Vec::new(),
       startup_z_order_pending: false,
       ignored_native_foreground: None,
+      #[cfg(test)]
+      test_focused_window: None,
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
       layout_history: LayoutHistory::default(),
       diagnostic_history: DiagnosticHistory::default(),
@@ -965,7 +974,15 @@ impl WmState {
       return false;
     }
 
-    if let Ok(foreground) = self.dispatcher.focused_window() {
+    #[cfg(test)]
+    let foreground = self
+      .test_focused_window
+      .clone()
+      .or_else(|| self.dispatcher.focused_window().ok());
+    #[cfg(not(test))]
+    let foreground = self.dispatcher.focused_window().ok();
+
+    if let Some(foreground) = foreground {
       if self
         .ignored_windows
         .iter()
@@ -1007,6 +1024,14 @@ impl WmState {
     }
 
     false
+  }
+
+  #[cfg(test)]
+  pub(crate) fn set_focused_window_for_test(
+    &mut self,
+    native_window: Option<NativeWindow>,
+  ) {
+    self.test_focused_window = native_window;
   }
 
   /// Best-effort: manage any currently visible top-level windows that are

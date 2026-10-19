@@ -2619,12 +2619,22 @@ fn apply_z_order_chain(
     usable.iter().filter(|is_usable| !**is_usable).count();
   for (window_id, insert_after) in planned_moves {
     let hwnd = HWND(window_id.0);
+    let insert_after_id = match insert_after {
+      ZOrderInsertAfter::Top => None,
+      ZOrderInsertAfter::After(window_id) => Some(window_id),
+    };
     let insert_after = match insert_after {
       ZOrderInsertAfter::Top => HWND_TOP,
       ZOrderInsertAfter::After(window_id) => HWND(window_id.0),
     };
-    unsafe {
-      SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)?;
+    if let Err(error) =
+      unsafe { SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags) }
+    {
+      return Err(crate::Error::Platform(format!(
+        "SetWindowPos failed for {window_id:?} after {insert_after_id:?}: {error}; target={:?}; anchor={:?}",
+        native_window_identity(window_id),
+        insert_after_id.and_then(native_window_identity),
+      )));
     }
   }
 
