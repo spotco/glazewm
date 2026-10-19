@@ -56,24 +56,12 @@ pub fn focus_in_direction(
       state
         .pending_sync
         .queue_workspace_to_reorder(workspace.clone());
-      // Super+arrow between normal floaters must promote ONLY the
-      // selected window (invariant). Mark as targeted so
-      // windows_to_bring_to_front does not raise every peer floater and
-      // so bring_to_front defers to reorder_focused_workspace_layers -
-      // matching the native floating focus path. Without this mark,
-      // focus_in_direction queued workspace reorder while defer still
-      // only covered tiling / focused_window_to_bring_to_front, so both
-      // applicators raced (3 floaters + tiles Super+Left/Right).
       if let Ok(window) = focus_target.as_window_container() {
-        if matches!(
-          window.state(),
-          WindowState::Floating(config) if !config.shown_on_top
-        ) {
-          state.pending_sync.queue_focused_window_to_bring_to_front(
-            &workspace,
-            window.id(),
-          );
-        }
+        state.pending_sync.queue_stack_activation(
+          &workspace,
+          window.id(),
+          crate::pending_sync::StackActivationReason::WmCommand,
+        );
       }
     }
   }

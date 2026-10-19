@@ -59,8 +59,7 @@ pub fn unmanage_window(
   if let Some(focus_target) = focus_target {
     set_focused_descendant(&focus_target, None);
     state.pending_sync.queue_focus_change();
-    state.unmanaged_or_minimized_timestamp =
-      Some(std::time::Instant::now());
+    state.arm_lifecycle_focus_recovery(Some(&focus_target));
   }
 
   // Sibling containers need to be redrawn if the window was tiling.

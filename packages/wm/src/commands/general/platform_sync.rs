@@ -6,10 +6,6 @@ use wm_common::{
   WindowState, WmEvent,
 };
 #[cfg(target_os = "windows")]
-use wm_platform::begin_z_order_batch;
-#[cfg(target_os = "windows")]
-use wm_platform::reorder_z_order;
-#[cfg(target_os = "windows")]
 use wm_platform::sample_z_order_ranks;
 #[cfg(target_os = "windows")]
 use wm_platform::SWP_NOZORDER;
@@ -20,6 +16,8 @@ use wm_platform::{NativeWindowWindowsExt, WindowId};
 use wm_platform::{Rect, WindowZOrder};
 
 use super::verbose_z_order_enabled;
+#[cfg(target_os = "windows")]
+use crate::normal_window_stack::{StackAtomId, StackOperation};
 use crate::{
   models::{Container, WindowContainer, Workspace},
   traits::{CommonGetters, PositionGetters, WindowGetters},
@@ -42,6 +40,8 @@ pub fn platform_sync(
 
   if !state.pending_sync.containers_to_redraw().is_empty()
     || !state.pending_sync.workspaces_to_reorder().is_empty()
+    || state.pending_sync.needs_focus_update()
+    || state.pending_sync.has_stack_activations()
   {
     redraw_containers(&focused_container, state, config, suspend_z_order)?;
   }
@@ -135,26 +135,6 @@ fn sync_focus(
   Ok(())
 }
 
-/// Whether per-window `bring_to_front` `set_z_order` must defer to the
-/// workspace layer chain apply.
-///
-/// Tiling focus, targeted floating focus, and any focus that already
-/// queued `workspace_to_reorder` (including Super+arrow) rely on
-/// `reorder_focused_workspace_layers`. Skipping the legacy `AfterWindow`
-/// swarm prevents floaters from flashing between tiles / peer floaters
-/// under `SWP_ASYNCWINDOWPOS` (layout.log 2026-10-02 ~00:33 ET; floating
-/// Super+arrow dual-applicator race).
-#[cfg(target_os = "windows")]
-fn should_defer_bring_to_front_to_workspace_reorder(
-  has_targeted_floating_focus: bool,
-  focused_is_tiling: bool,
-  workspace_reorder_queued: bool,
-) -> bool {
-  has_targeted_floating_focus
-    || focused_is_tiling
-    || workspace_reorder_queued
-}
-
 /// Finds windows that should be brought to the top of their workspace's
 /// z-order.
 ///
@@ -244,9 +224,6 @@ fn redraw_containers(
   config: &UserConfig,
   preserve_z_order: bool,
 ) -> anyhow::Result<()> {
-  #[cfg(target_os = "windows")]
-  let _ = begin_z_order_batch();
-
   let windows_to_redraw = state.windows_to_redraw();
   let windows_to_bring_to_front =
     windows_to_bring_to_front(focused_container, state)?;
@@ -318,84 +295,6 @@ fn redraw_containers(
       }
       _ => WindowZOrder::Normal,
     };
-
-    // Set the z-order of the window.
-    //
-    // NOTE: macOS doesn't have a robust public API for setting the z-order
-    // of a window. See `NativeWindow::raise` for more details.
-    //
-    // On Windows, skip per-window bring_to_front `set_z_order` when a
-    // workspace layer reorder will own the outcome. `AfterWindow(focused)`
-    // under `SWP_ASYNCWINDOWPOS` races `SetForegroundWindow` and
-    // `reorder_z_order`, leaving detached windows between tiles (confirmed
-    // layout.log 2026-10-02 ~00:33 ET). Targeted floating focus already
-    // skipped this path; tiling group promotion must skip too. Geometry
-    // redraws still pass `z_order` through `reposition_window`.
-    #[cfg(target_os = "windows")]
-    if !preserve_z_order
-      && should_bring_to_front
-      && !windows_to_redraw.contains(window)
-    {
-      let has_targeted_floating_focus = state
-        .pending_sync
-        .focused_window_to_bring_to_front(&workspace)
-        .is_some_and(|window_id| window_id == window.id());
-
-      let focused_is_tiling = workspace
-        .descendant_focus_order()
-        .next()
-        .and_then(|container| container.as_window_container().ok())
-        .is_some_and(|focused| {
-          matches!(focused.state(), WindowState::Tiling)
-        });
-
-      let workspace_reorder_queued = state
-        .pending_sync
-        .workspaces_to_reorder()
-        .iter()
-        .any(|queued| queued.id() == workspace.id())
-        || state.pending_sync.needs_focus_update();
-
-      // Defer to `reorder_focused_workspace_layers` whenever that chain
-      // owns the outcome (tiling group, targeted detached, or any
-      // Super+arrow / queued workspace reorder). Avoid dual applicators.
-      let defer_to_workspace_reorder =
-        should_defer_bring_to_front_to_workspace_reorder(
-          has_targeted_floating_focus,
-          focused_is_tiling,
-          workspace_reorder_queued,
-        );
-
-      if defer_to_workspace_reorder {
-        if verbose_z_order_enabled() {
-          let reason = if has_targeted_floating_focus {
-            "targeted_floating"
-          } else if focused_is_tiling {
-            "tiling_group_defer_workspace_reorder"
-          } else {
-            "workspace_reorder_queued"
-          };
-          crate::commands::general::layout_debug_log(format!(
-            "verbose z-order skip bring_to_front hwnd={:?} z_order={z_order:?} reason={reason}",
-            window.native().id(),
-          ));
-        }
-      } else {
-        if verbose_z_order_enabled() {
-          tracing::info!("Updating window z-order: {window}");
-          crate::commands::general::layout_debug_log(format!(
-            "verbose z-order bring_to_front hwnd={:?} z_order={z_order:?}",
-            window.native().id(),
-          ));
-        } else {
-          tracing::debug!("Updating window z-order: {window}");
-        }
-
-        if let Err(err) = window.native().set_z_order(&z_order) {
-          tracing::warn!("Failed to set window z-order: {}", err);
-        }
-      }
-    }
 
     // Skip updating the window's position if it only required a z-order
     // change.
@@ -580,28 +479,28 @@ fn reorder_focused_workspace_layers(
   focused_container: &Container,
   state: &mut WmState,
 ) {
-  let Some(workspace) = focused_container.workspace() else {
-    return;
-  };
-
-  if !workspace.is_displayed() {
-    return;
+  let mut workspaces = Vec::new();
+  let mut seen = std::collections::HashSet::new();
+  for workspace in state
+    .pending_sync
+    .workspaces_to_reorder()
+    .iter()
+    .filter(|workspace| workspace.is_displayed())
+    .cloned()
+    .chain(
+      focused_container
+        .workspace()
+        .filter(Workspace::is_displayed),
+    )
+  {
+    if seen.insert(workspace.id()) {
+      workspaces.push(workspace);
+    }
   }
 
-  let Some(focused_window_id) = workspace
-    .descendant_focus_order()
-    .next()
-    .and_then(|container| container.as_window_container().ok())
-    .map(|window| window.native().id())
-  else {
-    return;
-  };
-
-  reorder_focused_workspace_layers_in_workspace(
-    &workspace,
-    focused_window_id,
-    state,
-  );
+  for workspace in workspaces {
+    reconcile_workspace_stack(&workspace, state, None);
+  }
 }
 
 /// Records an ignored window as the top of the normal z-order.
@@ -626,182 +525,266 @@ pub fn promote_ignored_window(
     return;
   };
 
-  reorder_focused_workspace_layers_in_workspace(
-    &workspace,
-    native_window.id(),
-    state,
-  );
+  reconcile_workspace_stack(&workspace, state, Some(native_window.id()));
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn promote_ignored_window(
-  _state: &mut WmState,
-  _native_window: &wm_platform::NativeWindow,
-) {
-}
-
+/// Reconciles one displayed workspace from its logical atom stack.
+///
+/// `forced_activation` is used only for an observed ignored-window
+/// activation. Managed activations are recorded as explicit stack intent
+/// in `PendingSync`; an ordinary focus/layout recovery only reconciles.
 #[cfg(target_os = "windows")]
-#[allow(clippy::too_many_lines)]
-fn reorder_focused_workspace_layers_in_workspace(
+#[allow(clippy::too_many_lines)] // Builds one workspace snapshot and
+                                 // records its native reconciliation.
+fn reconcile_workspace_stack(
   workspace: &Workspace,
-  focused_window_id: WindowId,
   state: &mut WmState,
+  forced_activation: Option<WindowId>,
 ) {
-  let mut normal_windows = workspace
+  if !workspace.is_displayed() {
+    return;
+  }
+
+  let mut tiled_ids = Vec::new();
+  let mut detached_ids = Vec::new();
+  let mut layers = Vec::new();
+  for window in workspace
     .descendant_focus_order()
     .filter_map(|container| container.as_window_container().ok())
     .filter(|window| {
       matches!(
         window.display_state(),
         DisplayState::Showing | DisplayState::Shown
-      )
+      ) && !state.is_show_desktop_minimized(window.id())
+        && window.native().identity_is_current()
     })
-    .filter(|window| !state.is_show_desktop_minimized(window.id()))
-    .filter_map(|window| {
-      let layer = match window.state() {
-        WindowState::Tiling => NormalZOrderLayer::Tiling,
-        WindowState::Floating(config) if !config.shown_on_top => {
-          NormalZOrderLayer::Floating
-        }
-        _ => return None,
-      };
-
-      Some((window.native().id(), layer))
-    })
-    .collect::<Vec<_>>();
+  {
+    match window.state() {
+      WindowState::Tiling => {
+        tiled_ids.push(window.native().id());
+        layers.push((window.native().id(), NormalZOrderLayer::Tiling));
+      }
+      WindowState::Floating(config) if !config.shown_on_top => {
+        detached_ids.push(window.native().id());
+        layers.push((window.native().id(), NormalZOrderLayer::Floating));
+      }
+      _ => {}
+    }
+  }
 
   let workspace_monitor_id =
     workspace.monitor().map(|monitor| monitor.id());
-  let ignored_window_ids = state
+  let ignored = state
     .ignored_windows
     .iter()
     .filter(|window| {
       window.is_valid()
+        && window.identity_is_current()
         && window.is_visible().unwrap_or(false)
+        && window.debug_info().is_topmost != Some(true)
         && state.nearest_monitor(window).is_some_and(|monitor| {
           workspace_monitor_id == Some(monitor.id())
         })
     })
     .map(wm_platform::NativeWindow::id)
     .collect::<Vec<_>>();
-
-  // Ignored windows are native detached windows from the z-order manager's
-  // perspective. Their native focus events are intentionally no-ops, so
-  // they only enter this chain when a managed window owns focus. They
-  // share the Floating layer with detached managed windows and therefore
-  // retain the same relative-order rules.
-  normal_windows.extend(
-    ignored_window_ids
+  detached_ids.extend(ignored.iter().copied());
+  layers.extend(
+    ignored
       .iter()
       .copied()
       .map(|window_id| (window_id, NormalZOrderLayer::Ignored)),
   );
-  let focused_layer = normal_windows
-    .iter()
-    .find(|(window_id, _)| *window_id == focused_window_id)
-    .map(|(_, layer)| *layer);
-  let previous_order = state
-    .normal_z_order_for_workspace(workspace.id())
-    .map(<[WindowId]>::to_vec);
 
-  // Owner links among Floating/Ignored windows in this chain. Focusing an
-  // owned caption popup must also raise its managed GW_OWNER (and owned
-  // siblings) above the tiled block. Tiling owners are omitted so the
-  // tiled block stays contiguous without reshuffling unrelated floaters.
-  let chain_ids: std::collections::HashSet<WindowId> =
-    normal_windows.iter().map(|(id, _)| *id).collect();
-  let layer_of = |id: WindowId| -> Option<NormalZOrderLayer> {
-    normal_windows
-      .iter()
-      .find(|(window_id, _)| *window_id == id)
-      .map(|(_, layer)| *layer)
-  };
-  let mut owner_by_window: std::collections::HashMap<WindowId, WindowId> =
-    std::collections::HashMap::new();
-
+  let detached_set: std::collections::HashSet<WindowId> =
+    detached_ids.iter().copied().collect();
+  let stack_window_set: std::collections::HashSet<WindowId> =
+    tiled_ids.iter().chain(&detached_ids).copied().collect();
+  let mut owner_by_window = std::collections::HashMap::new();
   for window in workspace
     .descendant_focus_order()
     .filter_map(|container| container.as_window_container().ok())
   {
-    let window_id = window.native().id();
-    if !chain_ids.contains(&window_id) {
+    let child = window.native().id();
+    if !detached_set.contains(&child) {
       continue;
     }
-    let Some(owner_handle) = window.native().debug_info().owner_handle
-    else {
-      continue;
-    };
-    let owner_id = WindowId(owner_handle);
-    if !chain_ids.contains(&owner_id) {
+    if let Some(owner) = window.native().debug_info().owner_handle {
+      let owner = WindowId(owner);
+      if stack_window_set.contains(&owner) {
+        owner_by_window.insert(child, owner);
+      }
+    }
+  }
+  for window in &state.ignored_windows {
+    let child = window.id();
+    if !detached_set.contains(&child) {
       continue;
     }
-    if matches!(
-      layer_of(owner_id),
-      Some(NormalZOrderLayer::Floating | NormalZOrderLayer::Ignored)
-    ) {
-      owner_by_window.insert(window_id, owner_id);
+    if let Some(owner) = window.debug_info().owner_handle {
+      let owner = WindowId(owner);
+      if stack_window_set.contains(&owner) {
+        owner_by_window.insert(child, owner);
+      }
     }
   }
 
-  for ignored in &state.ignored_windows {
-    let window_id = ignored.id();
-    if !chain_ids.contains(&window_id) {
-      continue;
-    }
-    let Some(owner_handle) = ignored.debug_info().owner_handle else {
-      continue;
-    };
-    let owner_id = WindowId(owner_handle);
-    if !chain_ids.contains(&owner_id) {
-      continue;
-    }
-    if matches!(
-      layer_of(owner_id),
-      Some(NormalZOrderLayer::Floating | NormalZOrderLayer::Ignored)
-    ) {
-      owner_by_window.insert(window_id, owner_id);
-    }
-  }
+  let all_ids = tiled_ids
+    .iter()
+    .chain(&detached_ids)
+    .copied()
+    .collect::<Vec<_>>();
+  let mut observed = sample_z_order_ranks(&all_ids);
+  observed.sort_by_key(|(_, rank)| *rank);
+  let native_order = observed
+    .iter()
+    .map(|(window_id, _)| *window_id)
+    .collect::<Vec<_>>();
+  let previous_atoms = state
+    .normal_stack_for_workspace(workspace.id())
+    .map_or_else(Vec::new, |stack| stack.atoms().to_vec());
 
-  let owner_of = |id: WindowId| -> Option<WindowId> {
-    owner_by_window.get(&id).copied()
+  state.apply_normal_stack_operation(
+    workspace.id(),
+    StackOperation::Reconcile {
+      tiled_window_ids: tiled_ids.clone(),
+      detached_window_ids: detached_ids.clone(),
+      owner_by_window: owner_by_window.clone(),
+      native_order: native_order.clone(),
+    },
+  );
+
+  let queued_activation = state
+    .pending_sync
+    .stack_activation(workspace)
+    .and_then(|activation| {
+      workspace
+        .descendant_focus_order()
+        .filter_map(|container| container.as_window_container().ok())
+        .find(|window| window.id() == activation.window_id)
+        .map(|window| window.native().id())
+    });
+  let activation_reason = if forced_activation.is_some() {
+    Some("ignored_native_activation".to_string())
+  } else {
+    state
+      .pending_sync
+      .stack_activation(workspace)
+      .map(|activation| format!("{:?}", activation.reason))
   };
+  let activation = forced_activation.or(queued_activation);
+  if let Some(window_id) = activation {
+    let atom = if tiled_ids.contains(&window_id) {
+      Some(StackAtomId::TiledGroup)
+    } else if detached_ids.contains(&window_id) {
+      Some(StackAtomId::DetachedWindow(window_id))
+    } else {
+      None
+    };
+    if let Some(atom) = atom {
+      state.apply_normal_stack_operation(
+        workspace.id(),
+        StackOperation::Activate {
+          atom,
+          owner_by_window: owner_by_window.clone(),
+        },
+      );
+    }
+  }
 
-  let Some(window_ids) = normal_z_order_chain(
-    normal_windows,
-    focused_window_id,
-    previous_order.as_deref(),
-    &owner_of,
-  ) else {
+  let Some(stack) = state.normal_stack_for_workspace(workspace.id())
+  else {
     return;
   };
-
-  state.set_normal_z_order_for_workspace(workspace.id(), window_ids);
-  let native_window_ids = state
-    .normal_z_order_for_workspace(workspace.id())
-    .map_or_default(<[WindowId]>::to_vec);
-
+  let native_window_ids = stack.materialize(&tiled_ids);
+  let atom_order = stack.atoms().to_vec();
+  let promoted_atom_ids = activation.map_or_else(Vec::new, |window_id| {
+    stack.activation_group(window_id, &tiled_ids)
+  });
+  let focused_window_id = activation.or_else(|| {
+    workspace
+      .descendant_focus_order()
+      .next()
+      .and_then(|container| container.as_window_container().ok())
+      .map(|window| window.native().id())
+  });
+  let focused_layer = focused_window_id.and_then(|focused| {
+    layers
+      .iter()
+      .find(|(window_id, _)| *window_id == focused)
+      .map(|(_, layer)| *layer)
+  });
+  let request = if activation.is_some() {
+    wm_platform::ZOrderIntent::Promote
+  } else {
+    wm_platform::ZOrderIntent::Preserve
+  };
+  let mut pre_ranks = sample_z_order_ranks(&native_window_ids);
+  pre_ranks.sort_by_key(|(_, rank)| *rank);
   if verbose_z_order_enabled() {
     crate::commands::general::layout_debug_log(format!(
-      "normal z reconcile workspace={:?} focused={:?} layer={:?} chain={:?}",
+      "normal z reconcile workspace={:?} intent={:?} activation={:?} atoms_before={:?} atoms_after={:?} native_before={:?} desired={:?}",
       workspace.id(),
-      focused_window_id,
-      focused_layer,
+      request,
+      activation,
+      previous_atoms,
+      atom_order,
+      pre_ranks,
       native_window_ids,
     ));
-    log_verbose_native_z_order("pre-reorder", &native_window_ids);
   }
 
-  let reorder_error = match reorder_z_order(&native_window_ids) {
-    Ok(()) => None,
+  let (
+    reorder_error,
+    native_writes,
+    skipped_native_windows,
+    retry_scheduled,
+    reconcile_status,
+  ) = match wm_platform::reconcile_z_order_for_workspace(
+    workspace.id().as_u128(),
+    &native_window_ids,
+    request,
+    &promoted_atom_ids,
+  ) {
+    Ok(outcome) => (
+      None,
+      outcome.native_writes,
+      outcome.skipped_windows,
+      outcome.retry_scheduled,
+      if outcome.superseded {
+        "superseded"
+      } else if outcome.native_writes == 0 && outcome.skipped_windows == 0
+      {
+        "already_satisfied"
+      } else if outcome.skipped_windows > 0 {
+        "pending_skipped_windows"
+      } else if outcome.retry_scheduled {
+        "pending_async_convergence"
+      } else {
+        "requests_issued_without_retry_worker"
+      },
+    ),
     Err(err) => {
-      tracing::warn!(
-        "Failed to reorder focused workspace window layers: {}",
-        err
-      );
-      Some(crate::diagnostic_history::truncate_error(&err.to_string()))
+      tracing::warn!("Failed to reconcile normal-window z-order: {err}");
+      (
+        Some(crate::diagnostic_history::truncate_error(&err.to_string())),
+        0,
+        0,
+        false,
+        "native_reconcile_error",
+      )
     }
   };
+  let mut owner_constraints = owner_by_window
+    .iter()
+    .map(|(child, owner)| {
+      crate::diagnostic_history::NativeOwnerConstraint {
+        child_hwnd: crate::diagnostic_history::hwnd_i64(child.0),
+        owner_hwnd: crate::diagnostic_history::hwnd_i64(owner.0),
+      }
+    })
+    .collect::<Vec<_>>();
+  owner_constraints.sort_by_key(|constraint| constraint.child_hwnd);
   let mut native_ranks = sample_z_order_ranks(&native_window_ids)
     .into_iter()
     .map(|(window_id, z_order_index)| {
@@ -816,27 +799,58 @@ fn reorder_focused_workspace_layers_in_workspace(
     crate::diagnostic_history::DiagnosticBody::ZOrderReconcile {
       workspace_id: workspace.id(),
       workspace_name: workspace.config().name,
-      focused_hwnd: crate::diagnostic_history::hwnd_i64(
-        focused_window_id.0,
-      ),
+      focused_hwnd: focused_window_id.map_or(0, |window_id| {
+        crate::diagnostic_history::hwnd_i64(window_id.0)
+      }),
       focused_layer: focused_layer.map(NormalZOrderLayer::as_str),
+      stack_intent: activation_reason
+        .clone()
+        .unwrap_or_else(|| "preserve_reconcile".into()),
+      stack_atoms_before: previous_atoms
+        .iter()
+        .map(|atom| format!("{atom:?}"))
+        .collect(),
+      stack_atoms_after: atom_order
+        .iter()
+        .map(|atom| format!("{atom:?}"))
+        .collect(),
+      owner_constraints,
+      native_order_before: pre_ranks
+        .iter()
+        .map(|(window_id, z_order_index)| {
+          crate::diagnostic_history::NativeZRank {
+            hwnd: crate::diagnostic_history::hwnd_i64(window_id.0),
+            z_order_index: *z_order_index,
+          }
+        })
+        .collect(),
       intended_top_to_bottom: native_window_ids
         .iter()
         .map(|window_id| crate::diagnostic_history::hwnd_i64(window_id.0))
         .collect(),
       native_ranks,
-      native_sample_timing: "immediate_after_reorder_request",
+      native_writes,
+      skipped_native_windows,
+      retry_scheduled,
+      reconcile_status,
+      native_sample_timing: "immediate_after_reconcile_request",
       reorder_error,
     },
   );
-
   if verbose_z_order_enabled() {
-    log_verbose_native_z_order("post-reorder", &native_window_ids);
+    log_verbose_native_z_order("post-reconcile", &native_window_ids);
     schedule_verbose_z_order_recheck(
-      "post-reorder".into(),
-      native_window_ids.clone(),
+      "post-reconcile".into(),
+      native_window_ids,
     );
   }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn promote_ignored_window(
+  _state: &mut WmState,
+  _native_window: &wm_platform::NativeWindow,
+) {
 }
 
 #[cfg(target_os = "windows")]
@@ -844,8 +858,8 @@ fn reorder_focused_workspace_layers_in_workspace(
 enum NormalZOrderLayer {
   Tiling,
   Floating,
-  /// Ignored windows such as Snipping Tool. Same promotion rule as
-  /// `Floating`: only the focused one moves.
+  /// Ignored windows such as Snipping Tool remain independent detached
+  /// atoms and are promoted only after an observed explicit activation.
   Ignored,
 }
 
@@ -859,785 +873,10 @@ impl NormalZOrderLayer {
   }
 }
 
-/// Builds the normal-window z-order chain while treating all tiled windows
-/// as one group.
-///
-/// `current_windows` is in most-recent-focus order, while `previous_order`
-/// is the last intended native order from top to bottom. Focus promotion
-/// is applied to the previous order so non-selected detached windows
-/// retain their existing relationship to the tiled group. Only tiled
-/// windows are grouped together; detached windows remain individual
-/// z-order items, except a focused Floating/Ignored window also raises its
-/// managed Win32 owner group (see `floating_focus_owner_group`).
-///
-/// `owner_of` maps a managed window to its managed `GW_OWNER` when that
-/// owner is also present in this workspace chain (Floating/Ignored owners
-/// only — tiling owners stay in the tiled block).
-#[cfg(target_os = "windows")]
-fn normal_z_order_chain(
-  current_windows: Vec<(WindowId, NormalZOrderLayer)>,
-  focused_window_id: WindowId,
-  previous_order: Option<&[WindowId]>,
-  owner_of: &dyn Fn(WindowId) -> Option<WindowId>,
-) -> Option<Vec<WindowId>> {
-  let focused_layer = current_windows
-    .iter()
-    .find(|(window_id, _)| *window_id == focused_window_id)
-    .map(|(_, layer)| *layer)?;
-
-  // On the first reconciliation there is no prior native order to modify.
-  // Preserve the WM's current focus order as the initial order, then use
-  // that saved order for subsequent focus promotions.
-  let Some(previous_order) = previous_order else {
-    return Some(
-      current_windows
-        .into_iter()
-        .map(|(window_id, _)| window_id)
-        .collect(),
-    );
-  };
-
-  let mut previous_or_focus_order = Vec::new();
-  for window_id in previous_order {
-    if current_windows
-      .iter()
-      .any(|(current_id, _)| current_id == window_id)
-      && !previous_or_focus_order.contains(window_id)
-    {
-      previous_or_focus_order.push(*window_id);
-    }
-  }
-
-  for (window_id, _) in &current_windows {
-    if !previous_or_focus_order.contains(window_id) {
-      previous_or_focus_order.push(*window_id);
-    }
-  }
-
-  let mut chain = match focused_layer {
-    NormalZOrderLayer::Tiling => {
-      let mut tiled_windows = current_windows
-        .iter()
-        .filter(|(_, layer)| *layer == NormalZOrderLayer::Tiling)
-        .map(|(window_id, _)| *window_id)
-        .collect::<Vec<_>>();
-
-      let other_windows =
-        previous_or_focus_order.into_iter().filter(|window_id| {
-          current_windows
-            .iter()
-            .find(|(current_id, _)| current_id == window_id)
-            .is_some_and(|(_, layer)| *layer != NormalZOrderLayer::Tiling)
-        });
-
-      tiled_windows.extend(other_windows);
-      Some(tiled_windows)
-    }
-    // Floating and Ignored share the same promotion rule: raise the
-    // focused hwnd together with its managed Win32 owner group (owned
-    // siblings + owners). Unrelated detached peers keep prior slots
-    // relative to the tiled block.
-    NormalZOrderLayer::Floating | NormalZOrderLayer::Ignored => {
-      Some(floating_focus_owner_group(
-        &previous_or_focus_order,
-        focused_window_id,
-        owner_of,
-      ))
-    }
-  }?;
-
-  // Keep the tiled windows as one contiguous block at the slot of the
-  // first tile. This repairs a split block without moving a detached
-  // or ignored window past another one.
-  let tiled_window_ids = current_windows
-    .iter()
-    .filter(|(_, layer)| *layer == NormalZOrderLayer::Tiling)
-    .map(|(window_id, _)| *window_id)
-    .collect::<Vec<_>>();
-
-  normalize_tiled_window_block(&mut chain, &tiled_window_ids);
-
-  Some(chain)
-}
-
-#[cfg(target_os = "windows")]
-fn normalize_tiled_window_block(
-  chain: &mut Vec<WindowId>,
-  tiled_window_ids: &[WindowId],
-) {
-  let Some(first_tiled_index) = chain
-    .iter()
-    .position(|window_id| tiled_window_ids.contains(window_id))
-  else {
-    return;
-  };
-
-  let tiled_windows = chain
-    .iter()
-    .filter(|window_id| tiled_window_ids.contains(window_id))
-    .copied()
-    .collect::<Vec<_>>();
-
-  chain.retain(|window_id| !tiled_window_ids.contains(window_id));
-  let insertion_index = first_tiled_index.min(chain.len());
-  chain.splice(insertion_index..insertion_index, tiled_windows);
-}
-
-/// Pure helper for the owned-popup Alt-Tab fix (wired into
-/// `normal_z_order_chain`). Covers both **modal** (parent disabled) and
-/// **non-modal** owned caption children.
-///
-/// When focusing a floating/ignored HWND that has a managed `GW_OWNER`,
-/// the intended normal-layer chain must promote the focused window **and**
-/// its managed owner chain as one contiguous group (focused first, then
-/// other owned siblings in prior order, then the owner). Peers outside the
-/// group keep their relative order — same spirit as tiling-as-one-group,
-/// but for Win32 owner relationships.
-///
-/// `owner_of(id)` returns the managed owner `WindowId` when
-/// `GetWindow(GW_OWNER)` points at another window in the workspace chain;
-/// `None` otherwise.
-#[cfg(target_os = "windows")]
-fn floating_focus_owner_group(
-  previous_order: &[WindowId],
-  focused: WindowId,
-  owner_of: &dyn Fn(WindowId) -> Option<WindowId>,
-) -> Vec<WindowId> {
-  // Walk owner links from focused until we leave the managed set / hit
-  // root.
-  let mut owner_chain = Vec::new();
-  let mut cursor = focused;
-  while let Some(owner) = owner_of(cursor) {
-    if owner_chain.contains(&owner) || owner == focused {
-      break;
-    }
-    owner_chain.push(owner);
-    cursor = owner;
-  }
-
-  let in_group = |id: WindowId| -> bool {
-    if id == focused || owner_chain.contains(&id) {
-      return true;
-    }
-    // Owned sibling: its owner walk intersects this owner_chain / focused.
-    let mut c = id;
-    let mut seen = Vec::new();
-    while let Some(owner) = owner_of(c) {
-      if owner == focused || owner_chain.contains(&owner) {
-        return true;
-      }
-      if seen.contains(&owner) {
-        break;
-      }
-      seen.push(owner);
-      c = owner;
-    }
-    false
-  };
-
-  let mut group: Vec<WindowId> = Vec::new();
-  group.push(focused);
-  for id in previous_order {
-    if *id != focused && in_group(*id) && !group.contains(id) {
-      group.push(*id);
-    }
-  }
-  // Ensure every owner-chain member is present even if missing from
-  // previous.
-  for owner in &owner_chain {
-    if !group.contains(owner) {
-      group.push(*owner);
-    }
-  }
-
-  let mut rest: Vec<WindowId> = previous_order
-    .iter()
-    .copied()
-    .filter(|id| !group.contains(id))
-    .collect();
-
-  group.append(&mut rest);
-  group
-}
-
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
   use super::*;
 
-  fn window(
-    id: isize,
-    layer: NormalZOrderLayer,
-  ) -> (WindowId, NormalZOrderLayer) {
-    (WindowId(id), layer)
-  }
-
-  fn no_owner(_: WindowId) -> Option<WindowId> {
-    None
-  }
-
-  fn chain(
-    current_windows: Vec<(WindowId, NormalZOrderLayer)>,
-    focused_window_id: WindowId,
-    previous_order: Option<&[WindowId]>,
-  ) -> Option<Vec<WindowId>> {
-    normal_z_order_chain(
-      current_windows,
-      focused_window_id,
-      previous_order,
-      &no_owner,
-    )
-  }
-
-  #[test]
-  fn detached_focus_only_promotes_selected_window() {
-    let d1 = window(1, NormalZOrderLayer::Floating);
-    let d2 = window(2, NormalZOrderLayer::Floating);
-    let w3 = window(3, NormalZOrderLayer::Tiling);
-    let w4 = window(4, NormalZOrderLayer::Tiling);
-
-    // Bootstrap the saved order from the initial stack:
-    // Detached1 > Detached2 > GlazeWM.
-    assert_eq!(
-      chain(vec![d1, d2, w3, w4], d1.0, None),
-      Some(vec![d1.0, d2.0, w3.0, w4.0])
-    );
-
-    // Alt-Tab to detached Window2: only that detached window is promoted.
-    assert_eq!(
-      chain(vec![d2, d1, w3, w4], d2.0, Some(&[d1.0, d2.0, w3.0, w4.0]),),
-      Some(vec![d2.0, d1.0, w3.0, w4.0])
-    );
-
-    // Alt-Tab to tiled Window3: the complete tiled group is promoted.
-    assert_eq!(
-      chain(vec![w3, w4, d2, d1], w3.0, Some(&[d2.0, d1.0, w3.0, w4.0]),),
-      Some(vec![w3.0, w4.0, d2.0, d1.0])
-    );
-  }
-
-  #[test]
-  fn alt_tab_to_snipping_then_visual_studio_keeps_snipping_above_tiles() {
-    let visual_studio = window(1, NormalZOrderLayer::Floating);
-    let snipping = window(2, NormalZOrderLayer::Ignored);
-    let tiled_a = window(3, NormalZOrderLayer::Tiling);
-    let tiled_b = window(4, NormalZOrderLayer::Tiling);
-    let windows = vec![tiled_a, tiled_b, visual_studio, snipping];
-
-    // Tiles are focused. Snipping Tool is behind the tiled group.
-    let tiles_focused =
-      [tiled_a.0, tiled_b.0, visual_studio.0, snipping.0];
-
-    // Alt-Tab to Snipping Tool promotes only that window.
-    let snipping_focused =
-      chain(windows.clone(), snipping.0, Some(&tiles_focused))
-        .expect("snipping focus");
-    assert_eq!(
-      snipping_focused,
-      vec![snipping.0, tiled_a.0, tiled_b.0, visual_studio.0]
-    );
-
-    // The next Alt-Tab lands on Visual Studio. Only Visual Studio
-    // moves. Snipping Tool stays above the tiled group.
-    let visual_studio_focused =
-      chain(windows, visual_studio.0, Some(&snipping_focused))
-        .expect("visual studio focus");
-    assert_eq!(
-      visual_studio_focused,
-      vec![visual_studio.0, snipping.0, tiled_a.0, tiled_b.0]
-    );
-  }
-
-  #[test]
-  fn focusing_a_tiled_window_raises_the_group_without_reordering_peers() {
-    let visual_studio = window(1, NormalZOrderLayer::Floating);
-    let snipping = window(2, NormalZOrderLayer::Ignored);
-    let tiled_a = window(3, NormalZOrderLayer::Tiling);
-    let tiled_b = window(4, NormalZOrderLayer::Tiling);
-
-    // Visual Studio is in front, Snipping Tool is still above the tiles.
-    let before = [visual_studio.0, snipping.0, tiled_a.0, tiled_b.0];
-    assert_eq!(
-      chain(
-        vec![tiled_a, tiled_b, visual_studio, snipping],
-        tiled_a.0,
-        Some(&before),
-      ),
-      Some(vec![tiled_a.0, tiled_b.0, visual_studio.0, snipping.0])
-    );
-  }
-
-  /// layout.log 2026-10-02 22:35:50 ET: after an ignored toast
-  /// (`WindowId(984154)`, absent from `EnumWindows`) has been promoted,
-  /// tiling focus on Grok keeps that toast in the detached tail,
-  /// immediately before Notepad. `apply_z_order_chain` then uses the
-  /// toast as Notepad's insert-after hwnd.
-  #[test]
-  fn tiling_focus_leaves_unenumerated_ignored_window_directly_before_notepad(
-  ) {
-    let grok = window(131_888, NormalZOrderLayer::Tiling);
-    let peer = window(67_798, NormalZOrderLayer::Tiling);
-    let other = window(1_575_680, NormalZOrderLayer::Tiling);
-    let floater = window(3_803_134, NormalZOrderLayer::Floating);
-    let notification = window(984_154, NormalZOrderLayer::Ignored);
-    let notepad = window(67_996, NormalZOrderLayer::Floating);
-
-    // Saved order after the toast was focused, then the floater above it
-    // (layout.log 02:35:47Z chain).
-    let previous = [
-      floater.0,
-      notification.0,
-      grok.0,
-      peer.0,
-      other.0,
-      notepad.0,
-    ];
-    let chain = chain(
-      vec![grok, peer, other, floater, notepad, notification],
-      grok.0,
-      Some(&previous),
-    )
-    .expect("tiling focus chain");
-
-    assert_eq!(
-      chain,
-      vec![
-        grok.0,
-        peer.0,
-        other.0,
-        floater.0,
-        notification.0,
-        notepad.0,
-      ]
-    );
-    let notepad_at = chain.iter().position(|id| *id == notepad.0).unwrap();
-    assert_eq!(
-      chain[notepad_at - 1],
-      notification.0,
-      "Notepad's chain predecessor is the ignored toast, not a tiled window"
-    );
-  }
-
-  #[test]
-  fn e2e_leaving_ignored_focus_rejoins_ignored_before_detached_and_after_tiled(
-  ) {
-    let ignored = window(1, NormalZOrderLayer::Ignored);
-    let tiled_a = window(2, NormalZOrderLayer::Tiling);
-    let tiled_b = window(3, NormalZOrderLayer::Tiling);
-    let detached = window(4, NormalZOrderLayer::Floating);
-
-    // Snipping Tool is above the detached window. Raising the tiled
-    // group keeps that peer order behind the group.
-    assert_eq!(
-      chain(
-        vec![ignored, tiled_a, tiled_b, detached],
-        tiled_a.0,
-        Some(&[ignored.0, detached.0, tiled_a.0, tiled_b.0]),
-      ),
-      Some(vec![tiled_a.0, tiled_b.0, ignored.0, detached.0])
-    );
-  }
-
-  #[test]
-  fn e2e_ignored_focus_preserves_detached_peer_order() {
-    let notepad_one = window(1, NormalZOrderLayer::Floating);
-    let notepad_two = window(2, NormalZOrderLayer::Floating);
-    let ignored = window(3, NormalZOrderLayer::Ignored);
-    let tiled_a = window(4, NormalZOrderLayer::Tiling);
-    let tiled_b = window(5, NormalZOrderLayer::Tiling);
-
-    let initial = [
-      notepad_one.0,
-      notepad_two.0,
-      ignored.0,
-      tiled_a.0,
-      tiled_b.0,
-    ];
-
-    // Alt-Tab to the ignored window promotes only that window. Neither
-    // Notepad moves relative to the tiled group.
-    let after_ignored_focus = chain(
-      vec![notepad_one, notepad_two, ignored, tiled_a, tiled_b],
-      ignored.0,
-      Some(&initial),
-    )
-    .expect("ignored focus chain");
-    assert_eq!(
-      after_ignored_focus,
-      vec![
-        ignored.0,
-        notepad_one.0,
-        notepad_two.0,
-        tiled_a.0,
-        tiled_b.0,
-      ]
-    );
-
-    // Returning to either detached window promotes only that window.
-    let after_notepad_one = chain(
-      vec![notepad_one, notepad_two, ignored, tiled_a, tiled_b],
-      notepad_one.0,
-      Some(&after_ignored_focus),
-    )
-    .expect("detached focus chain");
-    assert_eq!(
-      after_notepad_one,
-      vec![
-        notepad_one.0,
-        ignored.0,
-        notepad_two.0,
-        tiled_a.0,
-        tiled_b.0,
-      ]
-    );
-
-    let after_notepad_two = chain(
-      vec![notepad_two, notepad_one, ignored, tiled_a, tiled_b],
-      notepad_two.0,
-      Some(&after_notepad_one),
-    )
-    .expect("second detached focus chain");
-    assert_eq!(
-      after_notepad_two,
-      vec![
-        notepad_two.0,
-        notepad_one.0,
-        ignored.0,
-        tiled_a.0,
-        tiled_b.0,
-      ]
-    );
-
-    // Focusing a tiled window raises the group as one window. The
-    // detached and ignored windows keep the order they already had.
-    let after_tiled = chain(
-      vec![tiled_a, tiled_b, notepad_two, notepad_one, ignored],
-      tiled_a.0,
-      Some(&after_notepad_two),
-    )
-    .expect("tiled focus chain");
-    assert_eq!(
-      after_tiled,
-      vec![
-        tiled_a.0,
-        tiled_b.0,
-        notepad_two.0,
-        notepad_one.0,
-        ignored.0,
-      ]
-    );
-  }
-
-  #[test]
-  fn detaching_a_tiled_focus_preserves_the_group_position() {
-    let d1 = window(1, NormalZOrderLayer::Floating);
-    let d2 = window(2, NormalZOrderLayer::Floating);
-    let d3 = window(3, NormalZOrderLayer::Floating);
-    let w4 = window(4, NormalZOrderLayer::Tiling);
-
-    // Window3 was the focused tiled window and is now detached. It moves
-    // to the front, while the remaining tiled group stays ahead of old
-    // peers.
-    assert_eq!(
-      chain(vec![d3, w4, d2, d1], d3.0, Some(&[d3.0, w4.0, d2.0, d1.0]),),
-      Some(vec![d3.0, w4.0, d2.0, d1.0])
-    );
-
-    // Reattaching Window3 makes it part of the tiled group again.
-    let w3 = window(3, NormalZOrderLayer::Tiling);
-    assert_eq!(
-      chain(vec![w3, w4, d2, d1], w3.0, Some(&[d3.0, w4.0, d2.0, d1.0]),),
-      Some(vec![w3.0, w4.0, d2.0, d1.0])
-    );
-  }
-
-  #[test]
-  fn nonfocused_layer_change_keeps_tiled_windows_contiguous() {
-    let d1 = window(1, NormalZOrderLayer::Floating);
-    let d2 = window(2, NormalZOrderLayer::Floating);
-    let t1 = window(3, NormalZOrderLayer::Tiling);
-    let t2 = window(4, NormalZOrderLayer::Tiling);
-
-    // The old order has one tiled block followed by two detached windows.
-    // Detached2 becomes tiled while Detached1 remains focused. Without
-    // normalization this would leave Detached1 between the tiled windows.
-    assert_eq!(
-      chain(
-        vec![d1, t1, t2, window(2, NormalZOrderLayer::Tiling)],
-        d1.0,
-        Some(&[t1.0, t2.0, d1.0, d2.0]),
-      ),
-      Some(vec![d1.0, t1.0, t2.0, d2.0])
-    );
-  }
-
-  #[test]
-  fn tiling_focus_defers_bring_to_front_to_workspace_reorder() {
-    assert!(should_defer_bring_to_front_to_workspace_reorder(
-      false, true, false
-    ));
-    assert!(
-      should_defer_bring_to_front_to_workspace_reorder(true, false, false),
-      "targeted floating also defers"
-    );
-    assert!(
-      should_defer_bring_to_front_to_workspace_reorder(false, false, true),
-      "queued workspace reorder (Super+arrow) must defer even without targeted mark"
-    );
-    assert!(
-      !should_defer_bring_to_front_to_workspace_reorder(
-        false, false, false
-      ),
-      "without tiling/targeted/reorder, legacy set_z_order path remains"
-    );
-  }
-
-  #[test]
-  fn floating_directional_focus_chain_promotes_only_selected_floater() {
-    // Regression: 3 floaters + tiles, Super+Left/Right among floaters.
-    // Focusing a detached window must promote ONLY that window; peer
-    // floaters keep their relation to the tiled block (f1 stays above
-    // tiles; f3 stays below).
-    let f1 = window(1, NormalZOrderLayer::Floating);
-    let f2 = window(2, NormalZOrderLayer::Floating);
-    let f3 = window(3, NormalZOrderLayer::Floating);
-    let t1 = window(10, NormalZOrderLayer::Tiling);
-    let t2 = window(11, NormalZOrderLayer::Tiling);
-
-    // Prior: f1 on top of tiles, f2/f3 below the tiled block.
-    let previous = [f1.0, t1.0, t2.0, f2.0, f3.0];
-    assert_eq!(
-      chain(vec![f2, f1, f3, t1, t2], f2.0, Some(&previous),),
-      Some(vec![f2.0, f1.0, t1.0, t2.0, f3.0]),
-      "only f2 moves to front; f1 stays above tiles; f3 stays below"
-    );
-
-    // Second Super+arrow to f3: only f3 rises; f2/f1 keep peer order
-    // relative to the tiled block.
-    assert_eq!(
-      chain(
-        vec![f3, f2, f1, t1, t2],
-        f3.0,
-        Some(&[f2.0, f1.0, t1.0, t2.0, f3.0]),
-      ),
-      Some(vec![f3.0, f2.0, f1.0, t1.0, t2.0]),
-      "only f3 moves; peers and tiled block undisturbed"
-    );
-  }
-
-  #[test]
-  fn tiling_focus_chain_keeps_floaters_below_contiguous_tiles() {
-    // Bug A regression: Super+arrow tiling focus must not leave floaters
-    // between tiles. The chain builder places the whole tiled group first.
-    let tile_a = window(10, NormalZOrderLayer::Tiling);
-    let tile_b = window(11, NormalZOrderLayer::Tiling);
-    let tile_c = window(12, NormalZOrderLayer::Tiling);
-    let steam = window(20, NormalZOrderLayer::Floating);
-    let grok = window(21, NormalZOrderLayer::Floating);
-
-    let previous = [steam.0, tile_a.0, grok.0, tile_b.0, tile_c.0];
-    let chain = chain(
-      vec![tile_b, tile_a, tile_c, steam, grok],
-      tile_b.0,
-      Some(&previous),
-    )
-    .expect("tiling focus chain");
-
-    assert_eq!(
-      &chain[..3],
-      &[tile_b.0, tile_a.0, tile_c.0],
-      "tiled block must be contiguous at the front"
-    );
-    assert!(
-      chain[3..].iter().all(|id| *id == steam.0 || *id == grok.0),
-      "floaters must stay below the tiled block: {chain:?}"
-    );
-    assert!(
-      !chain.windows(3).any(|w| {
-        let is_tile = |id: WindowId| {
-          id == tile_a.0 || id == tile_b.0 || id == tile_c.0
-        };
-        let is_floater = |id: WindowId| id == steam.0 || id == grok.0;
-        is_tile(w[0]) && is_floater(w[1]) && is_tile(w[2])
-      }),
-      "no floater may sit between tiles: {chain:?}"
-    );
-  }
-
-  /// **Non-modal** owned popup Alt-Tab (`GW_OWNER` + caption +
-  /// `WS_EX_APPWINDOW`, parent still enabled): floating focus promotes the
-  /// popup and its managed owner as one group above tiles (Asus helper
-  /// hwnd 4720436 / owner 330456).
-  #[test]
-  fn non_modal_owned_focus_raises_managed_owner_above_tiles() {
-    let popup = window(4_720_436, NormalZOrderLayer::Floating);
-    let owner = window(330_456, NormalZOrderLayer::Floating);
-    let tile_a = window(67_798, NormalZOrderLayer::Tiling);
-    let tile_b = window(131_888, NormalZOrderLayer::Tiling);
-
-    let previous = [tile_a.0, tile_b.0, popup.0, owner.0];
-    let owner_of = |id: WindowId| -> Option<WindowId> {
-      if id == popup.0 {
-        Some(owner.0)
-      } else {
-        None
-      }
-    };
-    let result = normal_z_order_chain(
-      vec![popup, owner, tile_a, tile_b],
-      popup.0,
-      Some(&previous),
-      &owner_of,
-    )
-    .expect("chain");
-
-    assert_eq!(
-      result,
-      vec![popup.0, owner.0, tile_a.0, tile_b.0],
-      "non-modal owned Alt-Tab must raise parent+popup as one group"
-    );
-  }
-
-  /// **Modal** owned dialog Alt-Tab (EnableWindow(parent, FALSE) +
-  /// `WS_EX_DLGMODALFRAME` | `WS_EX_APPWINDOW`). Same owner-group raise as
-  /// non-modal — both are managed Floating peers linked by `GW_OWNER`.
-  /// Asus layout.log modal 724112 / owner 330456.
-  #[test]
-  fn modal_owned_focus_raises_managed_owner_above_tiles() {
-    let popup = window(724_112, NormalZOrderLayer::Floating);
-    let owner = window(330_456, NormalZOrderLayer::Floating);
-    let tile_a = window(67_798, NormalZOrderLayer::Tiling);
-    let tile_b = window(131_888, NormalZOrderLayer::Tiling);
-
-    let previous = [tile_a.0, tile_b.0, popup.0, owner.0];
-    let owner_of = |id: WindowId| -> Option<WindowId> {
-      if id == popup.0 {
-        Some(owner.0)
-      } else {
-        None
-      }
-    };
-    let result = normal_z_order_chain(
-      vec![popup, owner, tile_a, tile_b],
-      popup.0,
-      Some(&previous),
-      &owner_of,
-    )
-    .expect("chain");
-
-    assert_eq!(
-      result,
-      vec![popup.0, owner.0, tile_a.0, tile_b.0],
-      "modal owned Alt-Tab must raise parent+dialog as one group"
-    );
-  }
-
-  /// Helper-level check for **non-modal** owned popup grouping.
-  #[test]
-  fn non_modal_owner_group_raises_popup_and_owner_above_tiles() {
-    let popup = WindowId(4_720_436);
-    let owner = WindowId(330_456);
-    let tile_a = WindowId(67_798);
-    let tile_b = WindowId(131_888);
-    let previous = [tile_a, tile_b, popup, owner];
-
-    let owner_of = |id: WindowId| -> Option<WindowId> {
-      if id == popup {
-        Some(owner)
-      } else {
-        None
-      }
-    };
-
-    assert_eq!(
-      floating_focus_owner_group(&previous, popup, &owner_of),
-      vec![popup, owner, tile_a, tile_b],
-      "non-modal owned Alt-Tab must raise parent+popup as one group"
-    );
-  }
-
-  /// Helper-level check for **modal** owned dialog grouping.
-  #[test]
-  fn modal_owner_group_raises_dialog_and_owner_above_tiles() {
-    let popup = WindowId(724_112);
-    let owner = WindowId(330_456);
-    let tile_a = WindowId(67_798);
-    let tile_b = WindowId(131_888);
-    let previous = [tile_a, tile_b, popup, owner];
-
-    let owner_of = |id: WindowId| -> Option<WindowId> {
-      if id == popup {
-        Some(owner)
-      } else {
-        None
-      }
-    };
-
-    assert_eq!(
-      floating_focus_owner_group(&previous, popup, &owner_of),
-      vec![popup, owner, tile_a, tile_b],
-      "modal owned Alt-Tab must raise parent+dialog as one group"
-    );
-  }
-
-  #[test]
-  fn floating_focus_owner_group_preserves_owned_sibling_order() {
-    let popup = WindowId(100);
-    let sibling = WindowId(101);
-    let owner = WindowId(200);
-    let other_float = WindowId(300);
-    let tile = WindowId(400);
-    // Prior: tiles, then other floater, then owner group (sibling above
-    // popup).
-    let previous = [tile, other_float, sibling, popup, owner];
-
-    let owner_of = |id: WindowId| -> Option<WindowId> {
-      if id == popup || id == sibling {
-        Some(owner)
-      } else {
-        None
-      }
-    };
-
-    assert_eq!(
-      floating_focus_owner_group(&previous, popup, &owner_of),
-      vec![popup, sibling, owner, tile, other_float],
-      "focused owned first; other owned siblings keep prior relative order; owner last in group"
-    );
-  }
-
-  #[test]
-  fn floating_focus_owner_group_noop_without_owner() {
-    let floater = WindowId(1);
-    let tile = WindowId(2);
-    let previous = [tile, floater];
-    let owner_of = |_id: WindowId| -> Option<WindowId> { None };
-
-    assert_eq!(
-      floating_focus_owner_group(&previous, floater, &owner_of),
-      vec![floater, tile],
-      "unowned floater still promotes alone"
-    );
-  }
-
-  #[test]
-  fn hung_focused_tile_chain_still_intends_tiles_then_floaters() {
-    // Bug B intent: even when the focused tile is a hung debug helper, the
-    // *intended* chain remains tiles-then-floaters. Native apply must then
-    // raise responsive peers without using the hung hwnd as an anchor.
-    let hung_helper = window(2_168_898, NormalZOrderLayer::Tiling);
-    let tile = window(265_086, NormalZOrderLayer::Tiling);
-    let steam = window(330_202, NormalZOrderLayer::Floating);
-
-    let previous = [steam.0, tile.0, hung_helper.0];
-    assert_eq!(
-      chain(
-        vec![hung_helper, tile, steam],
-        hung_helper.0,
-        Some(&previous),
-      ),
-      Some(vec![hung_helper.0, tile.0, steam.0])
-    );
-  }
   #[test]
   #[allow(clippy::too_many_lines)]
   fn workspace_hide_taskbar_delete_requires_prior_cloak() {
@@ -1852,6 +1091,8 @@ mod tests {
   }
 }
 
+#[allow(clippy::too_many_lines)] // The display transition and Win32
+                                 // geometry path stay together.
 fn reposition_window(
   window: &WindowContainer,
   hide_corner: HideCorner,
@@ -1864,6 +1105,11 @@ fn reposition_window(
   preserve_z_order: bool,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  #[cfg(target_os = "windows")]
+  if !window.native().identity_is_current() {
+    return Ok(());
+  }
+
   // Show Desktop minimizes windows natively without changing their WM tree
   // state. A redraw must not restore or reposition those windows, or the
   // next focus/layout sync would undo Show Desktop.
@@ -1952,7 +1198,10 @@ fn reposition_window(
         | SWP_NOCOPYBITS
         | SWP_NOSENDCHANGING
         | SWP_ASYNCWINDOWPOS;
-      if preserve_z_order {
+      let needs_z_order_change = matches!(z_order, WindowZOrder::TopMost)
+        || (window.native().debug_info().is_topmost == Some(true)
+          && !preserve_z_order);
+      if preserve_z_order || !needs_z_order_change {
         swp_flags |= SWP_NOZORDER;
       }
 

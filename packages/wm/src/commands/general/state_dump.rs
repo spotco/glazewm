@@ -258,7 +258,7 @@ fn workspace_z_order(state: &WmState) -> Vec<WorkspaceZOrder> {
   for workspace in state.workspaces() {
     let intended_ids = state
       .normal_z_order_for_workspace(workspace.id())
-      .unwrap_or(&[]);
+      .unwrap_or_default();
     rows.push(WorkspaceZOrder {
       workspace_id: workspace.id(),
       workspace_name: workspace.config().name,
@@ -268,7 +268,7 @@ fn workspace_z_order(state: &WmState) -> Vec<WorkspaceZOrder> {
         .iter()
         .map(|window_id| hwnd_i64(window_id.0))
         .collect(),
-      native_ranks: native_ranks_for(intended_ids),
+      native_ranks: native_ranks_for(&intended_ids),
       native_sample_timing: "dump_time",
     });
   }

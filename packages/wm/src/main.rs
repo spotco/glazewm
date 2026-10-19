@@ -51,6 +51,8 @@ mod events;
 mod ipc_conflict;
 mod ipc_server;
 mod models;
+#[cfg(target_os = "windows")]
+mod normal_window_stack;
 mod pending_sync;
 mod sys_tray;
 mod traits;

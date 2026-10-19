@@ -105,6 +105,13 @@ pub fn handle_mouse_move(
       if focused_container.id() != window.id() {
         set_focused_descendant(&window.as_container(), None);
         state.pending_sync.queue_focus_change();
+        if let Some(workspace) = window.workspace() {
+          state.pending_sync.queue_stack_activation(
+            &workspace,
+            window.id(),
+            crate::pending_sync::StackActivationReason::NativeActivation,
+          );
+        }
       }
     } else {
       // Focus the monitor if no window is under the cursor.

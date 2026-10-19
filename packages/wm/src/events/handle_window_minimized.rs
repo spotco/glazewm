@@ -50,8 +50,7 @@ pub fn handle_window_minimized(
       {
         set_focused_descendant(&focus_target, None);
         state.pending_sync.queue_focus_change().queue_cursor_jump();
-        state.unmanaged_or_minimized_timestamp =
-          Some(std::time::Instant::now());
+        state.arm_lifecycle_focus_recovery(Some(&focus_target));
       }
     }
   }

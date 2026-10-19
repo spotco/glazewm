@@ -80,6 +80,13 @@ pub fn manage_window(
     state.pending_sync.queue_workspace_to_reorder(
       window.workspace().context("No workspace.")?,
     );
+    if let Some(workspace) = window.workspace() {
+      state.pending_sync.queue_stack_activation(
+        &workspace,
+        window.id(),
+        crate::pending_sync::StackActivationReason::NewWindow,
+      );
+    }
 
     // Sibling containers need to be redrawn if the window is tiling.
     state.pending_sync.queue_container_to_redraw(

@@ -125,6 +125,7 @@ pub fn move_window_to_workspace(
     if let Some(focus_target) = focus_target {
       set_focused_descendant(&focus_target, None);
       state.pending_sync.queue_focus_change();
+      state.arm_lifecycle_focus_recovery(Some(&focus_target));
     }
 
     match window {

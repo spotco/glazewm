@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use wm_common::WindowState;
 use wm_platform::NativeWindow;
 #[cfg(target_os = "windows")]
@@ -63,14 +61,6 @@ pub fn show_desktop(
     {
       unmanaged_windows.push(window);
     }
-  }
-
-  if !managed_windows.is_empty() || !unmanaged_windows.is_empty() {
-    // Windows can emit a focus event for the next z-order window before
-    // its minimize event reaches the WM. Reuse the normal short focus
-    // override window so that event cannot switch to another workspace
-    // mid-action.
-    state.unmanaged_or_minimized_timestamp = Some(Instant::now());
   }
 
   if !managed_windows.is_empty() && !state.show_desktop_session_active() {

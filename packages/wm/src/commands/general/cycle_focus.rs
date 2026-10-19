@@ -62,8 +62,13 @@ pub fn cycle_focus(
         });
 
       if let Some(window) = window_of_type {
-        set_focused_descendant(&window.into(), None);
+        set_focused_descendant(&window.clone().into(), None);
         state.pending_sync.queue_focus_change().queue_cursor_jump();
+        state.pending_sync.queue_stack_activation(
+          &workspace,
+          window.id(),
+          crate::pending_sync::StackActivationReason::WmCommand,
+        );
         break;
       }
 

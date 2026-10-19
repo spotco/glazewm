@@ -98,14 +98,53 @@ pub struct NativeWindowDebugInfo {
   pub errors: Vec<String>,
 }
 
-/// Reorders a normal-window chain without changing focus or visibility.
+/// Reconciles normal-window order without implying an absolute promotion.
 ///
-/// # Platform-specific
-///
-/// This method is only available on Windows.
+/// `Preserve` repairs violated participant relationships while retaining
+/// the current native slot of the chain. `Promote` is reserved for
+/// explicit activation and may move the selected atom to the normal
+/// foreground.
 #[cfg(target_os = "windows")]
-pub fn reorder_z_order(window_ids: &[WindowId]) -> crate::Result<()> {
-  platform_impl::reorder_z_order(window_ids)
+pub fn reconcile_z_order(
+  window_ids: &[WindowId],
+  intent: ZOrderIntent,
+  promoted_atom_ids: &[WindowId],
+) -> crate::Result<ZOrderReconcileOutcome> {
+  platform_impl::reconcile_z_order(window_ids, intent, promoted_atom_ids)
+}
+
+/// Reconciles a workspace with a workspace-local retry generation.
+///
+/// Independent displayed workspaces keep their convergence workers
+/// independent. A newer decision for one workspace cancels only that
+/// workspace's stale retries.
+#[cfg(target_os = "windows")]
+pub fn reconcile_z_order_for_workspace(
+  workspace_scope: u128,
+  window_ids: &[WindowId],
+  intent: ZOrderIntent,
+  promoted_atom_ids: &[WindowId],
+) -> crate::Result<ZOrderReconcileOutcome> {
+  platform_impl::reconcile_z_order_for_workspace(
+    workspace_scope,
+    window_ids,
+    intent,
+    promoted_atom_ids,
+  )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZOrderIntent {
+  Preserve,
+  Promote,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZOrderReconcileOutcome {
+  pub native_writes: usize,
+  pub skipped_windows: usize,
+  pub retry_scheduled: bool,
+  pub superseded: bool,
 }
 
 /// Samples native top-to-bottom z-order ranks for the given window IDs.
@@ -117,13 +156,6 @@ pub fn sample_z_order_ranks(
   window_ids: &[WindowId],
 ) -> Vec<(WindowId, u32)> {
   platform_impl::sample_z_order_ranks(window_ids)
-}
-
-/// Starts one generation for a logical z-order reconciliation batch.
-#[cfg(target_os = "windows")]
-#[must_use]
-pub fn begin_z_order_batch() -> u64 {
-  platform_impl::begin_z_order_batch()
 }
 
 /// macOS-specific extension trait for [`NativeWindow`].
@@ -227,6 +259,11 @@ pub trait NativeWindowWindowsExt {
   ///
   /// This method is only available on Windows.
   fn hwnd(&self) -> HWND;
+
+  /// Whether the stored handle still identifies the HWND instance captured
+  /// by this wrapper. This rejects stale wrappers after Windows reuses an
+  /// HWND value.
+  fn identity_is_current(&self) -> bool;
 
   /// Gets the class name of the window.
   ///
@@ -405,6 +442,10 @@ impl NativeWindowWindowsExt for NativeWindow {
 
   fn hwnd(&self) -> HWND {
     self.inner.hwnd()
+  }
+
+  fn identity_is_current(&self) -> bool {
+    self.inner.identity_is_current()
   }
 
   fn class_name(&self) -> crate::Result<String> {
