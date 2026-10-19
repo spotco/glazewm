@@ -2433,6 +2433,7 @@ fn tid_probe_cache_get_or_insert(
 enum ZOrderInsertAfter {
   Top,
   After(WindowId),
+  AfterAnchor(WindowId),
 }
 
 /// Resolves insert-after for `index`, skipping unusable predecessors.
@@ -2448,7 +2449,8 @@ fn planned_insert_after(
       return ZOrderInsertAfter::After(window_ids[previous]);
     }
   }
-  first_anchor.map_or(ZOrderInsertAfter::Top, ZOrderInsertAfter::After)
+  first_anchor
+    .map_or(ZOrderInsertAfter::Top, ZOrderInsertAfter::AfterAnchor)
 }
 
 fn plan_z_order_moves(
@@ -2537,6 +2539,52 @@ struct ZOrderApplyResult {
   responsive_window_ids: Vec<WindowId>,
 }
 
+fn apply_planned_z_order_move(
+  window_id: WindowId,
+  insert_after: ZOrderInsertAfter,
+  flags: SET_WINDOW_POS_FLAGS,
+) -> crate::Result<()> {
+  let hwnd = HWND(window_id.0);
+  let (insert_after_id, insert_after_hwnd) = match insert_after {
+    ZOrderInsertAfter::Top => (None, HWND_TOP),
+    ZOrderInsertAfter::After(anchor)
+    | ZOrderInsertAfter::AfterAnchor(anchor) => {
+      (Some(anchor), HWND(anchor.0))
+    }
+  };
+
+  match unsafe {
+    SetWindowPos(hwnd, insert_after_hwnd, 0, 0, 0, 0, flags)
+  } {
+    Ok(()) => Ok(()),
+    Err(anchor_error)
+      if matches!(insert_after, ZOrderInsertAfter::AfterAnchor(_)) =>
+    {
+      match unsafe { SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags) } {
+        Ok(()) => {
+          warn!(
+            ?window_id,
+            ?insert_after_id,
+            %anchor_error,
+            "external z-order anchor rejected; retried at HWND_TOP",
+          );
+          Ok(())
+        }
+        Err(fallback_error) => Err(crate::Error::Platform(format!(
+          "SetWindowPos failed for {window_id:?} after {insert_after_id:?}: {anchor_error}; retry at HWND_TOP failed: {fallback_error}; target={:?}; anchor={:?}",
+          native_window_identity(window_id),
+          insert_after_id.and_then(native_window_identity),
+        ))),
+      }
+    }
+    Err(error) => Err(crate::Error::Platform(format!(
+      "SetWindowPos failed for {window_id:?} after {insert_after_id:?}: {error}; target={:?}; anchor={:?}",
+      native_window_identity(window_id),
+      insert_after_id.and_then(native_window_identity),
+    ))),
+  }
+}
+
 /// Applies the z-order chain. Reports responsive hwnds separately from
 /// skipped windows so convergence checks only include windows that this
 /// pass could place.
@@ -2618,24 +2666,7 @@ fn apply_z_order_chain(
   let skipped_windows =
     usable.iter().filter(|is_usable| !**is_usable).count();
   for (window_id, insert_after) in planned_moves {
-    let hwnd = HWND(window_id.0);
-    let insert_after_id = match insert_after {
-      ZOrderInsertAfter::Top => None,
-      ZOrderInsertAfter::After(window_id) => Some(window_id),
-    };
-    let insert_after = match insert_after {
-      ZOrderInsertAfter::Top => HWND_TOP,
-      ZOrderInsertAfter::After(window_id) => HWND(window_id.0),
-    };
-    if let Err(error) =
-      unsafe { SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags) }
-    {
-      return Err(crate::Error::Platform(format!(
-        "SetWindowPos failed for {window_id:?} after {insert_after_id:?}: {error}; target={:?}; anchor={:?}",
-        native_window_identity(window_id),
-        insert_after_id.and_then(native_window_identity),
-      )));
-    }
+    apply_planned_z_order_move(window_id, insert_after, flags)?;
   }
 
   Ok(ZOrderApplyResult {
@@ -3970,7 +4001,7 @@ mod reorder_z_order_tests {
         super::ZOrderIntent::Preserve,
         Some(external_anchor),
       ),
-      vec![(a, super::ZOrderInsertAfter::After(external_anchor))],
+      vec![(a, super::ZOrderInsertAfter::AfterAnchor(external_anchor))],
       "repairing participant order must anchor at its prior native slot"
     );
   }

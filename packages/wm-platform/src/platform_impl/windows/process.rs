@@ -5,7 +5,7 @@ use std::{
 use windows::{
   core::PCWSTR,
   Win32::{
-    Foundation::CloseHandle,
+    Foundation::{CloseHandle, HANDLE},
     Security::{
       GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     },
@@ -17,13 +17,13 @@ use windows::{
   },
 };
 
-const ERROR_CANCELLED_HRESULT: i32 = 0x8007_04C7_u32 as i32;
+const ERROR_CANCELLED_HRESULT: i32 = 0x8007_04C7_u32.cast_signed();
 
 /// Returns whether the current process has a full elevated token.
 pub(crate) fn is_process_elevated() -> crate::Result<bool> {
-  let mut token = Default::default();
+  let mut token = HANDLE::default();
   unsafe {
-    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token)?;
   }
 
   let mut elevation = TOKEN_ELEVATION::default();
@@ -32,9 +32,9 @@ pub(crate) fn is_process_elevated() -> crate::Result<bool> {
     GetTokenInformation(
       token,
       TokenElevation,
-      Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
-      size_of::<TOKEN_ELEVATION>() as u32,
-      &mut returned_length,
+      Some((&raw mut elevation).cast()),
+      u32::try_from(size_of::<TOKEN_ELEVATION>())?,
+      &raw mut returned_length,
     )
   };
   unsafe {
@@ -58,7 +58,7 @@ pub(crate) fn relaunch_current_process_as_admin(
   let parameters_wide = encode_windows_arguments(args);
 
   let mut execute_info = SHELLEXECUTEINFOW {
-    cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+    cbSize: u32::try_from(size_of::<SHELLEXECUTEINFOW>())?,
     fMask: SEE_MASK_NOASYNC,
     lpVerb: PCWSTR(verb_wide.as_ptr()),
     lpFile: PCWSTR(executable_wide.as_ptr()),
@@ -67,7 +67,7 @@ pub(crate) fn relaunch_current_process_as_admin(
     ..Default::default()
   };
 
-  match unsafe { ShellExecuteExW(&mut execute_info) } {
+  match unsafe { ShellExecuteExW(&raw mut execute_info) } {
     Ok(()) => Ok(true),
     Err(error) if error.code().0 == ERROR_CANCELLED_HRESULT => Ok(false),
     Err(error) => Err(error.into()),
@@ -81,31 +81,32 @@ fn wide_null(value: &OsStr) -> Vec<u16> {
 /// Quotes arguments using the Windows command-line backslash/quote rules.
 fn encode_windows_arguments(args: &[String]) -> Vec<u16> {
   let mut encoded = Vec::new();
+  let backslash = u16::from(b'\\');
+  let quote = u16::from(b'"');
 
   for (index, arg) in args.iter().enumerate() {
     if index > 0 {
-      encoded.push(b' ' as u16);
+      encoded.push(u16::from(b' '));
     }
 
-    encoded.push(b'"' as u16);
+    encoded.push(quote);
     let mut backslashes = 0;
     for unit in arg.encode_utf16() {
-      if unit == b'\\' as u16 {
+      if unit == backslash {
         backslashes += 1;
-      } else if unit == b'"' as u16 {
-        encoded
-          .extend(iter::repeat(b'\\' as u16).take(backslashes * 2 + 1));
+      } else if unit == quote {
+        encoded.extend(iter::repeat_n(backslash, backslashes * 2 + 1));
         encoded.push(unit);
         backslashes = 0;
       } else {
-        encoded.extend(iter::repeat(b'\\' as u16).take(backslashes));
+        encoded.extend(iter::repeat_n(backslash, backslashes));
         encoded.push(unit);
         backslashes = 0;
       }
     }
 
-    encoded.extend(iter::repeat(b'\\' as u16).take(backslashes * 2));
-    encoded.push(b'"' as u16);
+    encoded.extend(iter::repeat_n(backslash, backslashes * 2));
+    encoded.push(quote);
   }
 
   encoded.push(0);
