@@ -1154,10 +1154,9 @@ fn focus_target_after_removal_windows(
     .or_else(|| Some(workspace.clone().into()))
 }
 
-/// Finds a managed native owner in the removed window's workspace.
-///
-/// This only resolves the explicit Win32 owner handle; live-window
-/// eligibility is checked by the caller.
+/// Finds a managed window matching the removed window's explicit native
+/// owner handle in the same workspace. Native liveness and visibility are
+/// checked by the caller's eligibility predicate.
 #[cfg(target_os = "windows")]
 fn managed_owner_focus_target(
   descendants: &[Container],
@@ -1172,9 +1171,6 @@ fn managed_owner_focus_target(
         && candidate.workspace().is_some_and(|candidate_workspace| {
           candidate_workspace.id() == workspace.id()
         })
-        && candidate.state() != WindowState::Minimized
-        && candidate.native().is_valid()
-        && candidate.native().is_visible().unwrap_or(false)
     })
     .map(Into::into)
 }

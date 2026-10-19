@@ -55,6 +55,8 @@ mod models;
 mod normal_window_stack;
 mod pending_sync;
 mod sys_tray;
+#[cfg(all(test, target_os = "windows"))]
+mod test_utils;
 mod traits;
 
 use crate::traits::WindowGetters;

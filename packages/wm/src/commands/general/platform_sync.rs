@@ -374,8 +374,15 @@ fn redraw_containers(
     {
       let hide_with_cloak =
         config.value.general.hide_method == HideMethod::Cloak;
-      let mut cloak_begun = hide_with_cloak && repositioned.is_ok();
-      if hide_with_cloak && repositioned.is_err() {
+      let window_identity_is_current =
+        window.native().identity_is_current();
+      let mut cloak_begun = hide_with_cloak
+        && repositioned.is_ok()
+        && window_identity_is_current;
+      if hide_with_cloak
+        && repositioned.is_err()
+        && window_identity_is_current
+      {
         match window.native().set_cloaked(!is_visible) {
           Ok(()) => cloak_begun = true,
           Err(err) => {
@@ -389,6 +396,7 @@ fn redraw_containers(
 
       if hide_with_cloak
         && !config.value.general.show_all_in_taskbar
+        && window_identity_is_current
         && matches!(
           window.display_state(),
           DisplayState::Showing | DisplayState::Hiding
@@ -879,7 +887,7 @@ mod tests {
 
   #[test]
   #[allow(clippy::too_many_lines)]
-  fn workspace_hide_taskbar_delete_requires_prior_cloak() {
+  fn stale_window_does_not_delete_taskbar_tab_after_skipped_reposition() {
     use std::sync::Mutex;
 
     use tokio::sync::mpsc;
@@ -908,9 +916,9 @@ mod tests {
       }
     }
 
-    // Invalid HWND: SetWindowPos fails inside reposition_window before
-    // set_cloaked. Same early return as a fullscreen maximize /
-    // SetWindowPos error. Live windows are refused below.
+    // Invalid HWND: reposition_window correctly skips a stale identity.
+    // It must not report this no-op as a successful hide and delete the
+    // window's taskbar tab.
     const GAME_HWND: isize = 0x0EE0_EE01;
     const ANCHOR_HWND: isize = 0x0EE0_EE02;
 
@@ -1075,18 +1083,10 @@ mod tests {
     let cloak_at = began("op=set_cloaked");
     let taskbar_at = began("op=set_taskbar_visibility");
 
-    // Contract: if taskbar hide runs, cloak must already have begun.
-    // Current code returns from reposition_window on SetWindowPos
-    // failure, then the caller still calls DeleteTab.
-    let taskbar_before_cloak = match (cloak_at, taskbar_at) {
-      (None, Some(_)) => true,
-      (Some(cloak), Some(taskbar)) => cloak > taskbar,
-      _ => false,
-    };
     assert!(
-      !taskbar_before_cloak,
-      "taskbar hide ran before cloak for {hwnd_token}; window stays \
-       Hiding and drops out of Alt-Tab: {lines:?}"
+      cloak_at.is_none() && taskbar_at.is_none(),
+      "stale HWND must skip both cloak and taskbar changes for \
+       {hwnd_token}: {lines:?}"
     );
   }
 }

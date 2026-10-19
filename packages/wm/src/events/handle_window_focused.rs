@@ -296,10 +296,7 @@ mod tests {
   use wm_common::{
     GapsConfig, TilingDirection, WindowState, WorkspaceConfig,
   };
-  use wm_platform::{
-    EventLoop, NativeWindow, NativeWindowWindowsExt, Rect, RectDelta,
-    WindowId,
-  };
+  use wm_platform::{EventLoop, Rect, RectDelta};
 
   use super::*;
   use crate::{
@@ -360,9 +357,12 @@ mod tests {
     attach_container(&workspace_container, &monitor.clone().into(), None)
       .expect("attach workspace");
 
+    let tiled_native = crate::test_utils::TestNativeWindow::new();
+    let detached_native = crate::test_utils::TestNativeWindow::new();
+    let ignored_native = crate::test_utils::TestNativeWindow::new();
     let tiled_window = TilingWindow::new(
       None,
-      NativeWindow::from_handle(1),
+      tiled_native.native().clone(),
       test_properties("managed owner"),
       None,
       RectDelta::zero(),
@@ -374,7 +374,7 @@ mod tests {
     );
     let detached_window = NonTilingWindow::new(
       None,
-      NativeWindow::from_handle(2),
+      detached_native.native().clone(),
       test_properties("detached peer"),
       WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
@@ -412,7 +412,7 @@ mod tests {
       UserConfig::new(Some(config_path)).expect("test config");
 
     handle_window_focused(
-      &NativeWindow::from_handle(3),
+      ignored_native.native(),
       &mut state,
       &mut config,
     )
@@ -428,7 +428,7 @@ mod tests {
     // queued before that event must be dropped, and draining it must not
     // rebuild the normal z-order chain over the ignored foreground.
     state.pending_sync.clear();
-    state.ignored_windows.push(NativeWindow::from_handle(3));
+    state.ignored_windows.push(ignored_native.native().clone());
     state
       .pending_sync
       .queue_workspace_to_reorder(workspace.clone());
@@ -444,19 +444,21 @@ mod tests {
       .pending_sync
       .queue_container_to_redraw(tiled_window.clone());
     let sentinel =
-      vec![detached_window.native().id(), tiled_window.native().id()];
+      vec![detached_native.native().id(), tiled_native.native().id()];
+    let expected_after_ignored_activation =
+      vec![ignored_native.native().id(), sentinel[0], sentinel[1]];
     state.apply_normal_stack_operation(
       workspace.id(),
       crate::normal_window_stack::StackOperation::Reconcile {
-        tiled_window_ids: vec![tiled_window.native().id()],
-        detached_window_ids: vec![detached_window.native().id()],
+        tiled_window_ids: vec![tiled_native.native().id()],
+        detached_window_ids: vec![detached_native.native().id()],
         owner_by_window: HashMap::new(),
         native_order: sentinel.clone(),
       },
     );
 
     handle_window_focused(
-      &NativeWindow::from_handle(3),
+      ignored_native.native(),
       &mut state,
       &mut config,
     )
@@ -471,18 +473,25 @@ mod tests {
     assert!(!state.pending_sync.needs_focused_effect_update());
     assert!(!state.pending_sync.needs_cursor_jump());
     assert!(!state.pending_sync.containers_to_redraw().is_empty());
-    assert_eq!(state.ignored_native_foreground, Some(WindowId(3)));
+    assert_eq!(
+      state.ignored_native_foreground,
+      Some(ignored_native.native().id())
+    );
     assert!(!state.is_focus_synced);
 
-    // A redraw queued alongside the stale reorder still drains, but it
-    // must not replace the saved chain or focus the tiled window.
+    // A redraw queued alongside the stale reorder still drains. The
+    // ignored activation stays above the saved managed chain, whose
+    // relative order must not change or promote the tiled window.
     crate::commands::general::platform_sync(&mut state, &config)
       .expect("drain pending work after ignored focus");
     assert_eq!(
       state.normal_z_order_for_workspace(workspace.id()),
-      Some(sentinel.clone())
+      Some(expected_after_ignored_activation.clone())
     );
-    assert_eq!(state.ignored_native_foreground, Some(WindowId(3)));
+    assert_eq!(
+      state.ignored_native_foreground,
+      Some(ignored_native.native().id())
+    );
     assert!(state.pending_sync.containers_to_redraw().is_empty());
 
     // Work queued while the ignored window still owns foreground is
@@ -495,17 +504,13 @@ mod tests {
       .expect("drain work queued during ignored foreground");
     assert_eq!(
       state.normal_z_order_for_workspace(workspace.id()),
-      Some(sentinel)
+      Some(expected_after_ignored_activation)
     );
     assert!(!state.pending_sync.needs_focus_update());
     assert!(state.pending_sync.workspaces_to_reorder().is_empty());
 
-    handle_window_focused(
-      &NativeWindow::from_handle(1),
-      &mut state,
-      &mut config,
-    )
-    .expect("return focus to the tiled window");
+    handle_window_focused(tiled_native.native(), &mut state, &mut config)
+      .expect("return focus to the tiled window");
     assert_eq!(state.ignored_native_foreground, None);
     assert_eq!(state.pending_sync.workspaces_to_reorder().len(), 1);
   }

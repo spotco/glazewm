@@ -45,3 +45,9 @@ wm-common = { path = "../wm-common" }
 wm-ipc-client = { path = "../wm-ipc-client" }
 wm-macros = { workspace = true }
 wm-platform = { path = "../wm-platform" }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
