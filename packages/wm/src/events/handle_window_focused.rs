@@ -2,6 +2,8 @@ use anyhow::Context;
 use tracing::info;
 use wm_common::{DisplayState, WindowRuleEvent, WmEvent};
 use wm_platform::NativeWindow;
+#[cfg(target_os = "windows")]
+use wm_platform::NativeWindowWindowsExt;
 
 use crate::{
   commands::{
@@ -21,10 +23,27 @@ pub fn handle_window_focused(
   config: &mut UserConfig,
 ) -> anyhow::Result<()> {
   let found_window = state.window_from_native(native_window);
-  let is_ignored_window = state
-    .ignored_windows
-    .iter()
-    .any(|ignored_window| ignored_window == native_window);
+  #[cfg(target_os = "windows")]
+  let found_window =
+    found_window.filter(|window| window.native().identity_is_current());
+  let is_ignored_window =
+    state.ignored_windows.iter().any(|ignored_window| {
+      ignored_window == native_window && {
+        #[cfg(all(target_os = "windows", test))]
+        {
+          ignored_window.identity_is_current()
+            || (!ignored_window.is_valid() && !native_window.is_valid())
+        }
+        #[cfg(all(target_os = "windows", not(test)))]
+        {
+          ignored_window.identity_is_current()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+          true
+        }
+      }
+    });
 
   // Ignored windows stay out of logical focus. Record the promotion
   // immediately so a later Alt-Tab does not replay a chain that still
@@ -51,6 +70,8 @@ pub fn handle_window_focused(
   }
 
   state.ignored_native_foreground = None;
+  let lifecycle_recovery =
+    state.consume_lifecycle_focus_recovery(native_window);
 
   let focused_container =
     state.focused_container().context("No focused container.")?;
@@ -61,23 +82,6 @@ pub fn handle_window_focused(
     Ok(window) => *window.native() == *native_window,
     _ => native_window.is_desktop_window().unwrap_or(false),
   };
-
-  // Handle overriding focus on close/minimize. After a window is closed
-  // or minimized, the OS or the closed application might automatically
-  // switch focus to a different window. To force focus to go to the WM's
-  // target focus container, we reassign any focus events 100ms after
-  // close/minimize. This will cause focus to briefly flicker to the OS
-  // focus target and then to the WM's focus target.
-  if should_override_focus(state) {
-    state.pending_sync.queue_focus_change();
-    record_focus_diagnostic(
-      state,
-      native_window,
-      crate::diagnostic_history::FocusOutcome::OverrideRecentUnmanage,
-      found_window.as_ref(),
-    );
-    return Ok(());
-  }
 
   // Focus effect should be updated for any change in focus that shouldn't
   // be overwritten. The incoming focus event at this point is either:
@@ -102,17 +106,43 @@ pub fn handle_window_focused(
 
   if let Some(window) = found_window {
     let workspace = window.workspace().context("No workspace")?;
+    let already_requested_activation = state
+      .pending_sync
+      .stack_activation(&workspace)
+      .is_some_and(|activation| activation.window_id == window.id());
+    if !lifecycle_recovery {
+      // A different live native foreground transition supersedes the
+      // automatic fallback request. This preserves a real owner/app focus
+      // transition that races with unmanage processing.
+      state.clear_lifecycle_focus_recovery();
+    }
 
     // Native focus has been synced to the WM's focused container.
     if focused_container == window.clone().into() {
       state.is_focus_synced = true;
-      state.pending_sync.queue_workspace_to_reorder(workspace);
-      record_focus_diagnostic(
-        state,
-        native_window,
-        crate::diagnostic_history::FocusOutcome::AlreadySynced,
-        Some(&window),
-      );
+      state
+        .pending_sync
+        .queue_workspace_to_reorder(workspace.clone());
+      if lifecycle_recovery {
+        record_focus_diagnostic(
+          state,
+          native_window,
+          crate::diagnostic_history::FocusOutcome::LifecycleRecovery,
+          Some(&window),
+        );
+      } else if !already_requested_activation {
+        state.pending_sync.queue_stack_activation(
+          &workspace,
+          window.id(),
+          crate::pending_sync::StackActivationReason::NativeActivation,
+        );
+        record_focus_diagnostic(
+          state,
+          native_window,
+          crate::diagnostic_history::FocusOutcome::AlreadySynced,
+          Some(&window),
+        );
+      }
       return Ok(());
     }
 
@@ -152,13 +182,12 @@ pub fn handle_window_focused(
     let pending_sync = state
       .pending_sync
       .queue_workspace_to_reorder(workspace.clone());
-
-    if matches!(
-      window.state(),
-      wm_common::WindowState::Floating(config) if !config.shown_on_top
-    ) {
-      pending_sync
-        .queue_focused_window_to_bring_to_front(&workspace, window.id());
+    if !lifecycle_recovery && !already_requested_activation {
+      pending_sync.queue_stack_activation(
+        &workspace,
+        window.id(),
+        crate::pending_sync::StackActivationReason::NativeActivation,
+      );
     }
 
     // Broadcast the focus change event.
@@ -168,7 +197,11 @@ pub fn handle_window_focused(
     record_focus_diagnostic(
       state,
       native_window,
-      crate::diagnostic_history::FocusOutcome::ManualFocus,
+      if lifecycle_recovery {
+        crate::diagnostic_history::FocusOutcome::LifecycleRecovery
+      } else {
+        crate::diagnostic_history::FocusOutcome::ManualFocus
+      },
       Some(&window),
     );
   }
@@ -255,24 +288,15 @@ fn window_state_name(state: &wm_common::WindowState) -> &'static str {
 }
 
 /// Returns true if focus should be reassigned to the WM's focus container.
-fn should_override_focus(state: &WmState) -> bool {
-  let has_recent_unmanage = state
-    .unmanaged_or_minimized_timestamp
-    .is_some_and(|time| time.elapsed().as_millis() < 100);
-
-  has_recent_unmanage && !state.is_focus_synced
-}
-
 #[cfg(test)]
 mod tests {
+  use std::collections::HashMap;
+
   use tokio::sync::mpsc;
   use wm_common::{
     GapsConfig, TilingDirection, WindowState, WorkspaceConfig,
   };
-  use wm_platform::{
-    EventLoop, NativeWindow, NativeWindowWindowsExt, Rect, RectDelta,
-    WindowId,
-  };
+  use wm_platform::{EventLoop, Rect, RectDelta};
 
   use super::*;
   use crate::{
@@ -300,7 +324,7 @@ mod tests {
 
   #[test]
   #[allow(clippy::too_many_lines)]
-  fn e2e_ignored_window_alt_tab_is_not_overridden_after_recent_unmanage() {
+  fn e2e_ignored_window_alt_tab_cancels_stack_and_focus_work() {
     let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
@@ -333,9 +357,12 @@ mod tests {
     attach_container(&workspace_container, &monitor.clone().into(), None)
       .expect("attach workspace");
 
+    let tiled_native = crate::test_utils::TestNativeWindow::new();
+    let detached_native = crate::test_utils::TestNativeWindow::new();
+    let ignored_native = crate::test_utils::TestNativeWindow::new();
     let tiled_window = TilingWindow::new(
       None,
-      NativeWindow::from_handle(1),
+      tiled_native.native().clone(),
       test_properties("managed owner"),
       None,
       RectDelta::zero(),
@@ -347,7 +374,7 @@ mod tests {
     );
     let detached_window = NonTilingWindow::new(
       None,
-      NativeWindow::from_handle(2),
+      detached_native.native().clone(),
       test_properties("detached peer"),
       WindowState::Floating(wm_common::FloatingStateConfig::default()),
       Some(WindowState::Tiling),
@@ -385,7 +412,7 @@ mod tests {
       UserConfig::new(Some(config_path)).expect("test config");
 
     handle_window_focused(
-      &NativeWindow::from_handle(3),
+      ignored_native.native(),
       &mut state,
       &mut config,
     )
@@ -401,28 +428,39 @@ mod tests {
     // queued before that event must be dropped, and draining it must not
     // rebuild the normal z-order chain over the ignored foreground.
     state.pending_sync.clear();
-    state.ignored_windows.push(NativeWindow::from_handle(3));
-    state.unmanaged_or_minimized_timestamp =
-      Some(std::time::Instant::now());
+    state.ignored_windows.push(ignored_native.native().clone());
+    state
+      .set_focused_window_for_test(Some(ignored_native.native().clone()));
     state
       .pending_sync
       .queue_workspace_to_reorder(workspace.clone());
     state.pending_sync.queue_focus_change();
     state.pending_sync.queue_focused_effect_update();
     state.pending_sync.queue_cursor_jump();
-    state.pending_sync.queue_focused_window_to_bring_to_front(
+    state.pending_sync.queue_stack_activation(
       &workspace,
       detached_window.id(),
+      crate::pending_sync::StackActivationReason::NativeActivation,
     );
     state
       .pending_sync
       .queue_container_to_redraw(tiled_window.clone());
-    let sentinel = vec![WindowId(9)];
-    state
-      .set_normal_z_order_for_workspace(workspace.id(), sentinel.clone());
+    let sentinel =
+      vec![detached_native.native().id(), tiled_native.native().id()];
+    let expected_after_ignored_activation =
+      vec![ignored_native.native().id(), sentinel[0], sentinel[1]];
+    state.apply_normal_stack_operation(
+      workspace.id(),
+      crate::normal_window_stack::StackOperation::Reconcile {
+        tiled_window_ids: vec![tiled_native.native().id()],
+        detached_window_ids: vec![detached_native.native().id()],
+        owner_by_window: HashMap::new(),
+        native_order: sentinel.clone(),
+      },
+    );
 
     handle_window_focused(
-      &NativeWindow::from_handle(3),
+      ignored_native.native(),
       &mut state,
       &mut config,
     )
@@ -437,18 +475,25 @@ mod tests {
     assert!(!state.pending_sync.needs_focused_effect_update());
     assert!(!state.pending_sync.needs_cursor_jump());
     assert!(!state.pending_sync.containers_to_redraw().is_empty());
-    assert_eq!(state.ignored_native_foreground, Some(WindowId(3)));
+    assert_eq!(
+      state.ignored_native_foreground,
+      Some(ignored_native.native().id())
+    );
     assert!(!state.is_focus_synced);
 
-    // A redraw queued alongside the stale reorder still drains, but it
-    // must not replace the saved chain or focus the tiled window.
+    // A redraw queued alongside the stale reorder still drains. The
+    // ignored activation stays above the saved managed chain, whose
+    // relative order must not change or promote the tiled window.
     crate::commands::general::platform_sync(&mut state, &config)
       .expect("drain pending work after ignored focus");
     assert_eq!(
       state.normal_z_order_for_workspace(workspace.id()),
-      Some(sentinel.as_slice())
+      Some(expected_after_ignored_activation.clone())
     );
-    assert_eq!(state.ignored_native_foreground, Some(WindowId(3)));
+    assert_eq!(
+      state.ignored_native_foreground,
+      Some(ignored_native.native().id())
+    );
     assert!(state.pending_sync.containers_to_redraw().is_empty());
 
     // Work queued while the ignored window still owns foreground is
@@ -461,18 +506,13 @@ mod tests {
       .expect("drain work queued during ignored foreground");
     assert_eq!(
       state.normal_z_order_for_workspace(workspace.id()),
-      Some(sentinel.as_slice())
+      Some(expected_after_ignored_activation)
     );
     assert!(!state.pending_sync.needs_focus_update());
     assert!(state.pending_sync.workspaces_to_reorder().is_empty());
 
-    state.unmanaged_or_minimized_timestamp = None;
-    handle_window_focused(
-      &NativeWindow::from_handle(1),
-      &mut state,
-      &mut config,
-    )
-    .expect("return focus to the tiled window");
+    handle_window_focused(tiled_native.native(), &mut state, &mut config)
+      .expect("return focus to the tiled window");
     assert_eq!(state.ignored_native_foreground, None);
     assert_eq!(state.pending_sync.workspaces_to_reorder().len(), 1);
   }

@@ -1,6 +1,6 @@
 use std::{
   collections::{HashMap, HashSet, VecDeque},
-  time::Instant,
+  time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -17,6 +17,8 @@ use wm_platform::{
 #[cfg(target_os = "windows")]
 use wm_platform::{NativeWindowWindowsExt, OpacityValue};
 
+#[cfg(target_os = "windows")]
+use crate::normal_window_stack::{NormalWindowStack, StackOperation};
 use crate::{
   commands::{
     container::set_focused_descendant,
@@ -38,6 +40,12 @@ use crate::{
 
 pub(crate) const DEFAULT_GLOBAL_TILING_DIRECTION: TilingDirection =
   TilingDirection::Horizontal;
+
+#[derive(Clone)]
+struct LifecycleFocusRecovery {
+  target: NativeWindow,
+  expires_at: Instant,
+}
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct WmState {
@@ -62,10 +70,10 @@ pub struct WmState {
   /// changes.
   pub prev_effects_window: Option<WindowContainer>,
 
-  /// Time since a previously focused window was unmanaged or minimized.
-  ///
-  /// Used to decide whether to override incoming focus events.
-  pub unmanaged_or_minimized_timestamp: Option<Instant>,
+  /// Native window expected to receive focus from the current lifecycle
+  /// recovery transaction. A matching event updates focus without
+  /// implying a stacking activation.
+  lifecycle_focus_recovery: Option<LifecycleFocusRecovery>,
 
   /// Windows natively minimized by the active Show Desktop session. Their
   /// logical minimized transitions may temporarily simplify the live
@@ -77,6 +85,9 @@ pub struct WmState {
   /// bottom. This is transient native state, not layout state. It lets
   /// focus changes promote only the selected detached window while
   /// preserving the rest of the existing stack.
+  #[cfg(target_os = "windows")]
+  normal_z_order_by_workspace: HashMap<Uuid, NormalWindowStack>,
+  #[cfg(not(target_os = "windows"))]
   normal_z_order_by_workspace: HashMap<Uuid, Vec<WindowId>>,
 
   /// Layout captured before Show Desktop temporarily minimizes managed
@@ -107,6 +118,13 @@ pub struct WmState {
   /// Cleared by the next non-ignored focus event, or when the OS
   /// foreground is a managed window or the desktop.
   pub ignored_native_foreground: Option<WindowId>,
+
+  /// Test override for the OS foreground observation used while draining
+  /// pending z-order work. Focus events are injected by tests, so they
+  /// need an explicit matching native foreground observation when
+  /// exercising the live `platform_sync` path.
+  #[cfg(test)]
+  test_focused_window: Option<NativeWindow>,
 
   /// WM-wide insertion / stack axis for directional moves (spotcobuild).
   pub global_tiling_direction: TilingDirection,
@@ -145,7 +163,7 @@ impl WmState {
       pending_sync: PendingSync::default(),
       prev_effects_window: None,
       recent_workspace_name: None,
-      unmanaged_or_minimized_timestamp: None,
+      lifecycle_focus_recovery: None,
       show_desktop_minimized: HashSet::new(),
       normal_z_order_by_workspace: HashMap::new(),
       show_desktop_snapshot: None,
@@ -153,6 +171,8 @@ impl WmState {
       ignored_windows: Vec::new(),
       startup_z_order_pending: false,
       ignored_native_foreground: None,
+      #[cfg(test)]
+      test_focused_window: None,
       global_tiling_direction: DEFAULT_GLOBAL_TILING_DIRECTION,
       layout_history: LayoutHistory::default(),
       diagnostic_history: DiagnosticHistory::default(),
@@ -668,21 +688,45 @@ impl WmState {
   pub fn normal_z_order_for_workspace(
     &self,
     workspace_id: Uuid,
-  ) -> Option<&[WindowId]> {
-    self
-      .normal_z_order_by_workspace
-      .get(&workspace_id)
-      .map(Vec::as_slice)
+  ) -> Option<Vec<WindowId>> {
+    #[cfg(target_os = "windows")]
+    {
+      let stack = self.normal_z_order_by_workspace.get(&workspace_id)?;
+      let workspace = self
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.id() == workspace_id)?;
+      let tiled_ids = workspace
+        .descendant_focus_order()
+        .filter_map(|container| container.as_window_container().ok())
+        .filter(|window| window.state() == WindowState::Tiling)
+        .map(|window| window.native().id())
+        .collect::<Vec<_>>();
+      Some(stack.materialize(&tiled_ids))
+    }
+    #[cfg(not(target_os = "windows"))]
+    self.normal_z_order_by_workspace.get(&workspace_id).cloned()
   }
 
-  pub fn set_normal_z_order_for_workspace(
+  #[cfg(target_os = "windows")]
+  pub(crate) fn normal_stack_for_workspace(
+    &self,
+    workspace_id: Uuid,
+  ) -> Option<&NormalWindowStack> {
+    self.normal_z_order_by_workspace.get(&workspace_id)
+  }
+
+  #[cfg(target_os = "windows")]
+  pub(crate) fn apply_normal_stack_operation(
     &mut self,
     workspace_id: Uuid,
-    window_ids: Vec<WindowId>,
-  ) {
+    operation: StackOperation,
+  ) -> bool {
     self
       .normal_z_order_by_workspace
-      .insert(workspace_id, window_ids);
+      .entry(workspace_id)
+      .or_insert_with(|| NormalWindowStack::new(workspace_id))
+      .apply(operation)
   }
 
   #[must_use]
@@ -700,6 +744,48 @@ impl WmState {
 
   pub fn push_diagnostic(&mut self, body: DiagnosticBody) {
     self.diagnostic_history.push(body);
+  }
+
+  pub(crate) fn arm_lifecycle_focus_recovery(
+    &mut self,
+    focus_target: Option<&Container>,
+  ) {
+    self.lifecycle_focus_recovery = focus_target
+      .and_then(|target| target.as_window_container().ok())
+      .map(|window| LifecycleFocusRecovery {
+        target: window.native().clone(),
+        expires_at: Instant::now() + Duration::from_secs(1),
+      });
+  }
+
+  pub(crate) fn consume_lifecycle_focus_recovery(
+    &mut self,
+    native_window: &NativeWindow,
+  ) -> bool {
+    let Some(recovery) = self.lifecycle_focus_recovery.clone() else {
+      return false;
+    };
+    if Instant::now() >= recovery.expires_at {
+      self.lifecycle_focus_recovery = None;
+      return false;
+    }
+    if recovery.target.id() == native_window.id()
+      && recovery.target.identity_is_current()
+      && native_window.identity_is_current()
+    {
+      self.lifecycle_focus_recovery = None;
+      return true;
+    }
+
+    // A different valid foreground transition may be the removed dialog's
+    // real owner. Keep the recovery token until the event handler
+    // classifies that transition instead of spending it on an
+    // unrelated HWND.
+    false
+  }
+
+  pub(crate) fn clear_lifecycle_focus_recovery(&mut self) {
+    self.lifecycle_focus_recovery = None;
   }
 
   #[must_use]
@@ -754,66 +840,61 @@ impl WmState {
       .filter(|descendant| descendant.id() != removed_window.id())
       .collect::<Vec<_>>();
 
-    // Windows such as an application's Save As dialog can be created as a
-    // managed floating window even though they are transient popups from
-    // the user's perspective. When one closes, the native owner is the
-    // correct focus target.
     #[cfg(target_os = "windows")]
-    if let Some(owner_handle) =
-      removed_window.native().debug_info().owner_handle
     {
-      if let Some(owner_target) = managed_owner_focus_target(
-        &descendant_focus_order,
+      let owner_handle = removed_window
+        .native()
+        .identity_is_current()
+        .then(|| removed_window.native().debug_info().owner_handle)
+        .flatten();
+      let stack_order = self.normal_z_order_for_workspace(workspace.id());
+      focus_target_after_removal_windows(
+        removed_window,
         &workspace,
+        &descendant_focus_order,
         owner_handle,
-      ) {
-        return Some(owner_target);
+        stack_order.as_deref(),
+        eligible_recovery_window,
+      )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+      // Keep non-Windows focus selection unchanged.
+      if matches!(removed_window.state(), WindowState::Floating(_)) {
+        let previous_focus =
+          descendant_focus_order.iter().find(|descendant| {
+            descendant.as_window_container().map_or(true, |window| {
+              window.state() != WindowState::Minimized
+            })
+          });
+        return previous_focus
+          .cloned()
+          .or_else(|| Some(workspace.clone().into()));
       }
+
+      let focus_target_of_type = descendant_focus_order
+        .iter()
+        .filter_map(|descendant| descendant.as_window_container().ok())
+        .find(|descendant| {
+          matches!(
+            (descendant.state(), removed_window.state()),
+            (WindowState::Tiling, WindowState::Tiling)
+              | (WindowState::Floating(_), WindowState::Floating(_))
+              | (WindowState::Fullscreen(_), WindowState::Fullscreen(_))
+          )
+        })
+        .map(Into::into);
+      if focus_target_of_type.is_some() {
+        return focus_target_of_type;
+      }
+      let non_minimized_focus_target = descendant_focus_order
+        .iter()
+        .filter_map(|descendant| descendant.as_window_container().ok())
+        .find(|descendant| descendant.state() != WindowState::Minimized)
+        .map(Into::into);
+      non_minimized_focus_target.or(Some(workspace.into()))
     }
-
-    // A floating window is often a tool opened over the tiled workspace
-    // (P4Merge / P4Diff from a tiled P4V). The previous focus may be
-    // tiled. Prefer that window over an older floating peer such as
-    // Visual Studio, which would otherwise match the same-state rule
-    // and be raised above the tiles.
-    if matches!(removed_window.state(), WindowState::Floating(_)) {
-      let previous_focus =
-        descendant_focus_order.iter().find(|descendant| {
-          descendant.as_window_container().map_or(true, |window| {
-            window.state() != WindowState::Minimized
-          })
-        });
-      return previous_focus
-        .cloned()
-        .or_else(|| Some(workspace.clone().into()));
-    }
-
-    // Get focus target that matches the removed window type. This applies
-    // for windows that aren't in a minimized state.
-    let focus_target_of_type = descendant_focus_order
-      .iter()
-      .filter_map(|descendant| descendant.as_window_container().ok())
-      .find(|descendant| {
-        matches!(
-          (descendant.state(), removed_window.state()),
-          (WindowState::Tiling, WindowState::Tiling)
-            | (WindowState::Floating(_), WindowState::Floating(_))
-            | (WindowState::Fullscreen(_), WindowState::Fullscreen(_))
-        )
-      })
-      .map(Into::into);
-
-    if focus_target_of_type.is_some() {
-      return focus_target_of_type;
-    }
-
-    let non_minimized_focus_target = descendant_focus_order
-      .iter()
-      .filter_map(|descendant| descendant.as_window_container().ok())
-      .find(|descendant| descendant.state() != WindowState::Minimized)
-      .map(Into::into);
-
-    non_minimized_focus_target.or(Some(workspace.into()))
   }
 
   /// Returns all containers that contain the given point.
@@ -849,9 +930,9 @@ impl WmState {
   /// Records that `native_window` owns native foreground and cancels
   /// pending focus or z-order work.
   ///
-  /// Also invalidates in-flight Windows z-order retries. A retry scheduled
-  /// before this focus event must not replay a chain whose head is the
-  /// previous managed window.
+  /// A new reconciliation for this window's displayed workspace replaces
+  /// only that workspace's retry generation. Promotion retries also stop
+  /// as soon as native foreground leaves their requested chain.
   pub fn suspend_z_order_for_ignored_foreground(
     &mut self,
     native_window: &NativeWindow,
@@ -862,9 +943,8 @@ impl WmState {
 
     self.ignored_native_foreground = Some(window_id);
     self.pending_sync.cancel_foreground_assertions();
-    Self::invalidate_pending_z_order_retries();
-    // Promote after cancelling stale work, so the saved chain matches
-    // the window the user just Alt-Tabbed to.
+    // Promote after cancelling pending focus work, so the saved chain
+    // matches the window the user just Alt-Tabbed to.
     crate::commands::general::promote_ignored_window(self, native_window);
 
     if dropped_foreground_work
@@ -894,7 +974,15 @@ impl WmState {
       return false;
     }
 
-    if let Ok(foreground) = self.dispatcher.focused_window() {
+    #[cfg(test)]
+    let foreground = self
+      .test_focused_window
+      .clone()
+      .or_else(|| self.dispatcher.focused_window().ok());
+    #[cfg(not(test))]
+    let foreground = self.dispatcher.focused_window().ok();
+
+    if let Some(foreground) = foreground {
       if self
         .ignored_windows
         .iter()
@@ -925,7 +1013,6 @@ impl WmState {
       let dropped_foreground_work =
         self.pending_sync.has_foreground_assertions();
       self.pending_sync.cancel_foreground_assertions();
-      Self::invalidate_pending_z_order_retries();
       if dropped_foreground_work
         && crate::commands::general::verbose_z_order_enabled()
       {
@@ -939,12 +1026,12 @@ impl WmState {
     false
   }
 
-  /// Bumps the Windows z-order generation so delayed retries abort.
-  fn invalidate_pending_z_order_retries() {
-    #[cfg(target_os = "windows")]
-    {
-      let _ = wm_platform::begin_z_order_batch();
-    }
+  #[cfg(test)]
+  pub(crate) fn set_focused_window_for_test(
+    &mut self,
+    native_window: Option<NativeWindow>,
+  ) {
+    self.test_focused_window = native_window;
   }
 
   /// Best-effort: manage any currently visible top-level windows that are
@@ -982,10 +1069,17 @@ impl WmState {
   ///
   /// See: <https://github.com/glzr-io/glazewm/issues/1219>
   pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
-    let invalid_windows = self
-      .windows()
-      .into_iter()
-      .filter(|window| !window.native().is_valid());
+    let invalid_windows = self.windows().into_iter().filter(|window| {
+      #[cfg(target_os = "windows")]
+      {
+        !window.native().is_valid()
+          || !window.native().identity_is_current()
+      }
+      #[cfg(not(target_os = "windows"))]
+      {
+        !window.native().is_valid()
+      }
+    });
 
     for window in invalid_windows {
       tracing::info!("Removing invalid window: {}", window);
@@ -996,11 +1090,98 @@ impl WmState {
   }
 }
 
-/// Finds a managed native owner in the removed window's workspace.
-///
-/// Keeping this selection separate makes the transient-popup behavior
-/// independently testable without depending on a real Win32 owner
-/// relation.
+/// Applies the Windows fallback order while keeping eligibility injectable
+/// for pure selection tests.
+#[cfg(target_os = "windows")]
+fn focus_target_after_removal_windows(
+  removed_window: &WindowContainer,
+  workspace: &Workspace,
+  descendant_focus_order: &[Container],
+  owner_handle: Option<isize>,
+  stack_order: Option<&[WindowId]>,
+  is_eligible: impl Fn(&WindowContainer) -> bool,
+) -> Option<Container> {
+  // A real Win32 owner takes precedence over the saved stack slot.
+  if let Some(owner_handle) = owner_handle {
+    if let Some(owner_target) = managed_owner_focus_target(
+      descendant_focus_order,
+      workspace,
+      owner_handle,
+    ) {
+      if owner_target
+        .as_window_container()
+        .is_ok_and(|window| is_eligible(&window))
+      {
+        return Some(owner_target);
+      }
+    }
+  }
+
+  // Otherwise select the first eligible window below the removed atom.
+  // If the removed HWND was not in the saved stack, do not guess at a
+  // slot.
+  if let Some(stack_order) = stack_order {
+    let removed_handle = removed_window.native().id();
+    if let Some(removed_index) = stack_order
+      .iter()
+      .position(|window_id| *window_id == removed_handle)
+    {
+      if let Some(target) = stack_order
+        .iter()
+        .skip(removed_index.saturating_add(1))
+        .filter_map(|window_id| {
+          descendant_focus_order
+            .iter()
+            .filter_map(|container| container.as_window_container().ok())
+            .find(|candidate| candidate.native().id() == *window_id)
+        })
+        .find(|candidate| is_eligible(candidate))
+      {
+        return Some(target.into());
+      }
+    }
+  }
+
+  // A floating tool may have been opened over a tiled app. Preserve the
+  // prior eligible focus choice before considering general state matching.
+  if matches!(removed_window.state(), WindowState::Floating(_)) {
+    let previous_focus = descendant_focus_order
+      .iter()
+      .filter_map(|descendant| descendant.as_window_container().ok())
+      .find(|candidate| is_eligible(candidate));
+    return previous_focus
+      .map(Into::into)
+      .or_else(|| Some(workspace.clone().into()));
+  }
+
+  let focus_target_of_type = descendant_focus_order
+    .iter()
+    .filter_map(|descendant| descendant.as_window_container().ok())
+    .find(|candidate| {
+      is_eligible(candidate)
+        && matches!(
+          (candidate.state(), removed_window.state()),
+          (WindowState::Tiling, WindowState::Tiling)
+            | (WindowState::Floating(_), WindowState::Floating(_))
+            | (WindowState::Fullscreen(_), WindowState::Fullscreen(_))
+        )
+    })
+    .map(Into::into);
+  if focus_target_of_type.is_some() {
+    return focus_target_of_type;
+  }
+
+  descendant_focus_order
+    .iter()
+    .filter_map(|descendant| descendant.as_window_container().ok())
+    .find(|candidate| is_eligible(candidate))
+    .map(Into::into)
+    .or_else(|| Some(workspace.clone().into()))
+}
+
+/// Finds a managed window matching the removed window's explicit native
+/// owner handle in the same workspace. Native liveness and visibility are
+/// checked by the caller's eligibility predicate.
 #[cfg(target_os = "windows")]
 fn managed_owner_focus_target(
   descendants: &[Container],
@@ -1017,6 +1198,18 @@ fn managed_owner_focus_target(
         })
     })
     .map(Into::into)
+}
+
+#[cfg(target_os = "windows")]
+fn eligible_recovery_window(window: &WindowContainer) -> bool {
+  window.state() != WindowState::Minimized
+    && window.native().is_valid()
+    && window.native().identity_is_current()
+    && window.native().is_visible().unwrap_or(false)
+    && !window.native().is_minimized().unwrap_or(true)
+    && window
+      .workspace()
+      .is_some_and(|workspace| workspace.is_displayed())
 }
 
 impl Drop for WmState {
@@ -1087,6 +1280,8 @@ mod tests {
   }
 
   #[test]
+  #[allow(clippy::too_many_lines)] // Assemble a full workspace tree to
+                                   // verify recovery selection order.
   fn transient_owned_popup_removal_prefers_managed_owner() {
     let (_event_loop, dispatcher) = EventLoop::new().expect("event loop");
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
@@ -1176,6 +1371,137 @@ mod tests {
 
     assert_eq!(target.id(), owner.id());
     assert_ne!(target.id(), detached_peer.id());
+
+    let removed: WindowContainer = popup.clone().into();
+    let stack = [
+      popup.native().id(),
+      owner.native().id(),
+      detached_peer.native().id(),
+    ];
+    let owner_target = focus_target_after_removal_windows(
+      &removed,
+      &workspace,
+      &descendants,
+      Some(owner.native().id().0),
+      Some(&stack),
+      |_| true,
+    )
+    .expect("eligible native owner takes precedence");
+    assert_eq!(owner_target.id(), owner.id());
+
+    let below_target = focus_target_after_removal_windows(
+      &removed,
+      &workspace,
+      &descendants,
+      Some(owner.native().id().0),
+      Some(&stack),
+      |candidate| candidate.id() != owner.id(),
+    )
+    .expect("ineligible owner falls through to the saved stack");
+    assert_eq!(below_target.id(), detached_peer.id());
+  }
+
+  #[test]
+  fn recovery_selection_validates_owner_then_walks_saved_stack() {
+    let workspace = Workspace::new(
+      WorkspaceConfig {
+        name: "recovery-order".into(),
+        display_name: None,
+        bind_to_monitor: None,
+        keep_alive: false,
+      },
+      GapsConfig::default(),
+      TilingDirection::Horizontal,
+    );
+    let workspace_container: Container = workspace.clone().into();
+    let owner = TilingWindow::new(
+      None,
+      NativeWindow::from_handle(1),
+      test_properties("owner"),
+      None,
+      RectDelta::zero(),
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      GapsConfig::default(),
+      Vec::new(),
+      None,
+    );
+    let peer = NonTilingWindow::new(
+      None,
+      NativeWindow::from_handle(2),
+      test_properties("peer"),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    );
+    let removed = NonTilingWindow::new(
+      None,
+      NativeWindow::from_handle(3),
+      test_properties("dialog"),
+      WindowState::Floating(wm_common::FloatingStateConfig::default()),
+      Some(WindowState::Tiling),
+      RectDelta::zero(),
+      None,
+      Rect::from_xy(0, 0, 100, 100),
+      false,
+      Vec::new(),
+      None,
+    );
+    attach_container(&owner.clone().into(), &workspace_container, None)
+      .expect("attach owner");
+    attach_container(&peer.clone().into(), &workspace_container, None)
+      .expect("attach peer");
+    attach_container(&removed.clone().into(), &workspace_container, None)
+      .expect("attach removed dialog");
+
+    let removed: WindowContainer = removed.into();
+    let descendants = workspace
+      .descendant_focus_order()
+      .filter(|container| container.id() != removed.id())
+      .collect::<Vec<_>>();
+    let stack = [
+      removed.native().id(),
+      owner.native().id(),
+      peer.native().id(),
+    ];
+
+    let owner_target = focus_target_after_removal_windows(
+      &removed,
+      &workspace,
+      &descendants,
+      Some(owner.native().id().0),
+      Some(&stack),
+      |_| true,
+    )
+    .expect("eligible owner is preferred");
+    assert_eq!(owner_target.id(), owner.id());
+
+    let next_below = focus_target_after_removal_windows(
+      &removed,
+      &workspace,
+      &descendants,
+      Some(owner.native().id().0),
+      Some(&stack),
+      |candidate| candidate.id() != owner.id(),
+    )
+    .expect("ineligible owner is skipped");
+    assert_eq!(next_below.id(), peer.id());
+
+    let missing_removed = focus_target_after_removal_windows(
+      &removed,
+      &workspace,
+      &descendants,
+      None,
+      Some(&[owner.native().id(), peer.native().id()]),
+      |_| true,
+    )
+    .expect("focus history is used when the removed atom is absent");
+    assert_eq!(missing_removed.id(), owner.id());
   }
 
   #[test]
@@ -1268,9 +1594,19 @@ mod tests {
     set_focused_descendant(&p4merge.clone().into(), None);
 
     let removed: WindowContainer = p4merge.into();
-    let target = state
-      .focus_target_after_removal(&removed)
-      .expect("focus target");
+    let descendants = workspace
+      .descendant_focus_order()
+      .filter(|descendant| descendant.id() != removed.id())
+      .collect::<Vec<_>>();
+    let target = focus_target_after_removal_windows(
+      &removed,
+      &workspace,
+      &descendants,
+      None,
+      None,
+      |_| true,
+    )
+    .expect("focus target");
 
     assert_eq!(target.id(), p4v.id());
     assert_ne!(target.id(), visual_studio.id());

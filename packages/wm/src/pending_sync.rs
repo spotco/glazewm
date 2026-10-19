@@ -7,6 +7,19 @@ use crate::{
   traits::CommonGetters,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StackActivationReason {
+  WmCommand,
+  NativeActivation,
+  NewWindow,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StackActivation {
+  pub window_id: Uuid,
+  pub reason: StackActivationReason,
+}
+
 #[derive(Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct PendingSync {
@@ -23,7 +36,7 @@ pub struct PendingSync {
   ///
   /// The key is the workspace ID so that a burst of native focus events
   /// can retain only the latest focused window for each workspace.
-  focused_windows_to_bring_to_front: HashMap<Uuid, Uuid>,
+  stack_activations: HashMap<Uuid, StackActivation>,
 
   /// Whether native focus should be reassigned to the WM's focused
   /// container.
@@ -44,7 +57,7 @@ impl PendingSync {
   pub fn has_changes(&self) -> bool {
     !self.containers_to_redraw.is_empty()
       || !self.workspaces_to_reorder.is_empty()
-      || !self.focused_windows_to_bring_to_front.is_empty()
+      || !self.stack_activations.is_empty()
       || self.needs_focus_update
       || self.needs_focused_effect_update
       || self.needs_all_effects_update
@@ -54,7 +67,7 @@ impl PendingSync {
   pub fn clear(&mut self) -> &mut Self {
     self.containers_to_redraw.clear();
     self.workspaces_to_reorder.clear();
-    self.focused_windows_to_bring_to_front.clear();
+    self.stack_activations.clear();
     self.needs_focus_update = false;
     self.needs_focused_effect_update = false;
     self.needs_all_effects_update = false;
@@ -68,7 +81,7 @@ impl PendingSync {
   /// window owns native foreground, but they must not change z-order.
   pub fn has_foreground_assertions(&self) -> bool {
     !self.workspaces_to_reorder.is_empty()
-      || !self.focused_windows_to_bring_to_front.is_empty()
+      || !self.stack_activations.is_empty()
       || self.needs_focus_update
       || self.needs_focused_effect_update
       || self.needs_cursor_jump
@@ -80,7 +93,7 @@ impl PendingSync {
   /// managed focus event queues a fresh reconciliation.
   pub fn cancel_foreground_assertions(&mut self) -> &mut Self {
     self.workspaces_to_reorder.clear();
-    self.focused_windows_to_bring_to_front.clear();
+    self.stack_activations.clear();
     self.needs_focus_update = false;
     self.needs_focused_effect_update = false;
     self.needs_cursor_jump = false;
@@ -131,15 +144,15 @@ impl PendingSync {
     self
   }
 
-  /// Queues a native-focused window for an individual z-order promotion.
-  pub fn queue_focused_window_to_bring_to_front(
+  pub fn queue_stack_activation(
     &mut self,
     workspace: &Workspace,
     window_id: Uuid,
+    reason: StackActivationReason,
   ) -> &mut Self {
     self
-      .focused_windows_to_bring_to_front
-      .insert(workspace.id(), window_id);
+      .stack_activations
+      .insert(workspace.id(), StackActivation { window_id, reason });
     self
   }
 
@@ -192,8 +205,19 @@ impl PendingSync {
     workspace: &Workspace,
   ) -> Option<Uuid> {
     self
-      .focused_windows_to_bring_to_front
+      .stack_activations
       .get(&workspace.id())
-      .copied()
+      .map(|activation| activation.window_id)
+  }
+
+  pub fn stack_activation(
+    &self,
+    workspace: &Workspace,
+  ) -> Option<StackActivation> {
+    self.stack_activations.get(&workspace.id()).copied()
+  }
+
+  pub fn has_stack_activations(&self) -> bool {
+    !self.stack_activations.is_empty()
   }
 }

@@ -4099,6 +4099,7 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "uuid",
+ "windows",
  "wm-cli",
  "wm-common",
  "wm-ipc-client",

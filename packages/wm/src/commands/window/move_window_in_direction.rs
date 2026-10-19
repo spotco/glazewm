@@ -1162,6 +1162,7 @@ fn move_to_workspace_in_direction(
         &focus_target,
         Some(&workspace.clone().into()),
       );
+      state.arm_lifecycle_focus_recovery(Some(&focus_target));
     }
 
     state

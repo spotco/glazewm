@@ -51,8 +51,12 @@ mod events;
 mod ipc_conflict;
 mod ipc_server;
 mod models;
+#[cfg(target_os = "windows")]
+mod normal_window_stack;
 mod pending_sync;
 mod sys_tray;
+#[cfg(all(test, target_os = "windows"))]
+mod test_utils;
 mod traits;
 
 use crate::traits::WindowGetters;
@@ -127,7 +131,8 @@ async fn start_wm(
   tracing::info!("startup: logging ready");
 
   // Ensure that only one instance of the WM is running.
-  let _single_instance = SingleInstance::new()?;
+  let single_instance = SingleInstance::new()?;
+  let _ = &single_instance;
   tracing::info!("startup: single instance lock acquired");
 
   #[cfg(target_os = "macos")]
@@ -164,7 +169,7 @@ async fn start_wm(
     match wm_platform::relaunch_current_process_as_admin(&elevated_args) {
       Ok(true) => {
         startup_log("startup: elevated GlazeWM process launched");
-        drop(_single_instance);
+        drop(single_instance);
         return Ok(());
       }
       Ok(false) => {

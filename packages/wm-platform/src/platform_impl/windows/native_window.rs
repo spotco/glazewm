@@ -61,7 +61,7 @@ use super::com::{IApplicationView, COM_INIT};
 use crate::{
   Color, CornerStyle, Delta, Dispatcher, LengthValue,
   NativeWindowDebugInfo, OpacityValue, Point, Rect, RectDelta, WindowId,
-  WindowZOrder,
+  WindowZOrder, ZOrderIntent, ZOrderReconcileOutcome,
 };
 
 /// Magic number used to identify programmatic mouse inputs from our own
@@ -69,6 +69,8 @@ use crate::{
 pub(crate) const FOREGROUND_INPUT_IDENTIFIER: u32 = 6379;
 
 static Z_ORDER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WORKSPACE_Z_ORDER_GENERATIONS: OnceLock<Mutex<HashMap<u128, u64>>> =
+  OnceLock::new();
 
 #[cfg(test)]
 static TEST_FOREGROUND_WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -803,13 +805,27 @@ fn wait_until_foreign_style_ticket_released(
 #[derive(Clone, Debug)]
 pub(crate) struct NativeWindow {
   pub(crate) handle: isize,
+  identity: Option<WindowIdentity>,
 }
 
 impl NativeWindow {
   /// Creates an instance of `NativeWindow`.
   #[must_use]
   pub(crate) fn new(handle: isize) -> Self {
-    Self { handle }
+    Self {
+      handle,
+      identity: native_window_identity(WindowId(handle)),
+    }
+  }
+
+  /// Whether this wrapper still refers to the same HWND instance captured
+  /// when it was created. Numeric HWND values can be reused after destroy.
+  pub(crate) fn identity_is_current(&self) -> bool {
+    let Some(expected) = &self.identity else {
+      return false;
+    };
+    native_window_identity(expected.window_id)
+      .is_some_and(|current| expected.same_window_instance(&current))
   }
 
   /// Implements [`NativeWindow::id`].
@@ -1882,6 +1898,18 @@ pub(crate) fn sample_z_order_ranks(
 
   let wanted: HashSet<isize> =
     window_ids.iter().map(|window_id| window_id.0).collect();
+  sample_native_window_order()
+    .into_iter()
+    .enumerate()
+    .filter(|(_, window_id)| wanted.contains(&window_id.0))
+    .map(|(index, window_id)| {
+      #[allow(clippy::cast_possible_truncation)]
+      (window_id, index as u32)
+    })
+    .collect()
+}
+
+fn sample_native_window_order() -> Vec<WindowId> {
   let mut handles: Vec<isize> = Vec::new();
 
   #[allow(clippy::items_after_statements)]
@@ -1897,15 +1925,7 @@ pub(crate) fn sample_z_order_ranks(
       LPARAM(std::ptr::from_mut(&mut handles) as _),
     )
   };
-
-  let mut ranks = Vec::new();
-  for (index, handle) in handles.into_iter().enumerate() {
-    if wanted.contains(&handle) {
-      #[allow(clippy::cast_possible_truncation)]
-      ranks.push((WindowId(handle), index as u32));
-    }
-  }
-  ranks
+  handles.into_iter().map(WindowId).collect()
 }
 
 fn z_order_chain_matches(window_ids: &[WindowId]) -> bool {
@@ -1922,45 +1942,282 @@ fn z_order_chain_matches(window_ids: &[WindowId]) -> bool {
   actual == expected
 }
 
+fn native_window_is_owned_by_tiled_group(
+  window_id: WindowId,
+  tiled_window_ids: &[WindowId],
+) -> bool {
+  let tiled_ids = tiled_window_ids.iter().copied().collect::<HashSet<_>>();
+  let mut owner = unsafe { GetWindow(HWND(window_id.0), GW_OWNER) }.0;
+  let mut visited = HashSet::new();
+  while owner != 0 && visited.insert(owner) {
+    let owner_id = WindowId(owner);
+    if tiled_ids.contains(&owner_id) {
+      return true;
+    }
+    owner = unsafe { GetWindow(HWND(owner), GW_OWNER) }.0;
+  }
+  false
+}
+
+/// Treats owned popups and the topmost band as Win32 ordering constraints.
+fn tiled_group_is_contiguous(
+  native_order: &[WindowId],
+  tiled_window_ids: &[WindowId],
+) -> bool {
+  let normal_order = native_order
+    .iter()
+    .copied()
+    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .collect::<Vec<_>>();
+  let present_tiles = tiled_window_ids
+    .iter()
+    .copied()
+    .filter(|window_id| normal_order.contains(window_id))
+    .collect::<Vec<_>>();
+  if present_tiles.len() < 2 {
+    return true;
+  }
+
+  let tile_set = present_tiles.iter().copied().collect::<HashSet<_>>();
+  let positions = present_tiles
+    .iter()
+    .filter_map(|window_id| {
+      normal_order
+        .iter()
+        .position(|candidate| candidate == window_id)
+    })
+    .collect::<Vec<_>>();
+  if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+    return false;
+  }
+  let Some((&first, &last)) = positions.first().zip(positions.last())
+  else {
+    return true;
+  };
+  normal_order[first..=last].iter().all(|window_id| {
+    tile_set.contains(window_id)
+      || native_window_is_owned_by_tiled_group(*window_id, &present_tiles)
+  })
+}
+
+fn plan_tiled_group_moves(
+  native_order: &[WindowId],
+  tiled_window_ids: &[WindowId],
+) -> Vec<(WindowId, ZOrderInsertAfter)> {
+  let normal_order = native_order
+    .iter()
+    .copied()
+    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .collect::<Vec<_>>();
+  let present_tiles = tiled_window_ids
+    .iter()
+    .copied()
+    .filter(|window_id| normal_order.contains(window_id))
+    .collect::<Vec<_>>();
+  if present_tiles.len() < 2 {
+    return Vec::new();
+  }
+  let positions = present_tiles
+    .iter()
+    .filter_map(|window_id| {
+      normal_order
+        .iter()
+        .position(|candidate| candidate == window_id)
+    })
+    .collect::<Vec<_>>();
+  if positions.len() != present_tiles.len()
+    || positions.windows(2).any(|pair| pair[0] >= pair[1])
+  {
+    // Participant-order reconciliation repairs a reversed tile sequence.
+    return Vec::new();
+  }
+
+  let tile_set = present_tiles.iter().copied().collect::<HashSet<_>>();
+  let first_split = positions.windows(2).position(|pair| {
+    normal_order[pair[0] + 1..pair[1]].iter().any(|window_id| {
+      !tile_set.contains(window_id)
+        && !native_window_is_owned_by_tiled_group(
+          *window_id,
+          &present_tiles,
+        )
+    })
+  });
+  first_split.map_or_else(Vec::new, |split_index| {
+    present_tiles
+      .iter()
+      .enumerate()
+      .skip(split_index + 1)
+      .map(|(index, window_id)| {
+        (
+          *window_id,
+          ZOrderInsertAfter::After(present_tiles[index - 1]),
+        )
+      })
+      .collect()
+  })
+}
+
 fn foreground_is_in_z_order_chain(window_ids: &[WindowId]) -> bool {
   let foreground = z_order_foreground_window().0;
   window_ids.iter().any(|window_id| window_id.0 == foreground)
 }
 
-/// Reorders a normal-window chain without changing focus or visibility.
-///
-/// The first usable window is placed at the top of the normal z-order.
-/// Each subsequent usable window is placed immediately after the previous
-/// usable one. Hung / non-pumping and non-enumerated hwnds are skipped so
-/// they cannot block the WM loop or anchor peers below floaters. Because
-/// asynchronous requests to independent GUI queues can complete out of
-/// order, a generation-aware worker re-applies the chain until native
-/// ranks remain correct across two samples. When any hwnd is skipped,
-/// delayed recovery retries re-apply the same chain (100/250/500ms then
-/// once per second) so a later-responsive window eventually joins full
-/// order. Workers stop when a newer z-order generation starts or the
-/// foreground leaves this workspace chain. Recovery also requires the
-/// original chain head to remain foreground.
+fn z_order_request_matches(
+  responsive_window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
+  intent: ZOrderIntent,
+  promoted_atom_ids: &[WindowId],
+) -> bool {
+  z_order_chain_matches(responsive_window_ids)
+    && tiled_group_is_contiguous(
+      &sample_native_window_order(),
+      tiled_window_ids,
+    )
+    && (intent != ZOrderIntent::Promote
+      || promotion_is_satisfied(promoted_atom_ids))
+}
+
+fn promotion_is_satisfied(promoted_atom_ids: &[WindowId]) -> bool {
+  if promoted_atom_ids.is_empty() {
+    return true;
+  }
+  let normal_order = sample_native_window_order()
+    .into_iter()
+    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .collect::<Vec<_>>();
+  normal_order.starts_with(promoted_atom_ids)
+}
+
+/// Legacy test helper for an explicit promotion of all listed HWNDs.
+#[cfg(test)]
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
+  reconcile_z_order(window_ids, &[], ZOrderIntent::Promote, window_ids)
+    .map(|_| ())
+}
+
+pub(crate) fn reconcile_z_order(
+  window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
+  intent: ZOrderIntent,
+  promoted_atom_ids: &[WindowId],
+) -> crate::Result<ZOrderReconcileOutcome> {
+  let generation = next_z_order_generation();
+  reconcile_z_order_with_generation(
+    None,
+    generation,
+    window_ids,
+    tiled_window_ids,
+    intent,
+    promoted_atom_ids,
+  )
+}
+
+pub(crate) fn reconcile_z_order_for_workspace(
+  workspace_scope: u128,
+  window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
+  intent: ZOrderIntent,
+  promoted_atom_ids: &[WindowId],
+) -> crate::Result<ZOrderReconcileOutcome> {
+  let generation = next_workspace_z_order_generation(workspace_scope);
+  reconcile_z_order_with_generation(
+    Some(workspace_scope),
+    generation,
+    window_ids,
+    tiled_window_ids,
+    intent,
+    promoted_atom_ids,
+  )
+}
+
+#[allow(clippy::too_many_lines)] // Owns one generation-scoped transaction
+                                 // and its retry workers.
+fn reconcile_z_order_with_generation(
+  workspace_scope: Option<u128>,
+  generation: u64,
+  window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
+  intent: ZOrderIntent,
+  promoted_atom_ids: &[WindowId],
+) -> crate::Result<ZOrderReconcileOutcome> {
+  if !z_order_generation_is_current(workspace_scope, generation) {
+    return Ok(ZOrderReconcileOutcome {
+      superseded: true,
+      ..ZOrderReconcileOutcome::default()
+    });
+  }
+  let window_ids = window_ids
+    .iter()
+    .copied()
+    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .collect::<Vec<_>>();
+  let tiled_window_ids = tiled_window_ids
+    .iter()
+    .copied()
+    .filter(|window_id| window_ids.contains(window_id))
+    .collect::<Vec<_>>();
   if window_ids.is_empty() {
-    return Ok(());
+    return Ok(ZOrderReconcileOutcome::default());
+  }
+  let promoted_atom_ids = promoted_atom_ids
+    .iter()
+    .copied()
+    .filter(|id| window_ids.contains(id))
+    .collect::<Vec<_>>();
+  if intent == ZOrderIntent::Promote && promoted_atom_ids.is_empty() {
+    return Ok(ZOrderReconcileOutcome::default());
+  }
+  let initial_result = apply_z_order_request(
+    &window_ids,
+    &tiled_window_ids,
+    intent,
+    &promoted_atom_ids,
+  )?;
+  let mut outcome = ZOrderReconcileOutcome {
+    native_writes: initial_result.native_writes,
+    skipped_windows: initial_result.skipped_windows,
+    retry_scheduled: false,
+    superseded: false,
+  };
+  if initial_result.native_writes == 0
+    && initial_result.skipped_windows == 0
+  {
+    debug!(
+      ?workspace_scope,
+      generation,
+      ?intent,
+      "normal z-order already satisfies the requested constraints"
+    );
+    return Ok(outcome);
   }
 
-  let generation = next_z_order_generation();
-  let initial_result = apply_z_order_chain(window_ids)?;
-  let skipped_windows = initial_result.skipped_windows;
-
-  let window_ids = window_ids.to_vec();
   if let Ok(runtime) = Handle::try_current() {
-    let focused_window = window_ids[0];
+    let identities = capture_window_identities(&window_ids);
+    if identities.len() != window_ids.len() {
+      return Ok(outcome);
+    }
+    let recovery_identities = identities.clone();
     let retry_ids = window_ids.clone();
+    let retry_tiled_ids = tiled_window_ids.clone();
+    let retry_promoted_ids = promoted_atom_ids.clone();
+    outcome.retry_scheduled = true;
+    debug!(
+      ?workspace_scope,
+      generation,
+      ?intent,
+      native_writes = outcome.native_writes,
+      skipped_windows = outcome.skipped_windows,
+      "normal z-order reconciliation queued"
+    );
     runtime.spawn(async move {
       const VERIFY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 250, 500, 1000];
       let stale = || {
-        Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
-          || !foreground_is_in_z_order_chain(&retry_ids)
+        !z_order_generation_is_current(workspace_scope, generation)
+          || !window_identities_are_live(&identities)
+          || (intent == ZOrderIntent::Promote
+            && !foreground_is_in_z_order_chain(&retry_promoted_ids))
       };
       let mut delay_index = 0;
       let mut stable_sample_seen = false;
@@ -1972,23 +2229,46 @@ pub(crate) fn reorder_z_order(
         ))
         .await;
         if stale() {
+          debug!(
+            ?workspace_scope,
+            generation,
+            ?intent,
+            "normal z-order retry cancelled as stale"
+          );
           return;
         }
 
-        if !apply_result.skipped_windows
-          && z_order_chain_matches(&apply_result.responsive_window_ids)
+        if apply_result.skipped_windows == 0
+          && z_order_request_matches(
+            &apply_result.responsive_window_ids,
+            &retry_tiled_ids,
+            intent,
+            &retry_promoted_ids,
+          )
         {
           if stable_sample_seen {
+            debug!(
+              ?workspace_scope,
+              generation,
+              ?intent,
+              native_writes = apply_result.native_writes,
+              "normal z-order constraints converged"
+            );
             return;
           }
           stable_sample_seen = true;
         } else {
           stable_sample_seen = false;
-          match apply_z_order_chain(&retry_ids) {
+          match apply_z_order_request(
+            &retry_ids,
+            &retry_tiled_ids,
+            intent,
+            &retry_promoted_ids,
+          ) {
             Ok(result) => apply_result = result,
             Err(_) => return,
           }
-          if apply_result.skipped_windows {
+          if apply_result.skipped_windows > 0 {
             // A probe can briefly time out while a pumping window handles
             // an earlier queued position change. Wait for
             // those queues to drain before probing again
@@ -2002,7 +2282,7 @@ pub(crate) fn reorder_z_order(
       }
     });
 
-    if skipped_windows {
+    if outcome.skipped_windows > 0 {
       // Early absolute checkpoints, then low-frequency 1s backoff until
       // the full chain applies or generation/focus cancels. TID-cached
       // WM_NULL probes keep each attempt cheap. Recovery requires the
@@ -2010,11 +2290,16 @@ pub(crate) fn reorder_z_order(
       // cannot rejoin after focus moves elsewhere.
       const SKIPPED_WINDOW_RECOVERY_EARLY_AT_MS: &[u64] = &[100, 250, 500];
       let recovery_ids = window_ids;
+      let recovery_tiled_ids = tiled_window_ids;
+      let recovery_promoted_ids = promoted_atom_ids;
+      let recovery_foreground_ids = recovery_promoted_ids.clone();
       runtime.spawn(async move {
         let started = tokio::time::Instant::now();
         let stale = move || {
-          Z_ORDER_GENERATION.load(Ordering::SeqCst) != generation
-            || z_order_foreground_window() != HWND(focused_window.0)
+          !z_order_generation_is_current(workspace_scope, generation)
+            || !window_identities_are_live(&recovery_identities)
+            || (intent == ZOrderIntent::Promote
+              && !foreground_is_in_z_order_chain(&recovery_foreground_ids))
         };
         for &at_ms in SKIPPED_WINDOW_RECOVERY_EARLY_AT_MS {
           let target = started + Duration::from_millis(at_ms);
@@ -2022,8 +2307,13 @@ pub(crate) fn reorder_z_order(
           if stale() {
             return;
           }
-          match apply_z_order_chain(&recovery_ids) {
-            Ok(result) if result.skipped_windows => {}
+          match apply_z_order_request(
+            &recovery_ids,
+            &recovery_tiled_ids,
+            intent,
+            &recovery_promoted_ids,
+          ) {
+            Ok(result) if result.skipped_windows > 0 => {}
             Ok(_) | Err(_) => return,
           }
         }
@@ -2032,8 +2322,13 @@ pub(crate) fn reorder_z_order(
           if stale() {
             return;
           }
-          match apply_z_order_chain(&recovery_ids) {
-            Ok(result) if result.skipped_windows => {}
+          match apply_z_order_request(
+            &recovery_ids,
+            &recovery_tiled_ids,
+            intent,
+            &recovery_promoted_ids,
+          ) {
+            Ok(result) if result.skipped_windows > 0 => {}
             Ok(_) | Err(_) => return,
           }
         }
@@ -2041,15 +2336,155 @@ pub(crate) fn reorder_z_order(
     }
   }
 
-  Ok(())
+  Ok(outcome)
 }
 
 fn next_z_order_generation() -> u64 {
   Z_ORDER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-pub(crate) fn begin_z_order_batch() -> u64 {
-  next_z_order_generation()
+fn next_workspace_z_order_generation(workspace_scope: u128) -> u64 {
+  let generations = WORKSPACE_Z_ORDER_GENERATIONS
+    .get_or_init(|| Mutex::new(HashMap::new()));
+  let mut generations = generations
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let generation = generations.entry(workspace_scope).or_default();
+  *generation = generation.wrapping_add(1);
+  *generation
+}
+
+fn z_order_generation_is_current(
+  workspace_scope: Option<u128>,
+  generation: u64,
+) -> bool {
+  if let Some(workspace_scope) = workspace_scope {
+    let generations = WORKSPACE_Z_ORDER_GENERATIONS
+      .get_or_init(|| Mutex::new(HashMap::new()));
+    return generations
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .get(&workspace_scope)
+      .is_some_and(|current| *current == generation);
+  }
+  Z_ORDER_GENERATION.load(Ordering::SeqCst) == generation
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowIdentity {
+  window_id: WindowId,
+  process_id: u32,
+  thread_id: u32,
+  class_name: String,
+  owner_window: isize,
+}
+
+impl WindowIdentity {
+  /// Owner can legitimately change while a window lives. HWND, process,
+  /// GUI thread, and class identify the native window instance for
+  /// recovery.
+  fn same_window_instance(&self, other: &Self) -> bool {
+    self.window_id == other.window_id
+      && self.process_id == other.process_id
+      && self.thread_id == other.thread_id
+      && self.class_name == other.class_name
+  }
+}
+
+#[cfg(test)]
+mod window_identity_tests {
+  use super::{WindowId, WindowIdentity};
+
+  fn identity(
+    process_id: u32,
+    thread_id: u32,
+    class_name: &str,
+    owner_window: isize,
+  ) -> WindowIdentity {
+    WindowIdentity {
+      window_id: WindowId(42),
+      process_id,
+      thread_id,
+      class_name: class_name.to_string(),
+      owner_window,
+    }
+  }
+
+  #[test]
+  fn native_identity_rejects_reused_handles_but_allows_owner_changes() {
+    let original = identity(10, 20, "DialogClass", 0);
+    assert!(original.same_window_instance(&identity(
+      10,
+      20,
+      "DialogClass",
+      99,
+    )));
+    assert!(!original.same_window_instance(&identity(
+      11,
+      20,
+      "DialogClass",
+      0,
+    )));
+    assert!(!original.same_window_instance(&identity(
+      10,
+      21,
+      "DialogClass",
+      0,
+    )));
+    assert!(!original.same_window_instance(&identity(
+      10,
+      20,
+      "DifferentClass",
+      0,
+    )));
+  }
+}
+
+fn capture_window_identities(
+  window_ids: &[WindowId],
+) -> Vec<WindowIdentity> {
+  window_ids
+    .iter()
+    .filter_map(|window_id| native_window_identity(*window_id))
+    .collect()
+}
+
+fn window_identities_are_live(identities: &[WindowIdentity]) -> bool {
+  identities.iter().all(|expected| {
+    native_window_identity(expected.window_id).as_ref() == Some(expected)
+  })
+}
+
+fn native_window_identity(window_id: WindowId) -> Option<WindowIdentity> {
+  let hwnd = HWND(window_id.0);
+  if !unsafe { IsWindow(hwnd) }.as_bool() {
+    return None;
+  }
+  let mut process_id = 0u32;
+  let thread_id =
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+  if thread_id == 0 || process_id == 0 {
+    return None;
+  }
+  let mut class_name = [0u16; 256];
+  let length = unsafe { GetClassNameW(hwnd, &mut class_name) };
+  let length =
+    usize::try_from(length).ok().filter(|length| *length > 0)?;
+  Some(WindowIdentity {
+    window_id,
+    process_id,
+    thread_id,
+    class_name: String::from_utf16_lossy(&class_name[..length]),
+    owner_window: unsafe { GetWindow(hwnd, GW_OWNER) }.0,
+  })
+}
+
+fn native_window_is_topmost(window_id: WindowId) -> bool {
+  let hwnd = HWND(window_id.0);
+  unsafe { IsWindow(hwnd) }.as_bool()
+    && (unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
+      & isize::try_from(WS_EX_TOPMOST.0).unwrap_or_default())
+      != 0
 }
 
 fn current_or_new_z_order_generation() -> u64 {
@@ -2138,6 +2573,7 @@ fn tid_probe_cache_get_or_insert(
 enum ZOrderInsertAfter {
   Top,
   After(WindowId),
+  AfterAnchor(WindowId),
 }
 
 /// Resolves insert-after for `index`, skipping unusable predecessors.
@@ -2145,6 +2581,7 @@ fn planned_insert_after(
   window_ids: &[WindowId],
   usable: &[bool],
   index: usize,
+  first_anchor: Option<WindowId>,
 ) -> ZOrderInsertAfter {
   debug_assert_eq!(window_ids.len(), usable.len());
   for previous in (0..index).rev() {
@@ -2152,12 +2589,131 @@ fn planned_insert_after(
       return ZOrderInsertAfter::After(window_ids[previous]);
     }
   }
-  ZOrderInsertAfter::Top
+  first_anchor
+    .map_or(ZOrderInsertAfter::Top, ZOrderInsertAfter::AfterAnchor)
+}
+
+fn plan_z_order_moves(
+  window_ids: &[WindowId],
+  usable: &[bool],
+  actual_responsive_order: &[WindowId],
+  intent: ZOrderIntent,
+  first_anchor: Option<WindowId>,
+) -> Vec<(WindowId, ZOrderInsertAfter)> {
+  let stable = if intent == ZOrderIntent::Promote {
+    HashSet::new()
+  } else {
+    longest_stable_subsequence(window_ids, usable, actual_responsive_order)
+  };
+  window_ids
+    .iter()
+    .enumerate()
+    .filter(|(index, window_id)| {
+      usable[*index] && !stable.contains(*window_id)
+    })
+    .map(|(index, window_id)| {
+      (
+        *window_id,
+        planned_insert_after(window_ids, usable, index, first_anchor),
+      )
+    })
+    .collect()
+}
+
+/// Returns the longest desired subsequence already in native order.
+/// Keeping it in place minimizes cross-process `SetWindowPos` requests.
+fn longest_stable_subsequence(
+  desired: &[WindowId],
+  usable: &[bool],
+  actual_responsive_order: &[WindowId],
+) -> HashSet<WindowId> {
+  let native_rank: HashMap<WindowId, usize> = actual_responsive_order
+    .iter()
+    .enumerate()
+    .map(|(rank, window_id)| (*window_id, rank))
+    .collect();
+  let ranked_desired = desired
+    .iter()
+    .zip(usable)
+    .filter_map(|(window_id, is_usable)| {
+      (*is_usable)
+        .then(|| {
+          native_rank.get(window_id).map(|rank| (*window_id, *rank))
+        })
+        .flatten()
+    })
+    .collect::<Vec<_>>();
+  if ranked_desired.is_empty() {
+    return HashSet::new();
+  }
+
+  let mut lengths = vec![1usize; ranked_desired.len()];
+  let mut previous = vec![None; ranked_desired.len()];
+  for index in 0..ranked_desired.len() {
+    for earlier in 0..index {
+      if ranked_desired[earlier].1 < ranked_desired[index].1
+        && lengths[earlier] + 1 > lengths[index]
+      {
+        lengths[index] = lengths[earlier] + 1;
+        previous[index] = Some(earlier);
+      }
+    }
+  }
+
+  let mut cursor = lengths
+    .iter()
+    .enumerate()
+    .max_by_key(|(_, length)| *length)
+    .map(|(index, _)| index);
+  let mut stable = HashSet::new();
+  while let Some(index) = cursor {
+    stable.insert(ranked_desired[index].0);
+    cursor = previous[index];
+  }
+  stable
 }
 
 struct ZOrderApplyResult {
-  skipped_windows: bool,
+  skipped_windows: usize,
+  native_writes: usize,
   responsive_window_ids: Vec<WindowId>,
+}
+
+fn apply_planned_z_order_move(
+  window_id: WindowId,
+  insert_after: ZOrderInsertAfter,
+  flags: SET_WINDOW_POS_FLAGS,
+) -> crate::Result<bool> {
+  let hwnd = HWND(window_id.0);
+  let (insert_after_id, insert_after_hwnd) = match insert_after {
+    ZOrderInsertAfter::Top => (None, HWND_TOP),
+    ZOrderInsertAfter::After(anchor)
+    | ZOrderInsertAfter::AfterAnchor(anchor) => {
+      (Some(anchor), HWND(anchor.0))
+    }
+  };
+
+  match unsafe {
+    SetWindowPos(hwnd, insert_after_hwnd, 0, 0, 0, 0, flags)
+  } {
+    Ok(()) => Ok(true),
+    Err(anchor_error)
+      if matches!(insert_after, ZOrderInsertAfter::AfterAnchor(_)) =>
+    {
+      warn!(
+        ?window_id,
+        ?insert_after_id,
+        %anchor_error,
+        "external z-order anchor rejected; deferring preserve-mode move",
+      );
+      Ok(false)
+    }
+    Err(error) => Err(crate::Error::Platform(format!(
+      "SetWindowPos failed for {window_id:?} after {insert_after_id:?}: {error}; target={:?}; anchor={:?}",
+      native_window_identity(window_id),
+      insert_after_id.and_then(native_window_identity),
+    ))),
+  }
 }
 
 /// Applies the z-order chain. Reports responsive hwnds separately from
@@ -2165,16 +2721,12 @@ struct ZOrderApplyResult {
 /// pass could place.
 fn apply_z_order_chain(
   window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
+  intent: ZOrderIntent,
 ) -> crate::Result<ZOrderApplyResult> {
-  // Keep SWP_ASYNCWINDOWPOS so a slow-but-pumping foreign queue (or a hung
-  // helper) cannot block the WM loop. Prefer ASYNC over sync SetWindowPos
-  // even for responsive hwnds — a slow pump must never stall the WM
-  // thread (plan: keep SWP_ASYNCWINDOWPOS; code is right). Hung /
-  // non-pumping hwnds are skipped as placement targets *and* as
-  // insert-after anchors so responsive tiles still rise to HWND_TOP above
-  // floaters (layout.log hung helper 2168898).
-  // Only clear TOPMOST when present — unconditional HWND_NOTOPMOST raises
-  // normal floaters and races the follow-up insert_after under ASYNC.
+  // Keep SWP_ASYNCWINDOWPOS so a foreign GUI queue cannot block the WM
+  // event loop. Topmost windows are excluded by the caller and handled by
+  // Windows' separate topmost band.
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
@@ -2191,6 +2743,25 @@ fn apply_z_order_chain(
       .into_iter()
       .map(|(window_id, _)| window_id)
       .collect();
+  let native_order = sample_native_window_order();
+  let chain_ids: HashSet<WindowId> = window_ids.iter().copied().collect();
+  let first_chain_index = native_order
+    .iter()
+    .position(|window_id| chain_ids.contains(window_id));
+  let first_anchor = if intent == ZOrderIntent::Preserve {
+    first_chain_index.and_then(|index| {
+      native_order[..index]
+        .iter()
+        .rev()
+        .copied()
+        .find(|window_id| {
+          !chain_ids.contains(window_id)
+            && !native_window_is_topmost(*window_id)
+        })
+    })
+  } else {
+    None
+  };
   let mut tid_cache: Option<HashMap<u32, bool>> = Some(HashMap::new());
   let mut usable = Vec::with_capacity(window_ids.len());
   let mut responsive_window_ids = Vec::new();
@@ -2198,6 +2769,7 @@ fn apply_z_order_chain(
   for window_id in window_ids {
     let hwnd = HWND(window_id.0);
     let is_usable = enumerated_window_ids.contains(window_id)
+      && !native_window_is_topmost(*window_id)
       && hwnd_gui_responsive_with_tid_cache(hwnd, &mut tid_cache);
     usable.push(is_usable);
     if is_usable {
@@ -2205,36 +2777,83 @@ fn apply_z_order_chain(
     }
   }
 
-  for (index, window_id) in window_ids.iter().enumerate() {
-    if !usable[index] {
-      continue;
-    }
-    let hwnd = HWND(window_id.0);
-
-    #[allow(clippy::cast_possible_wrap)]
-    let is_topmost = (unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }
-      & WS_EX_TOPMOST.0 as isize)
-      != 0;
-    if is_topmost {
-      unsafe {
-        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)?;
-      }
-    }
-
-    let insert_after =
-      match planned_insert_after(window_ids, &usable, index) {
-        ZOrderInsertAfter::Top => HWND_TOP,
-        ZOrderInsertAfter::After(window_id) => HWND(window_id.0),
-      };
-    unsafe {
-      SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)?;
+  let usable_ids: HashSet<WindowId> = window_ids
+    .iter()
+    .zip(&usable)
+    .filter_map(|(window_id, is_usable)| is_usable.then_some(*window_id))
+    .collect();
+  let actual_responsive_order = native_order
+    .iter()
+    .filter(|window_id| usable_ids.contains(window_id))
+    .copied()
+    .collect::<Vec<_>>();
+  let mut planned_moves = plan_z_order_moves(
+    window_ids,
+    &usable,
+    &actual_responsive_order,
+    intent,
+    first_anchor,
+  );
+  if planned_moves.is_empty() {
+    planned_moves =
+      plan_tiled_group_moves(&native_order, tiled_window_ids);
+  }
+  let mut native_writes = 0;
+  let mut skipped_windows =
+    usable.iter().filter(|is_usable| !**is_usable).count();
+  for (window_id, insert_after) in planned_moves {
+    if apply_planned_z_order_move(window_id, insert_after, flags)? {
+      native_writes += 1;
+    } else {
+      skipped_windows += 1;
     }
   }
 
   Ok(ZOrderApplyResult {
-    skipped_windows: usable.iter().any(|is_usable| !is_usable),
+    skipped_windows,
+    native_writes,
     responsive_window_ids,
   })
+}
+
+fn apply_z_order_request(
+  window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
+  intent: ZOrderIntent,
+  promoted_atom_ids: &[WindowId],
+) -> crate::Result<ZOrderApplyResult> {
+  let mut result = if z_order_chain_matches(window_ids)
+    && tiled_group_is_contiguous(
+      &sample_native_window_order(),
+      tiled_window_ids,
+    ) {
+    ZOrderApplyResult {
+      skipped_windows: 0,
+      native_writes: 0,
+      responsive_window_ids: window_ids.to_vec(),
+    }
+  } else {
+    apply_z_order_chain(
+      window_ids,
+      tiled_window_ids,
+      ZOrderIntent::Preserve,
+    )?
+  };
+
+  if intent == ZOrderIntent::Promote
+    && !promotion_is_satisfied(promoted_atom_ids)
+  {
+    let promotion_result =
+      apply_z_order_chain(promoted_atom_ids, &[], ZOrderIntent::Promote)?;
+    result.skipped_windows += promotion_result.skipped_windows;
+    result.native_writes += promotion_result.native_writes;
+    for window_id in promotion_result.responsive_window_ids {
+      if !result.responsive_window_ids.contains(&window_id) {
+        result.responsive_window_ids.push(window_id);
+      }
+    }
+  }
+  Ok(result)
 }
 
 impl PartialEq for NativeWindow {
@@ -2528,14 +3147,15 @@ mod reorder_z_order_tests {
         UnregisterClassW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_SHOW,
         GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT,
         LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, MSG, OBJID_WINDOW,
-        WINDOW_EX_STYLE, WM_NULL, WM_WINDOWPOSCHANGING, WNDCLASSW,
-        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
+        SWP_NOOWNERZORDER, SWP_NOSIZE, WINDOW_EX_STYLE, WM_NULL,
+        WM_WINDOWPOSCHANGING, WNDCLASSW, WS_DLGFRAME, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
       },
     },
   };
 
-  use super::reorder_z_order;
+  use super::{reconcile_z_order, reorder_z_order, ZOrderIntent};
   use crate::{
     Color, CornerStyle, OpacityValue, Rect, WindowEvent, WindowId,
     WindowZOrder,
@@ -2560,7 +3180,21 @@ mod reorder_z_order_tests {
   /// Creates a visible top-level window. `topmost` reproduces a Snipping
   /// Tool window left `WS_EX_TOPMOST` by a previous GlazeWM session.
   fn create_test_window(class: &[u16], topmost: bool) -> HWND {
-    let title = wide("glazewm-z-order-test");
+    create_test_window_with_owner(
+      class,
+      "glazewm-z-order-test",
+      topmost,
+      None,
+    )
+  }
+
+  fn create_test_window_with_owner(
+    class: &[u16],
+    title: &str,
+    topmost: bool,
+    owner: Option<HWND>,
+  ) -> HWND {
+    let title = wide(title);
     let ex_style = if topmost {
       WS_EX_TOPMOST
     } else {
@@ -2576,7 +3210,7 @@ mod reorder_z_order_tests {
         40,
         160,
         80,
-        None,
+        owner.unwrap_or_default(),
         None,
         None,
         None,
@@ -2596,6 +3230,19 @@ mod reorder_z_order_tests {
       hwnd = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
     }
     order
+  }
+
+  fn wait_for_relative_order(targets: &[HWND], expected: &[isize]) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+      if relative_order(targets) == expected {
+        return;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(relative_order(targets), expected);
   }
 
   fn helper_mode(mode: &str) -> bool {
@@ -3117,7 +3764,7 @@ mod reorder_z_order_tests {
   }
 
   #[test]
-  fn reorder_z_order_sinks_a_topmost_window_to_the_bottom_of_the_chain() {
+  fn explicit_normal_promotion_preserves_a_real_topmost_window() {
     let class_name =
       wide(&format!("GlazeWmZOrderTest{}", std::process::id()));
     let class = WNDCLASSW {
@@ -3141,6 +3788,8 @@ mod reorder_z_order_tests {
     reorder_z_order(&chain).expect("reorder");
 
     let order = relative_order(&[visual_studio, tiled, snipping]);
+    let snipping_is_topmost =
+      super::native_window_is_topmost(WindowId(snipping.0));
     unsafe {
       let _ = DestroyWindow(visual_studio);
       let _ = DestroyWindow(tiled);
@@ -3150,9 +3799,412 @@ mod reorder_z_order_tests {
 
     assert_eq!(
       order,
-      vec![visual_studio.0, tiled.0, snipping.0],
-      "chain must be applied top-to-bottom, with the topmost ignored window sunk"
+      vec![snipping.0, visual_studio.0, tiled.0],
+      "normal stack activation must not cross the topmost band"
     );
+    assert!(snipping_is_topmost, "topmost state belongs to Windows");
+  }
+
+  #[test]
+  #[allow(clippy::too_many_lines)] // Exercise several real HWND lifecycle
+                                   // transitions in order.
+  fn preserve_reconciliation_and_synthetic_dialog_close_keep_atom_slots() {
+    let class_name =
+      wide(&format!("GlazeWmSyntheticDialog{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register synthetic dialog class");
+
+    let settings = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Settings",
+      false,
+      None,
+    );
+    let tile_a = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Tile A",
+      false,
+      None,
+    );
+    let tile_b = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Tile B",
+      false,
+      None,
+    );
+    let independent = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Independent Detached",
+      false,
+      None,
+    );
+    let dialog = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Ownerless Dialog",
+      false,
+      None,
+    );
+    let nested = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Owned Nested Dialog",
+      false,
+      Some(dialog),
+    );
+
+    let all = [nested, dialog, independent, settings, tile_a, tile_b];
+    reconcile_z_order(
+      &all.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Promote,
+      &[WindowId(nested.0), WindowId(dialog.0)],
+    )
+    .expect("seed synthetic detached and tiled order");
+    wait_for_relative_order(
+      &all,
+      &[
+        nested.0,
+        dialog.0,
+        independent.0,
+        settings.0,
+        tile_a.0,
+        tile_b.0,
+      ],
+    );
+
+    // Close a nested window, then simulate Windows temporarily raising a
+    // tiled replacement focus. Preserve mode must restore the atom order
+    // without promoting the complete normal stack.
+    unsafe { DestroyWindow(nested).expect("destroy nested dialog") };
+    let after_close = [dialog, independent, settings, tile_a, tile_b];
+    super::NativeWindow::new(tile_a.0)
+      .set_z_order(&WindowZOrder::Top)
+      .expect("simulate native tile focus z-order side effect");
+    reconcile_z_order(
+      &after_close.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Preserve,
+      &[],
+    )
+    .expect("preserve detached order after dialog close");
+    wait_for_relative_order(
+      &after_close,
+      &[dialog.0, independent.0, settings.0, tile_a.0, tile_b.0],
+    );
+
+    // An explicit tile activation promotes the complete contiguous tile
+    // atom. Focusing either detached app later moves only that atom.
+    let tiles_then_detached =
+      [tile_a, tile_b, dialog, independent, settings];
+    reconcile_z_order(
+      &tiles_then_detached.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Promote,
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+    )
+    .expect("explicitly activate tiled group");
+    wait_for_relative_order(
+      &tiles_then_detached,
+      &[tile_a.0, tile_b.0, dialog.0, independent.0, settings.0],
+    );
+
+    let settings_then_tiles =
+      [settings, tile_a, tile_b, dialog, independent];
+    reconcile_z_order(
+      &settings_then_tiles.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Promote,
+      &[WindowId(settings.0)],
+    )
+    .expect("explicitly return focus to Settings");
+    wait_for_relative_order(
+      &settings_then_tiles,
+      &[settings.0, tile_a.0, tile_b.0, dialog.0, independent.0],
+    );
+
+    unsafe {
+      for hwnd in all {
+        let _ = DestroyWindow(hwnd);
+      }
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn owned_popup_above_a_tiled_owner_keeps_the_tile_group_contiguous() {
+    let class_name =
+      wide(&format!("GlazeWmTileOwnerDialog{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register tile-owner dialog class");
+
+    let tile_a = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Tile Owner",
+      false,
+      None,
+    );
+    let tile_b = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Tile Peer",
+      false,
+      None,
+    );
+    let owned_popup = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Owned Popup",
+      false,
+      Some(tile_a),
+    );
+    let detached_peer = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Detached Peer",
+      false,
+      None,
+    );
+
+    let desired = [owned_popup, tile_a, tile_b, detached_peer];
+    reconcile_z_order(
+      &desired.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Preserve,
+      &[],
+    )
+    .expect("reconcile an owned popup and atomic tile group");
+    wait_for_relative_order(
+      &desired,
+      &[owned_popup.0, tile_a.0, tile_b.0, detached_peer.0],
+    );
+
+    // Activating the tiled owner must include the complete tile group and
+    // the OS-owned popup that Windows keeps above that owner.
+    reconcile_z_order(
+      &desired.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Promote,
+      &[
+        WindowId(owned_popup.0),
+        WindowId(tile_a.0),
+        WindowId(tile_b.0),
+      ],
+    )
+    .expect("promote the owner group as one constrained atom");
+    wait_for_relative_order(
+      &desired,
+      &[owned_popup.0, tile_a.0, tile_b.0, detached_peer.0],
+    );
+
+    unsafe {
+      for hwnd in desired {
+        let _ = DestroyWindow(hwnd);
+      }
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn preserve_mode_repairs_a_split_tile_group_without_reordering_atoms() {
+    let class_name =
+      wide(&format!("GlazeWmPreserveNoop{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register preserve-mode class");
+
+    let settings = create_test_window(&class_name, false);
+    let tile_a = create_test_window(&class_name, false);
+    let external = create_test_window(&class_name, false);
+    let tile_b = create_test_window(&class_name, false);
+    let detached = create_test_window(&class_name, false);
+    let normal_chain = [settings, tile_a, tile_b, detached];
+    reconcile_z_order(
+      &normal_chain.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Promote,
+      &[WindowId(settings.0)],
+    )
+    .expect("seed matching participant chain");
+    super::NativeWindow::new(external.0)
+      .set_z_order(&WindowZOrder::AfterWindow(WindowId(tile_a.0)))
+      .expect("place unrelated native window between tile peers");
+    wait_for_relative_order(
+      &[settings, tile_a, external, tile_b, detached],
+      &[settings.0, tile_a.0, external.0, tile_b.0, detached.0],
+    );
+
+    let outcome = reconcile_z_order(
+      &normal_chain.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Preserve,
+      &[],
+    )
+    .expect("repair split tile peers while preserving atom order");
+    assert_eq!(outcome.native_writes, 1);
+    assert_eq!(outcome.skipped_windows, 0);
+    assert!(!outcome.retry_scheduled);
+    assert_eq!(
+      relative_order(&[settings, tile_a, tile_b, external, detached]),
+      vec![settings.0, tile_a.0, tile_b.0, external.0, detached.0],
+      "tile peers must be contiguous while surviving atoms retain pairwise order"
+    );
+
+    unsafe {
+      for hwnd in [settings, tile_a, external, tile_b, detached] {
+        let _ = DestroyWindow(hwnd);
+      }
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn preserve_mode_noops_for_an_already_contiguous_tile_group() {
+    let class_name =
+      wide(&format!("GlazeWmPreserveTileNoop{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register contiguous-tile preserve class");
+
+    let settings = create_test_window(&class_name, false);
+    let tile_a = create_test_window(&class_name, false);
+    let tile_b = create_test_window(&class_name, false);
+    let external = create_test_window(&class_name, false);
+    let detached = create_test_window(&class_name, false);
+    let normal_chain = [settings, tile_a, tile_b, detached];
+    reconcile_z_order(
+      &normal_chain.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Promote,
+      &[WindowId(settings.0)],
+    )
+    .expect("seed contiguous tile group");
+    super::NativeWindow::new(external.0)
+      .set_z_order(&WindowZOrder::AfterWindow(WindowId(tile_b.0)))
+      .expect("place unrelated native window after the tile group");
+    wait_for_relative_order(
+      &[settings, tile_a, tile_b, external, detached],
+      &[settings.0, tile_a.0, tile_b.0, external.0, detached.0],
+    );
+
+    let outcome = reconcile_z_order(
+      &normal_chain.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Preserve,
+      &[],
+    )
+    .expect("preserve already contiguous tile group");
+    assert_eq!(outcome.native_writes, 0);
+    assert_eq!(outcome.skipped_windows, 0);
+    assert!(!outcome.retry_scheduled);
+    assert_eq!(
+      relative_order(&[settings, tile_a, tile_b, external, detached]),
+      vec![settings.0, tile_a.0, tile_b.0, external.0, detached.0],
+    );
+
+    unsafe {
+      for hwnd in [settings, tile_a, tile_b, external, detached] {
+        let _ = DestroyWindow(hwnd);
+      }
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
+  #[test]
+  fn preserve_mode_defers_a_move_when_its_external_anchor_is_destroyed() {
+    let class_name =
+      wide(&format!("GlazeWmStaleAnchor{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register stale-anchor class");
+
+    let survivor = create_test_window(&class_name, false);
+    let anchor = create_test_window(&class_name, false);
+    let tile_b = create_test_window(&class_name, false);
+    let tile_a = create_test_window(&class_name, false);
+    super::NativeWindow::new(survivor.0)
+      .set_z_order(&WindowZOrder::Top)
+      .expect("place surviving atom above the reconciliation chain");
+    super::NativeWindow::new(anchor.0)
+      .set_z_order(&WindowZOrder::AfterWindow(WindowId(survivor.0)))
+      .expect("place external anchor after the surviving atom");
+    super::NativeWindow::new(tile_b.0)
+      .set_z_order(&WindowZOrder::AfterWindow(WindowId(anchor.0)))
+      .expect("place first participant after the external anchor");
+    super::NativeWindow::new(tile_a.0)
+      .set_z_order(&WindowZOrder::AfterWindow(WindowId(tile_b.0)))
+      .expect("place out-of-order participant at the end");
+    wait_for_relative_order(
+      &[survivor, anchor, tile_b, tile_a],
+      &[survivor.0, anchor.0, tile_b.0, tile_a.0],
+    );
+
+    let desired = [WindowId(tile_a.0), WindowId(tile_b.0)];
+    let usable = [true, true];
+    let moves = super::plan_z_order_moves(
+      &desired,
+      &usable,
+      &[WindowId(tile_b.0), WindowId(tile_a.0)],
+      ZOrderIntent::Preserve,
+      Some(WindowId(anchor.0)),
+    );
+    assert_eq!(
+      moves,
+      vec![(
+        WindowId(tile_a.0),
+        super::ZOrderInsertAfter::AfterAnchor(WindowId(anchor.0)),
+      )],
+      "plan against the external anchor before it becomes stale"
+    );
+    unsafe {
+      DestroyWindow(anchor).expect("destroy planned external anchor")
+    };
+
+    let flags = SWP_NOACTIVATE
+      | SWP_NOCOPYBITS
+      | SWP_NOMOVE
+      | SWP_NOSIZE
+      | SWP_ASYNCWINDOWPOS
+      | SWP_NOOWNERZORDER;
+    let applied = super::apply_planned_z_order_move(
+      WindowId(tile_a.0),
+      moves[0].1,
+      flags,
+    )
+    .expect("a rejected stale preserve anchor is deferred");
+    assert!(
+      !applied,
+      "the invalid anchor must not trigger an HWND_TOP retry"
+    );
+    assert_eq!(
+      relative_order(&[survivor, tile_b, tile_a]),
+      vec![survivor.0, tile_b.0, tile_a.0],
+      "a stale anchor must not promote a surviving atom"
+    );
+
+    unsafe {
+      for hwnd in [survivor, tile_a, tile_b] {
+        let _ = DestroyWindow(hwnd);
+      }
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
   }
 
   #[test]
@@ -3164,16 +4216,16 @@ mod reorder_z_order_tests {
     let responsive = [false, true, true];
 
     assert_eq!(
-      super::planned_insert_after(&chain, &responsive, 0),
+      super::planned_insert_after(&chain, &responsive, 0, None),
       super::ZOrderInsertAfter::Top
     );
     assert_eq!(
-      super::planned_insert_after(&chain, &responsive, 1),
+      super::planned_insert_after(&chain, &responsive, 1, None),
       super::ZOrderInsertAfter::Top,
       "first responsive after hung focused tile must rise to HWND_TOP"
     );
     assert_eq!(
-      super::planned_insert_after(&chain, &responsive, 2),
+      super::planned_insert_after(&chain, &responsive, 2, None),
       super::ZOrderInsertAfter::After(tile)
     );
   }
@@ -3201,10 +4253,98 @@ mod reorder_z_order_tests {
     let usable = chain.map(|window_id| enumerated.contains(&window_id));
 
     assert_eq!(
-      super::planned_insert_after(&chain, &usable, 2),
+      super::planned_insert_after(&chain, &usable, 2, None),
       super::ZOrderInsertAfter::After(grok),
       "Notepad must not insert after toast 984154; that hwnd is not in EnumWindows and lifts Notepad above focused Grok"
     );
+  }
+
+  #[test]
+  fn preserve_planner_moves_only_the_hwnd_outside_the_stable_subsequence()
+  {
+    let a = WindowId(1);
+    let tile_a = WindowId(2);
+    let detached = WindowId(3);
+    let tile_b = WindowId(4);
+    let desired = [a, tile_a, tile_b, detached];
+    let usable = [true; 4];
+    let actual = [a, tile_a, detached, tile_b];
+
+    assert_eq!(
+      super::plan_z_order_moves(
+        &desired,
+        &usable,
+        &actual,
+        super::ZOrderIntent::Preserve,
+        None,
+      ),
+      vec![(tile_b, super::ZOrderInsertAfter::After(tile_a))],
+      "repairing a split tile group should move only its displaced member"
+    );
+  }
+
+  #[test]
+  fn preserve_planner_keeps_the_existing_external_slot() {
+    let external_anchor = WindowId(9);
+    let a = WindowId(1);
+    let b = WindowId(2);
+    let desired = [a, b];
+    let usable = [true; 2];
+    let actual = [b, a];
+
+    assert_eq!(
+      super::plan_z_order_moves(
+        &desired,
+        &usable,
+        &actual,
+        super::ZOrderIntent::Preserve,
+        Some(external_anchor),
+      ),
+      vec![(a, super::ZOrderInsertAfter::AfterAnchor(external_anchor))],
+      "repairing participant order must anchor at its prior native slot"
+    );
+  }
+
+  #[test]
+  fn explicit_promotion_moves_only_its_atom_and_owner_family() {
+    let tile_a = WindowId(1);
+    let tile_b = WindowId(2);
+    let desired = [tile_a, tile_b];
+    let usable = [true; 2];
+
+    assert_eq!(
+      super::plan_z_order_moves(
+        &desired,
+        &usable,
+        &[WindowId(8), tile_a, tile_b],
+        super::ZOrderIntent::Promote,
+        None,
+      ),
+      vec![
+        (tile_a, super::ZOrderInsertAfter::Top),
+        (tile_b, super::ZOrderInsertAfter::After(tile_a)),
+      ]
+    );
+  }
+
+  #[test]
+  fn workspace_retry_generations_do_not_invalidate_other_monitors() {
+    let process_id = u128::from(std::process::id());
+    let scope_a = (process_id << 64) | 0xa;
+    let scope_b = (process_id << 64) | 0xb;
+    let a_first = super::next_workspace_z_order_generation(scope_a);
+    let b_first = super::next_workspace_z_order_generation(scope_b);
+    let a_second = super::next_workspace_z_order_generation(scope_a);
+
+    assert!(!super::z_order_generation_is_current(
+      Some(scope_a),
+      a_first
+    ));
+    assert!(super::z_order_generation_is_current(Some(scope_b), b_first));
+    assert!(super::z_order_generation_is_current(
+      Some(scope_a),
+      a_second
+    ));
   }
 
   #[test]
@@ -3232,7 +4372,7 @@ mod reorder_z_order_tests {
   #[test]
   fn reorder_z_order_raises_responsive_tiles_above_floaters_when_focused_tile_is_hung(
   ) {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // Cross-process layout matching layout.log hung helper @ 05:02Z:
     // hung tiled focus + responsive tile peer + foreign floater (Steam).
@@ -3274,7 +4414,6 @@ mod reorder_z_order_tests {
     // floaters via HWND_NOTOPMOST, so the responsive tile reaches HWND_TOP
     // without waiting on the 10ms retry. Allow a short foreign-queue drain
     // (well under the old +25ms failure window).
-    use std::time::Instant;
     let deadline = Instant::now() + Duration::from_millis(40);
     let mut order = relative_order(&[hung, tile, floater]);
     let mut tile_above_floater = false;
@@ -3567,15 +4706,9 @@ mod reorder_z_order_tests {
 
   fn foreign_windows_have_order(expected: &[HWND]) -> bool {
     let order = relative_order(expected);
-    #[allow(clippy::cast_possible_wrap)]
-    let topmost_style = WS_EX_TOPMOST.0 as isize;
-    let all_not_topmost = expected.iter().all(|window| {
-      let style = unsafe { GetWindowLongPtrW(*window, GWL_EXSTYLE) };
-      style & topmost_style == 0
-    });
     let expected_order =
       expected.iter().map(|window| window.0).collect::<Vec<_>>();
-    order == expected_order && all_not_topmost
+    order == expected_order
   }
 
   fn assert_foreign_z_order_converges(expected: &[HWND]) {
@@ -3766,23 +4899,47 @@ mod reorder_z_order_tests {
   }
 
   #[test]
-  fn reorder_z_order_converges_for_foreign_pumping_windows() {
+  fn normal_peer_reorders_preserve_foreign_topmost_constraints() {
     let (mut helper, [topmost, peer]) = spawn_pumping_window_helper();
+    let (mut peer_helper, second_peer) =
+      spawn_single_pumping_window_helper(false, 0, true);
 
-    reorder_z_order(&[WindowId(topmost.0), WindowId(peer.0)])
-      .expect("reorder foreign pumping windows");
-    assert_foreign_z_order_converges(&[topmost, peer]);
+    reconcile_z_order(
+      &[
+        WindowId(topmost.0),
+        WindowId(peer.0),
+        WindowId(second_peer.0),
+      ],
+      &[],
+      ZOrderIntent::Promote,
+      &[WindowId(peer.0), WindowId(second_peer.0)],
+    )
+    .expect("promote foreign normal peers below the topmost band");
+    assert_foreign_z_order_converges(&[topmost, peer, second_peer]);
+    assert!(super::native_window_is_topmost(WindowId(topmost.0)));
+    assert!(!super::native_window_is_topmost(WindowId(peer.0)));
+    assert!(!super::native_window_is_topmost(WindowId(second_peer.0)));
 
-    // Queue two successive desired chains before polling. The final chain
-    // must win without restoring TOPMOST on the foreign window.
-    reorder_z_order(&[WindowId(peer.0), WindowId(topmost.0)])
-      .expect("queue first rapid foreign reorder");
-    reorder_z_order(&[WindowId(topmost.0), WindowId(peer.0)])
-      .expect("queue second rapid foreign reorder");
-    assert_foreign_z_order_converges(&[topmost, peer]);
+    // Rapidly reverse the normal peers. The topmost HWND stays in its
+    // separate Win32 band and is never demoted to satisfy a normal chain.
+    reconcile_z_order(
+      &[
+        WindowId(topmost.0),
+        WindowId(second_peer.0),
+        WindowId(peer.0),
+      ],
+      &[],
+      ZOrderIntent::Promote,
+      &[WindowId(second_peer.0), WindowId(peer.0)],
+    )
+    .expect("reverse normal peers without moving the topmost HWND");
+    assert_foreign_z_order_converges(&[topmost, second_peer, peer]);
+    assert!(super::native_window_is_topmost(WindowId(topmost.0)));
 
     let _ = helper.kill();
     let _ = helper.wait();
+    let _ = peer_helper.kill();
+    let _ = peer_helper.wait();
   }
 
   #[test]
@@ -3795,8 +4952,8 @@ mod reorder_z_order_tests {
     // activation.
     let (mut prompt_helper, prompt_peer) =
       spawn_single_pumping_window_helper(false, 0, false);
-    let (mut delayed_helper, delayed_topmost) =
-      spawn_single_pumping_window_helper(true, 100, true);
+    let (mut delayed_helper, delayed_peer) =
+      spawn_single_pumping_window_helper(false, 100, true);
     let _foreground_override =
       super::TestForegroundWindowOverride::new(prompt_peer);
 
@@ -3804,7 +4961,7 @@ mod reorder_z_order_tests {
     runtime.block_on(async {
       reorder_z_order(&[
         WindowId(prompt_peer.0),
-        WindowId(delayed_topmost.0),
+        WindowId(delayed_peer.0),
       ])
       .expect("reorder independently serviced foreign windows");
 
@@ -3813,7 +4970,7 @@ mod reorder_z_order_tests {
       tokio::time::sleep(Duration::from_millis(500)).await;
     });
 
-    assert_foreign_z_order_converges(&[prompt_peer, delayed_topmost]);
+    assert_foreign_z_order_converges(&[prompt_peer, delayed_peer]);
 
     let _ = delayed_helper.kill();
     let _ = delayed_helper.wait();

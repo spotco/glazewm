@@ -64,6 +64,13 @@ pub fn focus_workspace(
 
     set_focused_descendant(&container_to_focus, None);
     state.pending_sync.queue_focus_change();
+    if let Ok(window) = container_to_focus.as_window_container() {
+      state.pending_sync.queue_stack_activation(
+        &target_workspace,
+        window.id(),
+        crate::pending_sync::StackActivationReason::WmCommand,
+      );
+    }
 
     // Display the workspace to switch focus to.
     state

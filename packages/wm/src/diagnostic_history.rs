@@ -46,8 +46,17 @@ pub enum DiagnosticBody {
     workspace_name: String,
     focused_hwnd: i64,
     focused_layer: Option<&'static str>,
+    stack_intent: String,
+    stack_atoms_before: Vec<String>,
+    stack_atoms_after: Vec<String>,
+    owner_constraints: Vec<NativeOwnerConstraint>,
+    native_order_before: Vec<NativeZRank>,
     intended_top_to_bottom: Vec<i64>,
     native_ranks: Vec<NativeZRank>,
+    native_writes: usize,
+    skipped_native_windows: usize,
+    retry_scheduled: bool,
+    reconcile_status: &'static str,
     /// When `native_ranks` was sampled relative to `SetWindowPos`.
     /// Reorder is asynchronous, so an immediate sample can still show
     /// the previous native order.
@@ -60,7 +69,7 @@ pub enum DiagnosticBody {
 #[serde(rename_all = "snake_case")]
 pub enum FocusOutcome {
   IgnoredSuspend,
-  OverrideRecentUnmanage,
+  LifecycleRecovery,
   UnknownForeground,
   AlreadySynced,
   ManualFocus,
@@ -70,6 +79,12 @@ pub enum FocusOutcome {
 pub struct NativeZRank {
   pub hwnd: i64,
   pub z_order_index: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeOwnerConstraint {
+  pub child_hwnd: i64,
+  pub owner_hwnd: i64,
 }
 
 #[derive(Clone, Debug, Default)]
