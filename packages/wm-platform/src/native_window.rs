@@ -103,14 +103,22 @@ pub struct NativeWindowDebugInfo {
 /// `Preserve` repairs violated participant relationships while retaining
 /// the current native slot of the chain. `Promote` is reserved for
 /// explicit activation and may move the selected atom to the normal
-/// foreground.
+/// foreground. `tiled_window_ids` identifies the participant HWNDs that
+/// must remain one contiguous normal-window group, subject to Win32 owner
+/// and topmost constraints.
 #[cfg(target_os = "windows")]
 pub fn reconcile_z_order(
   window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
 ) -> crate::Result<ZOrderReconcileOutcome> {
-  platform_impl::reconcile_z_order(window_ids, intent, promoted_atom_ids)
+  platform_impl::reconcile_z_order(
+    window_ids,
+    tiled_window_ids,
+    intent,
+    promoted_atom_ids,
+  )
 }
 
 /// Reconciles a workspace with a workspace-local retry generation.
@@ -122,12 +130,14 @@ pub fn reconcile_z_order(
 pub fn reconcile_z_order_for_workspace(
   workspace_scope: u128,
   window_ids: &[WindowId],
+  tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
 ) -> crate::Result<ZOrderReconcileOutcome> {
   platform_impl::reconcile_z_order_for_workspace(
     workspace_scope,
     window_ids,
+    tiled_window_ids,
     intent,
     promoted_atom_ids,
   )

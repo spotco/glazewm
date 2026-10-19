@@ -751,6 +751,7 @@ fn reconcile_workspace_stack(
   ) = match wm_platform::reconcile_z_order_for_workspace(
     workspace.id().as_u128(),
     &native_window_ids,
+    &tiled_ids,
     request,
     &promoted_atom_ids,
   ) {

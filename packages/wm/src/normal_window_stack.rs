@@ -613,11 +613,41 @@ mod tests {
   #[test]
   fn insertion_and_removal_preserve_other_atoms_pairwise() {
     let mut stack = seeded();
-    let before = detached(&stack);
+    let original_atoms = stack.atoms().to_vec();
+    let original_detached = detached(&stack);
     stack.apply(StackOperation::InsertDetached(wid(4)));
-    assert_eq!(detached(&stack)[..before.len()], before);
+    assert_eq!(
+      detached(&stack)[..original_detached.len()],
+      original_detached
+    );
+    let after_insert = stack.atoms().to_vec();
+    let original_atoms_after_insert = after_insert
+      .iter()
+      .filter(|atom| {
+        **atom != StackAtom::DetachedWindow { window_id: wid(4) }
+      })
+      .copied()
+      .collect::<Vec<_>>();
+    assert_eq!(original_atoms_after_insert, original_atoms);
     stack.apply(StackOperation::Remove(wid(2)));
     assert_eq!(detached(&stack), vec![wid(1), wid(3), wid(4)]);
+    let surviving_original_atoms = stack
+      .atoms()
+      .iter()
+      .filter(|atom| {
+        **atom != StackAtom::DetachedWindow { window_id: wid(4) }
+          && **atom != StackAtom::DetachedWindow { window_id: wid(2) }
+      })
+      .copied()
+      .collect::<Vec<_>>();
+    let expected_survivors = original_atoms
+      .iter()
+      .filter(|atom| {
+        **atom != StackAtom::DetachedWindow { window_id: wid(2) }
+      })
+      .copied()
+      .collect::<Vec<_>>();
+    assert_eq!(surviving_original_atoms, expected_survivors);
     assert!(!stack.apply(StackOperation::Remove(wid(2))));
   }
 
