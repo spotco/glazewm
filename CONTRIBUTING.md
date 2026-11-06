@@ -38,6 +38,12 @@ After making your changes, push to your fork and [submit a pull request](https:/
 
 Run all required tests and CI checks for the exact commit before pushing it or distributing a build archive. Do not push or deploy an archive while any required check is failing or has not run; fix the failure and rerun the checks first.
 
+### Remote Windows tests
+
+The remote test runner builds Rust test executables on the local checkout,
+transfers them to a configured Windows host, and runs them there. See
+[`docs/remote-testing.md`](docs/remote-testing.md) for setup and commands.
+
 ### Tips
 
 If using VSCode, it's recommended to use the [Rust Analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer) extension. Get automatic linting by adding this to your VSCode's `settings.json`:

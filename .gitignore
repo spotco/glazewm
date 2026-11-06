@@ -10,6 +10,11 @@ out/
 *.env
 .wix/
 
+# Machine-local remote test connection settings and retained run output.
+/config_local.json
+/Temp/remote-tests/
+/Temp/remote-tests-*.log
+
 # IDE files
 .vs/
 .idea/
