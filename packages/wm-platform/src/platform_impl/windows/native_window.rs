@@ -1942,6 +1942,42 @@ fn z_order_chain_matches(window_ids: &[WindowId]) -> bool {
   actual == expected
 }
 
+fn window_still_has_topmost_bit_after_demote(
+  window_id: WindowId,
+  demote_set: &HashSet<WindowId>,
+) -> bool {
+  demote_set.contains(&window_id) && native_window_is_topmost(window_id)
+}
+
+fn demote_pending_managed_topmost(
+  demote_set: &HashSet<WindowId>,
+  window_ids: &[WindowId],
+) -> crate::Result<(usize, usize)> {
+  let flags = SWP_NOACTIVATE
+    | SWP_NOCOPYBITS
+    | SWP_NOMOVE
+    | SWP_NOSIZE
+    | SWP_ASYNCWINDOWPOS
+    | SWP_NOOWNERZORDER;
+  let mut native_writes = 0;
+  let mut skipped = 0usize;
+  for window_id in window_ids {
+    if !demote_set.contains(window_id) {
+      continue;
+    }
+    if !native_window_is_topmost(*window_id) {
+      continue;
+    }
+    match unsafe {
+      SetWindowPos(HWND(window_id.0), HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+    } {
+      Ok(()) => native_writes += 1,
+      Err(_) => skipped += 1,
+    }
+  }
+  Ok((native_writes, skipped))
+}
+
 fn native_window_is_owned_by_tiled_group(
   window_id: WindowId,
   tiled_window_ids: &[WindowId],
@@ -1963,11 +1999,15 @@ fn native_window_is_owned_by_tiled_group(
 fn tiled_group_is_contiguous(
   native_order: &[WindowId],
   tiled_window_ids: &[WindowId],
+  demote_topmost_ids: &HashSet<WindowId>,
 ) -> bool {
   let normal_order = native_order
     .iter()
     .copied()
-    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .filter(|window_id| {
+      !native_window_is_topmost(*window_id)
+        || demote_topmost_ids.contains(window_id)
+    })
     .collect::<Vec<_>>();
   let present_tiles = tiled_window_ids
     .iter()
@@ -2003,11 +2043,15 @@ fn tiled_group_is_contiguous(
 fn plan_tiled_group_moves(
   native_order: &[WindowId],
   tiled_window_ids: &[WindowId],
+  demote_topmost_ids: &HashSet<WindowId>,
 ) -> Vec<(WindowId, ZOrderInsertAfter)> {
   let normal_order = native_order
     .iter()
     .copied()
-    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .filter(|window_id| {
+      !native_window_is_topmost(*window_id)
+        || demote_topmost_ids.contains(window_id)
+    })
     .collect::<Vec<_>>();
   let present_tiles = tiled_window_ids
     .iter()
@@ -2067,23 +2111,37 @@ fn z_order_request_matches(
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &HashSet<WindowId>,
 ) -> bool {
   z_order_chain_matches(responsive_window_ids)
+    && !responsive_window_ids.iter().any(|window_id| {
+      window_still_has_topmost_bit_after_demote(
+        *window_id,
+        demote_topmost_ids,
+      )
+    })
     && tiled_group_is_contiguous(
       &sample_native_window_order(),
       tiled_window_ids,
+      demote_topmost_ids,
     )
     && (intent != ZOrderIntent::Promote
-      || promotion_is_satisfied(promoted_atom_ids))
+      || promotion_is_satisfied(promoted_atom_ids, demote_topmost_ids))
 }
 
-fn promotion_is_satisfied(promoted_atom_ids: &[WindowId]) -> bool {
+fn promotion_is_satisfied(
+  promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &HashSet<WindowId>,
+) -> bool {
   if promoted_atom_ids.is_empty() {
     return true;
   }
   let normal_order = sample_native_window_order()
     .into_iter()
-    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .filter(|window_id| {
+      !native_window_is_topmost(*window_id)
+        || demote_topmost_ids.contains(window_id)
+    })
     .collect::<Vec<_>>();
   normal_order.starts_with(promoted_atom_ids)
 }
@@ -2093,8 +2151,14 @@ fn promotion_is_satisfied(promoted_atom_ids: &[WindowId]) -> bool {
 pub(crate) fn reorder_z_order(
   window_ids: &[WindowId],
 ) -> crate::Result<()> {
-  reconcile_z_order(window_ids, &[], ZOrderIntent::Promote, window_ids)
-    .map(|_| ())
+  reconcile_z_order(
+    window_ids,
+    &[],
+    ZOrderIntent::Promote,
+    window_ids,
+    &[],
+  )
+  .map(|_| ())
 }
 
 pub(crate) fn reconcile_z_order(
@@ -2102,6 +2166,7 @@ pub(crate) fn reconcile_z_order(
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &[WindowId],
 ) -> crate::Result<ZOrderReconcileOutcome> {
   let generation = next_z_order_generation();
   reconcile_z_order_with_generation(
@@ -2111,6 +2176,7 @@ pub(crate) fn reconcile_z_order(
     tiled_window_ids,
     intent,
     promoted_atom_ids,
+    demote_topmost_ids,
   )
 }
 
@@ -2120,6 +2186,7 @@ pub(crate) fn reconcile_z_order_for_workspace(
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &[WindowId],
 ) -> crate::Result<ZOrderReconcileOutcome> {
   let generation = next_workspace_z_order_generation(workspace_scope);
   reconcile_z_order_with_generation(
@@ -2129,6 +2196,7 @@ pub(crate) fn reconcile_z_order_for_workspace(
     tiled_window_ids,
     intent,
     promoted_atom_ids,
+    demote_topmost_ids,
   )
 }
 
@@ -2141,6 +2209,7 @@ fn reconcile_z_order_with_generation(
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &[WindowId],
 ) -> crate::Result<ZOrderReconcileOutcome> {
   if !z_order_generation_is_current(workspace_scope, generation) {
     return Ok(ZOrderReconcileOutcome {
@@ -2148,10 +2217,15 @@ fn reconcile_z_order_with_generation(
       ..ZOrderReconcileOutcome::default()
     });
   }
+  let demote_set: HashSet<WindowId> =
+    demote_topmost_ids.iter().copied().collect();
   let window_ids = window_ids
     .iter()
     .copied()
-    .filter(|window_id| !native_window_is_topmost(*window_id))
+    .filter(|window_id| {
+      !native_window_is_topmost(*window_id)
+        || demote_set.contains(window_id)
+    })
     .collect::<Vec<_>>();
   let tiled_window_ids = tiled_window_ids
     .iter()
@@ -2174,6 +2248,7 @@ fn reconcile_z_order_with_generation(
     &tiled_window_ids,
     intent,
     &promoted_atom_ids,
+    &demote_set,
   )?;
   let mut outcome = ZOrderReconcileOutcome {
     native_writes: initial_result.native_writes,
@@ -2202,6 +2277,7 @@ fn reconcile_z_order_with_generation(
     let retry_ids = window_ids.clone();
     let retry_tiled_ids = tiled_window_ids.clone();
     let retry_promoted_ids = promoted_atom_ids.clone();
+    let retry_demote_set = demote_set.clone();
     outcome.retry_scheduled = true;
     debug!(
       ?workspace_scope,
@@ -2244,6 +2320,7 @@ fn reconcile_z_order_with_generation(
             &retry_tiled_ids,
             intent,
             &retry_promoted_ids,
+            &retry_demote_set,
           )
         {
           if stable_sample_seen {
@@ -2264,6 +2341,7 @@ fn reconcile_z_order_with_generation(
             &retry_tiled_ids,
             intent,
             &retry_promoted_ids,
+            &retry_demote_set,
           ) {
             Ok(result) => apply_result = result,
             Err(_) => return,
@@ -2292,6 +2370,7 @@ fn reconcile_z_order_with_generation(
       let recovery_ids = window_ids;
       let recovery_tiled_ids = tiled_window_ids;
       let recovery_promoted_ids = promoted_atom_ids;
+      let recovery_demote_set = demote_set.clone();
       let recovery_foreground_ids = recovery_promoted_ids.clone();
       runtime.spawn(async move {
         let started = tokio::time::Instant::now();
@@ -2312,6 +2391,7 @@ fn reconcile_z_order_with_generation(
             &recovery_tiled_ids,
             intent,
             &recovery_promoted_ids,
+            &recovery_demote_set,
           ) {
             Ok(result) if result.skipped_windows > 0 => {}
             Ok(_) | Err(_) => return,
@@ -2327,6 +2407,7 @@ fn reconcile_z_order_with_generation(
             &recovery_tiled_ids,
             intent,
             &recovery_promoted_ids,
+            &recovery_demote_set,
           ) {
             Ok(result) if result.skipped_windows > 0 => {}
             Ok(_) | Err(_) => return,
@@ -2723,6 +2804,7 @@ fn apply_z_order_chain(
   window_ids: &[WindowId],
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
+  demote_topmost_ids: &HashSet<WindowId>,
 ) -> crate::Result<ZOrderApplyResult> {
   // Keep SWP_ASYNCWINDOWPOS so a foreign GUI queue cannot block the WM
   // event loop. Topmost windows are excluded by the caller and handled by
@@ -2769,7 +2851,8 @@ fn apply_z_order_chain(
   for window_id in window_ids {
     let hwnd = HWND(window_id.0);
     let is_usable = enumerated_window_ids.contains(window_id)
-      && !native_window_is_topmost(*window_id)
+      && (!native_window_is_topmost(*window_id)
+        || demote_topmost_ids.contains(window_id))
       && hwnd_gui_responsive_with_tid_cache(hwnd, &mut tid_cache);
     usable.push(is_usable);
     if is_usable {
@@ -2795,8 +2878,11 @@ fn apply_z_order_chain(
     first_anchor,
   );
   if planned_moves.is_empty() {
-    planned_moves =
-      plan_tiled_group_moves(&native_order, tiled_window_ids);
+    planned_moves = plan_tiled_group_moves(
+      &native_order,
+      tiled_window_ids,
+      demote_topmost_ids,
+    );
   }
   let mut native_writes = 0;
   let mut skipped_windows =
@@ -2821,30 +2907,54 @@ fn apply_z_order_request(
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &HashSet<WindowId>,
 ) -> crate::Result<ZOrderApplyResult> {
+  let (demote_writes, demote_skipped) =
+    demote_pending_managed_topmost(demote_topmost_ids, window_ids)?;
+  let no_pending_demote_bits = !window_ids.iter().any(|window_id| {
+    window_still_has_topmost_bit_after_demote(
+      *window_id,
+      demote_topmost_ids,
+    )
+  });
   let mut result = if z_order_chain_matches(window_ids)
     && tiled_group_is_contiguous(
       &sample_native_window_order(),
       tiled_window_ids,
-    ) {
+      demote_topmost_ids,
+    )
+    && no_pending_demote_bits
+    && (intent != ZOrderIntent::Promote
+      || promotion_is_satisfied(promoted_atom_ids, demote_topmost_ids))
+  {
     ZOrderApplyResult {
-      skipped_windows: 0,
-      native_writes: 0,
+      skipped_windows: demote_skipped,
+      native_writes: demote_writes,
       responsive_window_ids: window_ids.to_vec(),
     }
   } else {
-    apply_z_order_chain(
+    let preserve_result = apply_z_order_chain(
       window_ids,
       tiled_window_ids,
       ZOrderIntent::Preserve,
-    )?
+      demote_topmost_ids,
+    )?;
+    ZOrderApplyResult {
+      skipped_windows: demote_skipped + preserve_result.skipped_windows,
+      native_writes: demote_writes + preserve_result.native_writes,
+      responsive_window_ids: preserve_result.responsive_window_ids,
+    }
   };
 
   if intent == ZOrderIntent::Promote
-    && !promotion_is_satisfied(promoted_atom_ids)
+    && !promotion_is_satisfied(promoted_atom_ids, demote_topmost_ids)
   {
-    let promotion_result =
-      apply_z_order_chain(promoted_atom_ids, &[], ZOrderIntent::Promote)?;
+    let promotion_result = apply_z_order_chain(
+      promoted_atom_ids,
+      &[],
+      ZOrderIntent::Promote,
+      demote_topmost_ids,
+    )?;
     result.skipped_windows += promotion_result.skipped_windows;
     result.native_writes += promotion_result.native_writes;
     for window_id in promotion_result.responsive_window_ids {
@@ -3133,7 +3243,10 @@ fn desktop_window() -> NativeWindow {
 
 #[cfg(test)]
 mod reorder_z_order_tests {
-  use std::os::windows::ffi::OsStrExt;
+  use std::{
+    ops::{Deref, DerefMut},
+    os::windows::ffi::OsStrExt,
+  };
 
   use windows::{
     core::PCWSTR,
@@ -3177,14 +3290,61 @@ mod reorder_z_order_tests {
       .collect()
   }
 
-  /// Creates a visible top-level window. `topmost` reproduces a Snipping
-  /// Tool window left `WS_EX_TOPMOST` by a previous GlazeWM session.
+  /// A child helper process must not survive a failed test. Without this
+  /// guard, an assertion can leave HWND helpers running, interfere with
+  /// later z-order tests, and keep Cargo's inherited stderr pipe open.
+  struct TestChild(std::process::Child);
+
+  impl TestChild {
+    fn spawn(
+      command: &mut std::process::Command,
+    ) -> std::io::Result<Self> {
+      command.spawn().map(Self)
+    }
+  }
+
+  impl Deref for TestChild {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+      &self.0
+    }
+  }
+
+  impl DerefMut for TestChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+      &mut self.0
+    }
+  }
+
+  impl Drop for TestChild {
+    fn drop(&mut self) {
+      let _ = self.0.kill();
+      let _ = self.0.wait();
+    }
+  }
+
+  /// Creates a hidden top-level window so a running window manager does
+  /// not adopt the test fixture. Hidden HWNDs still participate in the
+  /// native z-order. `topmost` reproduces a Snipping Tool window left
+  /// `WS_EX_TOPMOST` by a previous GlazeWM session.
   fn create_test_window(class: &[u16], topmost: bool) -> HWND {
-    create_test_window_with_owner(
+    create_test_window_with_owner_and_visibility(
       class,
       "glazewm-z-order-test",
       topmost,
       None,
+      false,
+    )
+  }
+
+  fn create_visible_test_window(class: &[u16], topmost: bool) -> HWND {
+    create_test_window_with_owner_and_visibility(
+      class,
+      "glazewm-z-order-test",
+      topmost,
+      None,
+      true,
     )
   }
 
@@ -3194,18 +3354,35 @@ mod reorder_z_order_tests {
     topmost: bool,
     owner: Option<HWND>,
   ) -> HWND {
+    create_test_window_with_owner_and_visibility(
+      class, title, topmost, owner, false,
+    )
+  }
+
+  fn create_test_window_with_owner_and_visibility(
+    class: &[u16],
+    title: &str,
+    topmost: bool,
+    owner: Option<HWND>,
+    visible: bool,
+  ) -> HWND {
     let title = wide(title);
     let ex_style = if topmost {
       WS_EX_TOPMOST
     } else {
       WINDOW_EX_STYLE::default()
     };
+    let style = if visible {
+      WS_OVERLAPPEDWINDOW | WS_VISIBLE
+    } else {
+      WS_OVERLAPPEDWINDOW
+    };
     let hwnd = unsafe {
       CreateWindowExW(
         ex_style,
         PCWSTR(class.as_ptr()),
         PCWSTR(title.as_ptr()),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        style,
         40,
         40,
         160,
@@ -3279,7 +3456,7 @@ mod reorder_z_order_tests {
         WS_EX_NOACTIVATE,
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW,
         80,
         80,
         240,
@@ -3340,7 +3517,7 @@ mod reorder_z_order_tests {
         WINDOW_EX_STYLE::default(),
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW,
         80,
         80,
         240,
@@ -3423,7 +3600,7 @@ mod reorder_z_order_tests {
         WINDOW_EX_STYLE::default(),
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW,
         80,
         80,
         240,
@@ -3663,7 +3840,7 @@ mod reorder_z_order_tests {
         ex_style,
         PCWSTR(class_name.as_ptr()),
         PCWSTR(title.as_ptr()),
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        WS_OVERLAPPEDWINDOW,
         80,
         80,
         240,
@@ -3805,6 +3982,55 @@ mod reorder_z_order_tests {
     assert!(snipping_is_topmost, "topmost state belongs to Windows");
   }
 
+  /// App-set `WS_EX_TOPMOST` on a managed floater (Roblox Studio) must not
+  /// remove that window from the reconciliation chain. Demoting it into
+  /// the normal band matches `reconcile_workspace_stack`'s demote set.
+  #[test]
+  fn demote_set_moves_app_topmost_managed_floater_below_promoted_tiles() {
+    let class_name =
+      wide(&format!("GlazeWmAppTopmostFloater{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register app-topmost floater class");
+
+    let tile_a = create_visible_test_window(&class_name, false);
+    let tile_b = create_visible_test_window(&class_name, false);
+    let studio_like = create_visible_test_window(&class_name, true);
+    let peer = create_visible_test_window(&class_name, false);
+
+    let chain = [tile_a, tile_b, studio_like, peer];
+    let demote = [WindowId(studio_like.0)];
+
+    reconcile_z_order(
+      &chain.map(|hwnd| WindowId(hwnd.0)),
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Promote,
+      &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      &demote,
+    )
+    .expect("demote app topmost then promote tiled group");
+
+    wait_for_relative_order(
+      &chain,
+      &[tile_a.0, tile_b.0, studio_like.0, peer.0],
+    );
+    assert!(
+      !super::native_window_is_topmost(WindowId(studio_like.0)),
+      "managed normal-band HWND must leave the topmost band after demote",
+    );
+
+    unsafe {
+      for hwnd in chain {
+        let _ = DestroyWindow(hwnd);
+      }
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
   #[test]
   #[allow(clippy::too_many_lines)] // Exercise several real HWND lifecycle
                                    // transitions in order.
@@ -3862,6 +4088,7 @@ mod reorder_z_order_tests {
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Promote,
       &[WindowId(nested.0), WindowId(dialog.0)],
+      &[],
     )
     .expect("seed synthetic detached and tiled order");
     wait_for_relative_order(
@@ -3889,6 +4116,7 @@ mod reorder_z_order_tests {
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Preserve,
       &[],
+      &[],
     )
     .expect("preserve detached order after dialog close");
     wait_for_relative_order(
@@ -3905,6 +4133,7 @@ mod reorder_z_order_tests {
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Promote,
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      &[],
     )
     .expect("explicitly activate tiled group");
     wait_for_relative_order(
@@ -3919,6 +4148,7 @@ mod reorder_z_order_tests {
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Promote,
       &[WindowId(settings.0)],
+      &[],
     )
     .expect("explicitly return focus to Settings");
     wait_for_relative_order(
@@ -3977,6 +4207,7 @@ mod reorder_z_order_tests {
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Preserve,
       &[],
+      &[],
     )
     .expect("reconcile an owned popup and atomic tile group");
     wait_for_relative_order(
@@ -3995,6 +4226,7 @@ mod reorder_z_order_tests {
         WindowId(tile_a.0),
         WindowId(tile_b.0),
       ],
+      &[],
     )
     .expect("promote the owner group as one constrained atom");
     wait_for_relative_order(
@@ -4033,6 +4265,7 @@ mod reorder_z_order_tests {
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Promote,
       &[WindowId(settings.0)],
+      &[],
     )
     .expect("seed matching participant chain");
     super::NativeWindow::new(external.0)
@@ -4047,6 +4280,7 @@ mod reorder_z_order_tests {
       &normal_chain.map(|hwnd| WindowId(hwnd.0)),
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Preserve,
+      &[],
       &[],
     )
     .expect("repair split tile peers while preserving atom order");
@@ -4090,6 +4324,7 @@ mod reorder_z_order_tests {
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Promote,
       &[WindowId(settings.0)],
+      &[],
     )
     .expect("seed contiguous tile group");
     super::NativeWindow::new(external.0)
@@ -4104,6 +4339,7 @@ mod reorder_z_order_tests {
       &normal_chain.map(|hwnd| WindowId(hwnd.0)),
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
       ZOrderIntent::Preserve,
+      &[],
       &[],
     )
     .expect("preserve already contiguous tile group");
@@ -4377,13 +4613,14 @@ mod reorder_z_order_tests {
     // Cross-process layout matching layout.log hung helper @ 05:02Z:
     // hung tiled focus + responsive tile peer + foreign floater (Steam).
     let current_exe = std::env::current_exe().expect("test executable");
-    let mut hung_helper = std::process::Command::new(&current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", "window")
-      .arg("z_order_test_helper_window")
-      .arg("--nocapture")
-      .stdout(std::process::Stdio::piped())
-      .spawn()
-      .expect("spawn hung helper");
+    let mut hung_helper = TestChild::spawn(
+      &mut std::process::Command::new(&current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", "window")
+        .arg("z_order_test_helper_window")
+        .arg("--nocapture")
+        .stdout(std::process::Stdio::piped()),
+    )
+    .expect("spawn hung helper");
     let hung = read_helper_hwnd(&mut hung_helper, "GLAZEWM_Z_ORDER_HWND:");
 
     let (mut tile_helper, tile) =
@@ -4570,7 +4807,6 @@ mod reorder_z_order_tests {
           "foreground left hung helper after seed reorder"
         );
 
-        let reorder_at = Instant::now();
         reorder_z_order(&[
           WindowId(hung.0),
           WindowId(tile.0),
@@ -4594,11 +4830,18 @@ mod reorder_z_order_tests {
 
         hung_gate.release();
 
-        let deadline = reorder_at + Duration::from_millis(3500);
+        let resume_at = Instant::now();
+        let deadline = resume_at + Duration::from_millis(3500);
+        let mut next_sample_at = resume_at;
+        let mut samples = Vec::new();
         let mut order = relative_order(&[hung, tile, floater]);
         let mut full_chain = false;
         while Instant::now() < deadline {
           order = relative_order(&[hung, tile, floater]);
+          if Instant::now() >= next_sample_at {
+            samples.push((resume_at.elapsed().as_millis(), order.clone()));
+            next_sample_at += Duration::from_millis(100);
+          }
           full_chain = order == vec![hung.0, tile.0, floater.0];
           if full_chain {
             break;
@@ -4608,7 +4851,7 @@ mod reorder_z_order_tests {
 
         assert!(
           full_chain,
-          "after late resume, 1s backoff recovery must restore full chain; actual={order:?}"
+          "after late resume, 1s backoff recovery must restore full chain; actual={order:?}; samples at ms after release={samples:?}"
         );
       });
       },
@@ -4624,60 +4867,96 @@ mod reorder_z_order_tests {
     }
   }
 
-  fn read_helper_hwnd(
-    helper: &mut std::process::Child,
-    prefix: &str,
-  ) -> HWND {
-    use std::io::{BufRead, BufReader};
+  fn read_helper_line(helper: &mut TestChild, prefix: &str) -> String {
+    use std::{
+      io::{BufRead, BufReader},
+      sync::mpsc::{self, RecvTimeoutError},
+      time::{Duration, Instant},
+    };
 
     let stdout = helper.stdout.take().expect("helper stdout");
-    let mut lines = BufReader::new(stdout).lines();
+    let (sender, receiver) = mpsc::channel();
+    let _reader = std::thread::spawn(move || {
+      for line in BufReader::new(stdout).lines() {
+        match line {
+          Ok(line) => {
+            if sender.send(Ok(line)).is_err() {
+              return;
+            }
+          }
+          Err(error) => {
+            let _ = sender.send(Err(error.to_string()));
+            return;
+          }
+        }
+      }
+      let _ = sender.send(Err("helper closed stdout".to_string()));
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-      let line = lines
-        .next()
-        .expect("helper HWND line")
-        .expect("read helper HWND line");
+      let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_millis(100));
+      let line = match receiver.recv_timeout(wait) {
+        Ok(Ok(line)) => line,
+        Ok(Err(error)) => panic!("read helper HWND line: {error}"),
+        Err(RecvTimeoutError::Disconnected) => {
+          panic!("helper HWND reader stopped")
+        }
+        Err(RecvTimeoutError::Timeout) => {
+          if let Some(status) = helper.try_wait().expect("poll helper") {
+            panic!("helper exited before HWND line: {status}");
+          }
+          if Instant::now() >= deadline {
+            let _ = helper.kill();
+            let _ = helper.wait();
+            panic!("helper did not emit HWND line within 10s");
+          }
+          continue;
+        }
+      };
       if let Some(hwnd) = line.strip_prefix(prefix) {
-        return HWND(hwnd.parse::<isize>().expect("parse helper HWND"));
+        return hwnd.to_string();
       }
     }
   }
 
+  fn read_helper_hwnd(helper: &mut TestChild, prefix: &str) -> HWND {
+    HWND(
+      read_helper_line(helper, prefix)
+        .parse::<isize>()
+        .expect("parse helper HWND"),
+    )
+  }
+
   fn assert_foreign_z_order_call_is_bounded(mode: &str) {
     use std::{
-      io::{BufRead, BufReader},
       process::{Command, Stdio},
       time::{Duration, Instant},
     };
 
     let current_exe = std::env::current_exe().expect("test executable");
-    let mut window_helper = Command::new(&current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", "window")
-      .arg("z_order_test_helper_window")
-      .arg("--nocapture")
-      .stdout(Stdio::piped())
-      .spawn()
-      .expect("spawn non-pumping window helper");
-    let stdout = window_helper.stdout.take().expect("helper stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let hwnd = loop {
-      let line = lines
-        .next()
-        .expect("window helper HWND")
-        .expect("read window helper HWND");
-      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
-        break hwnd.parse::<isize>().expect("parse window helper HWND");
-      }
-    };
+    let mut window_helper = TestChild::spawn(
+      &mut Command::new(&current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", "window")
+        .arg("z_order_test_helper_window")
+        .arg("--nocapture")
+        .stdout(Stdio::piped()),
+    )
+    .expect("spawn non-pumping window helper");
+    let hwnd =
+      read_helper_hwnd(&mut window_helper, "GLAZEWM_Z_ORDER_HWND:");
 
-    let mut z_order_call = Command::new(&current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", mode)
-      .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
-      .arg(format!("z_order_test_helper_{mode}"))
-      .arg("--nocapture")
-      .stdout(Stdio::null())
-      .spawn()
-      .expect("spawn bounded z-order caller");
+    let mut z_order_call = TestChild::spawn(
+      &mut Command::new(&current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", mode)
+        .env("GLAZEWM_Z_ORDER_HWND", hwnd.0.to_string())
+        .arg(format!("z_order_test_helper_{mode}"))
+        .arg("--nocapture")
+        .stdout(Stdio::null()),
+    )
+    .expect("spawn bounded z-order caller");
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let completed = loop {
@@ -4740,45 +5019,32 @@ mod reorder_z_order_tests {
     );
   }
 
-  fn spawn_pumping_window_helper() -> (std::process::Child, [HWND; 2]) {
-    use std::{
-      io::{BufRead, BufReader},
-      process::{Command, Stdio},
-    };
+  fn spawn_pumping_window_helper() -> (TestChild, [HWND; 2]) {
+    use std::process::{Command, Stdio};
 
     let current_exe = std::env::current_exe().expect("test executable");
-    let mut helper = Command::new(current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", "pumping-window")
-      .arg("z_order_test_helper_pumping_window")
-      .arg("--nocapture")
-      .stdout(Stdio::piped())
-      .spawn()
-      .expect("spawn pumping window helper");
-    let stdout = helper.stdout.take().expect("helper stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let handles = loop {
-      let line = lines
-        .next()
-        .expect("pumping helper HWNDs")
-        .expect("read pumping helper HWNDs");
-      if let Some(handles) =
-        line.strip_prefix("GLAZEWM_Z_ORDER_PUMPING_HWND:")
-      {
-        break handles
-          .split(':')
-          .map(|handle| {
-            handle.parse::<isize>().expect("parse pumping helper HWND")
-          })
-          .collect::<Vec<_>>();
-      }
-    };
+    let mut helper = TestChild::spawn(
+      &mut Command::new(current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", "pumping-window")
+        .arg("z_order_test_helper_pumping_window")
+        .arg("--nocapture")
+        .stdout(Stdio::piped()),
+    )
+    .expect("spawn pumping window helper");
+    let handles =
+      read_helper_line(&mut helper, "GLAZEWM_Z_ORDER_PUMPING_HWND:")
+        .split(':')
+        .map(|handle| {
+          handle.parse::<isize>().expect("parse pumping helper HWND")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(handles.len(), 2, "pumping helper must expose two HWNDs");
     (helper, [HWND(handles[0]), HWND(handles[1])])
   }
 
   /// Foreign window that fails `WM_NULL` until [`DeferredPump::release`].
   struct DeferredPump {
-    helper: std::process::Child,
+    helper: TestChild,
     hwnd: HWND,
     event: windows::Win32::Foundation::HANDLE,
   }
@@ -4804,7 +5070,6 @@ mod reorder_z_order_tests {
 
   fn spawn_deferred_pump_helper() -> DeferredPump {
     use std::{
-      io::{BufRead, BufReader},
       process::{Command, Stdio},
       sync::atomic::{AtomicU64, Ordering},
       time::Duration,
@@ -4828,27 +5093,16 @@ mod reorder_z_order_tests {
     assert_ne!(event, HANDLE::default(), "deferred-pump event handle");
 
     let current_exe = std::env::current_exe().expect("test executable");
-    let mut helper = Command::new(current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", "deferred-pump")
-      .env("GLAZEWM_RESUME_EVENT", &name)
-      .arg("deferred_pump_helper_window")
-      .arg("--nocapture")
-      .stdout(Stdio::piped())
-      .spawn()
-      .expect("spawn deferred-pump helper");
-    let stdout = helper.stdout.take().expect("helper stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let hwnd = loop {
-      let line = lines
-        .next()
-        .expect("deferred-pump HWND")
-        .expect("read deferred-pump HWND");
-      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
-        break HWND(
-          hwnd.parse::<isize>().expect("parse deferred-pump HWND"),
-        );
-      }
-    };
+    let mut helper = TestChild::spawn(
+      &mut Command::new(current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", "deferred-pump")
+        .env("GLAZEWM_RESUME_EVENT", &name)
+        .arg("deferred_pump_helper_window")
+        .arg("--nocapture")
+        .stdout(Stdio::piped()),
+    )
+    .expect("spawn deferred-pump helper");
+    let hwnd = read_helper_hwnd(&mut helper, "GLAZEWM_Z_ORDER_HWND:");
     std::thread::sleep(Duration::from_millis(50));
     DeferredPump {
       helper,
@@ -4861,41 +5115,27 @@ mod reorder_z_order_tests {
     topmost: bool,
     delay_ms: u64,
     no_activate: bool,
-  ) -> (std::process::Child, HWND) {
-    use std::{
-      io::{BufRead, BufReader},
-      process::{Command, Stdio},
-    };
+  ) -> (TestChild, HWND) {
+    use std::process::{Command, Stdio};
 
     let current_exe = std::env::current_exe().expect("test executable");
-    let mut helper = Command::new(current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", "single-pumping-window")
-      .env("GLAZEWM_Z_ORDER_TOPMOST", if topmost { "1" } else { "0" })
-      .env(
-        "GLAZEWM_Z_ORDER_NO_ACTIVATE",
-        if no_activate { "1" } else { "0" },
-      )
-      .env("GLAZEWM_Z_ORDER_DELAY_MS", delay_ms.to_string())
-      .arg("z_order_test_helper_single_pumping_window")
-      .arg("--nocapture")
-      .stdout(Stdio::piped())
-      .spawn()
-      .expect("spawn single pumping window helper");
-    let stdout = helper.stdout.take().expect("helper stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let hwnd = loop {
-      let line = lines
-        .next()
-        .expect("single pumping helper HWND")
-        .expect("read single pumping helper HWND");
-      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_SINGLE_HWND:")
-      {
-        break hwnd
-          .parse::<isize>()
-          .expect("parse single pumping helper HWND");
-      }
-    };
-    (helper, HWND(hwnd))
+    let mut helper = TestChild::spawn(
+      &mut Command::new(current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", "single-pumping-window")
+        .env("GLAZEWM_Z_ORDER_TOPMOST", if topmost { "1" } else { "0" })
+        .env(
+          "GLAZEWM_Z_ORDER_NO_ACTIVATE",
+          if no_activate { "1" } else { "0" },
+        )
+        .env("GLAZEWM_Z_ORDER_DELAY_MS", delay_ms.to_string())
+        .arg("z_order_test_helper_single_pumping_window")
+        .arg("--nocapture")
+        .stdout(Stdio::piped()),
+    )
+    .expect("spawn single pumping window helper");
+    let hwnd =
+      read_helper_hwnd(&mut helper, "GLAZEWM_Z_ORDER_SINGLE_HWND:");
+    (helper, hwnd)
   }
 
   #[test]
@@ -4913,6 +5153,7 @@ mod reorder_z_order_tests {
       &[],
       ZOrderIntent::Promote,
       &[WindowId(peer.0), WindowId(second_peer.0)],
+      &[],
     )
     .expect("promote foreign normal peers below the topmost band");
     assert_foreign_z_order_converges(&[topmost, peer, second_peer]);
@@ -4931,6 +5172,7 @@ mod reorder_z_order_tests {
       &[],
       ZOrderIntent::Promote,
       &[WindowId(second_peer.0), WindowId(peer.0)],
+      &[],
     )
     .expect("reverse normal peers without moving the topmost HWND");
     assert_foreign_z_order_converges(&[topmost, second_peer, peer]);
@@ -5174,7 +5416,6 @@ mod reorder_z_order_tests {
     layered: bool,
   ) -> HungStyleOutcome {
     use std::{
-      io::{BufRead, BufReader},
       process::{Command, Stdio},
       time::{Duration, Instant},
     };
@@ -5185,26 +5426,18 @@ mod reorder_z_order_tests {
     } else {
       ("z_order_test_helper_window", "window")
     };
-    let mut window_helper = Command::new(&current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", helper_kind)
-      .env("GLAZEWM_HELPER_STOP", stop)
-      .env("GLAZEWM_HELPER_LAYERED", if layered { "1" } else { "0" })
-      .arg(helper_test)
-      .arg("--nocapture")
-      .stdout(Stdio::piped())
-      .spawn()
-      .expect("spawn non-pumping window helper");
-    let stdout = window_helper.stdout.take().expect("helper stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let hwnd = loop {
-      let line = lines
-        .next()
-        .expect("window helper HWND")
-        .expect("read window helper HWND");
-      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
-        break hwnd.parse::<isize>().expect("parse window helper HWND");
-      }
-    };
+    let mut window_helper = TestChild::spawn(
+      &mut Command::new(&current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", helper_kind)
+        .env("GLAZEWM_HELPER_STOP", stop)
+        .env("GLAZEWM_HELPER_LAYERED", if layered { "1" } else { "0" })
+        .arg(helper_test)
+        .arg("--nocapture")
+        .stdout(Stdio::piped()),
+    )
+    .expect("spawn non-pumping window helper");
+    let hwnd =
+      read_helper_hwnd(&mut window_helper, "GLAZEWM_Z_ORDER_HWND:").0;
     if stop == "suspend" || stop == "style-stall" {
       // Suspend: the HWND line is printed just before SuspendThread.
       // Style stall: the stall is armed before the HWND line, and the
@@ -5222,17 +5455,23 @@ mod reorder_z_order_tests {
       "set-title-bar" if stop == "sleep" && !layered => {
         ("hung_style_helper_set_title_bar", mode)
       }
+      "set-transparency-after-style-stall"
+        if stop == "style-stall" && layered =>
+      {
+        ("foreign_hwnd_call", mode)
+      }
       _ => ("foreign_hwnd_call", "foreign-call"),
     };
-    let mut style_call = Command::new(&current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", helper_mode_name)
-      .env("GLAZEWM_FOREIGN_OP", mode)
-      .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
-      .arg(test_name)
-      .arg("--nocapture")
-      .stdout(Stdio::null())
-      .spawn()
-      .expect("spawn hung style caller");
+    let mut style_call = TestChild::spawn(
+      &mut Command::new(&current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", helper_mode_name)
+        .env("GLAZEWM_FOREIGN_OP", mode)
+        .env("GLAZEWM_Z_ORDER_HWND", hwnd.to_string())
+        .arg(test_name)
+        .arg("--nocapture")
+        .stdout(Stdio::null()),
+    )
+    .expect("spawn hung style caller");
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let completed = loop {
@@ -5322,6 +5561,17 @@ mod reorder_z_order_tests {
         window
           .set_transparency(&OpacityValue::from_alpha(u8::MAX))
           .expect("set opaque transparency");
+      }
+      "set-transparency-after-style-stall" => {
+        // Start a worker that stalls in WM_STYLECHANGING, then publish a
+        // newer alpha while that same worker is blocked. The alpha must
+        // not change until the stalled style call returns.
+        window
+          .set_title_bar_visibility(false)
+          .expect("start stalled title-bar style write");
+        window
+          .set_transparency(&OpacityValue::from_alpha(180))
+          .expect("publish alpha behind stalled style write");
       }
       "set-title-bar" => {
         window
@@ -5549,8 +5799,11 @@ mod reorder_z_order_tests {
 
   #[test]
   fn layered_attributes_stay_bounded_during_style_stall() {
-    let outcome =
-      assert_stopped_style_call("set-transparency", "style-stall", true);
+    let outcome = assert_stopped_style_call(
+      "set-transparency-after-style-stall",
+      "style-stall",
+      true,
+    );
     assert!(outcome.layered);
     assert_eq!(
       outcome.alpha,
@@ -5562,7 +5815,7 @@ mod reorder_z_order_tests {
   /// Foreign window that blocks sent messages until
   /// [`ResumeGate::release`].
   struct ResumeGate {
-    helper: std::process::Child,
+    helper: TestChild,
     hwnd: isize,
     event: windows::Win32::Foundation::HANDLE,
   }
@@ -5590,7 +5843,6 @@ mod reorder_z_order_tests {
   /// Spawns a pumping foreign window whose sent messages wait on an event.
   fn spawn_resume_gate(layered: bool) -> ResumeGate {
     use std::{
-      io::{BufRead, BufReader},
       process::{Command, Stdio},
       sync::atomic::{AtomicU64, Ordering},
       time::Duration,
@@ -5614,26 +5866,17 @@ mod reorder_z_order_tests {
     assert_ne!(event, HANDLE::default(), "resume event handle");
 
     let current_exe = std::env::current_exe().expect("test executable");
-    let mut helper = Command::new(current_exe)
-      .env("GLAZEWM_Z_ORDER_HELPER", "resume-gate")
-      .env("GLAZEWM_RESUME_EVENT", &name)
-      .env("GLAZEWM_HELPER_LAYERED", if layered { "1" } else { "0" })
-      .arg("resume_gate_helper_window")
-      .arg("--nocapture")
-      .stdout(Stdio::piped())
-      .spawn()
-      .expect("spawn resume-gate helper");
-    let stdout = helper.stdout.take().expect("helper stdout");
-    let mut lines = BufReader::new(stdout).lines();
-    let hwnd = loop {
-      let line = lines
-        .next()
-        .expect("resume-gate HWND")
-        .expect("read resume-gate HWND");
-      if let Some(hwnd) = line.strip_prefix("GLAZEWM_Z_ORDER_HWND:") {
-        break hwnd.parse::<isize>().expect("parse resume-gate HWND");
-      }
-    };
+    let mut helper = TestChild::spawn(
+      &mut Command::new(current_exe)
+        .env("GLAZEWM_Z_ORDER_HELPER", "resume-gate")
+        .env("GLAZEWM_RESUME_EVENT", &name)
+        .env("GLAZEWM_HELPER_LAYERED", if layered { "1" } else { "0" })
+        .arg("resume_gate_helper_window")
+        .arg("--nocapture")
+        .stdout(Stdio::piped()),
+    )
+    .expect("spawn resume-gate helper");
+    let hwnd = read_helper_hwnd(&mut helper, "GLAZEWM_Z_ORDER_HWND:").0;
     // The HWND line is printed after the gate is armed and before the
     // pump.
     std::thread::sleep(Duration::from_millis(100));

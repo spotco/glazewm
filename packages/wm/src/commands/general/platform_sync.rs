@@ -580,6 +580,12 @@ fn reconcile_workspace_stack(
     }
   }
 
+  let managed_normal_band: std::collections::HashSet<WindowId> = tiled_ids
+    .iter()
+    .chain(detached_ids.iter())
+    .copied()
+    .collect();
+
   let workspace_monitor_id =
     workspace.monitor().map(|monitor| monitor.id());
   let ignored = state
@@ -636,6 +642,26 @@ fn reconcile_workspace_stack(
       }
     }
   }
+
+  let demote_topmost_ids: Vec<WindowId> = workspace
+    .descendant_focus_order()
+    .filter_map(|container| container.as_window_container().ok())
+    .filter(|window| {
+      matches!(
+        window.display_state(),
+        DisplayState::Showing | DisplayState::Shown
+      ) && !state.is_show_desktop_minimized(window.id())
+        && window.native().identity_is_current()
+    })
+    .filter(|window| match window.state() {
+      WindowState::Tiling => true,
+      WindowState::Floating(config) => !config.shown_on_top,
+      _ => false,
+    })
+    .filter(|window| managed_normal_band.contains(&window.native().id()))
+    .filter(|window| window.native().debug_info().is_topmost == Some(true))
+    .map(|window| window.native().id())
+    .collect();
 
   let all_ids = tiled_ids
     .iter()
@@ -754,6 +780,7 @@ fn reconcile_workspace_stack(
     &tiled_ids,
     request,
     &promoted_atom_ids,
+    &demote_topmost_ids,
   ) {
     Ok(outcome) => (
       None,

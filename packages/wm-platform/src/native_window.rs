@@ -112,12 +112,14 @@ pub fn reconcile_z_order(
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &[WindowId],
 ) -> crate::Result<ZOrderReconcileOutcome> {
   platform_impl::reconcile_z_order(
     window_ids,
     tiled_window_ids,
     intent,
     promoted_atom_ids,
+    demote_topmost_ids,
   )
 }
 
@@ -133,6 +135,7 @@ pub fn reconcile_z_order_for_workspace(
   tiled_window_ids: &[WindowId],
   intent: ZOrderIntent,
   promoted_atom_ids: &[WindowId],
+  demote_topmost_ids: &[WindowId],
 ) -> crate::Result<ZOrderReconcileOutcome> {
   platform_impl::reconcile_z_order_for_workspace(
     workspace_scope,
@@ -140,6 +143,7 @@ pub fn reconcile_z_order_for_workspace(
     tiled_window_ids,
     intent,
     promoted_atom_ids,
+    demote_topmost_ids,
   )
 }
 

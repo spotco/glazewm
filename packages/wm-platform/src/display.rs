@@ -317,17 +317,26 @@ mod tests {
     let (event_loop, dispatcher) = EventLoop::new().unwrap();
 
     let thread = std::thread::spawn(move || {
-      let display = platform_impl::nearest_display(
-        // Assumes that there is at least one window currently visible.
-        &dispatcher.visible_windows().unwrap()[0],
-        &dispatcher,
-      );
-      dispatcher.stop_event_loop().unwrap();
+      let display =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          let windows =
+            dispatcher.visible_windows().expect("visible windows");
+          // A non-interactive session can have no visible windows.
+          // Indexing an empty list panics before the loop is stopped,
+          // and `EventLoop::run` then waits forever.
+          windows.first().map(|window| {
+            platform_impl::nearest_display(window, &dispatcher)
+          })
+        }));
+      let _ = dispatcher.stop_event_loop();
       display
     });
 
     event_loop.run().unwrap();
-    let display = thread.join().unwrap();
-    assert!(display.is_ok());
+    match thread.join().expect("nearest display thread") {
+      Ok(Some(display)) => assert!(display.is_ok()),
+      Ok(None) => {}
+      Err(payload) => std::panic::resume_unwind(payload),
+    }
   }
 }
