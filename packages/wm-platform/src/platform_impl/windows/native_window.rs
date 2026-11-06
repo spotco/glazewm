@@ -1952,7 +1952,7 @@ fn window_still_has_topmost_bit_after_demote(
 fn demote_pending_managed_topmost(
   demote_set: &HashSet<WindowId>,
   window_ids: &[WindowId],
-) -> crate::Result<(usize, usize)> {
+) -> (usize, usize) {
   let flags = SWP_NOACTIVATE
     | SWP_NOCOPYBITS
     | SWP_NOMOVE
@@ -1975,7 +1975,7 @@ fn demote_pending_managed_topmost(
       Err(_) => skipped += 1,
     }
   }
-  Ok((native_writes, skipped))
+  (native_writes, skipped)
 }
 
 fn native_window_is_owned_by_tiled_group(
@@ -2910,7 +2910,7 @@ fn apply_z_order_request(
   demote_topmost_ids: &HashSet<WindowId>,
 ) -> crate::Result<ZOrderApplyResult> {
   let (demote_writes, demote_skipped) =
-    demote_pending_managed_topmost(demote_topmost_ids, window_ids)?;
+    demote_pending_managed_topmost(demote_topmost_ids, window_ids);
   let no_pending_demote_bits = !window_ids.iter().any(|window_id| {
     window_still_has_topmost_bit_after_demote(
       *window_id,
