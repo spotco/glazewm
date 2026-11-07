@@ -4092,6 +4092,138 @@ mod reorder_z_order_tests {
     }
   }
 
+  /// An app-set topmost floater must leave the topmost band while a
+  /// different managed tile is promoted above it.
+  #[test]
+  fn demote_set_preserves_tile_promotion_when_floater_sets_topmost() {
+    let class_name =
+      wide(&format!("GlazeWmPromoteAppTopmost{}", std::process::id()));
+    let class = WNDCLASSW {
+      lpfnWndProc: Some(reorder_test_wnd_proc),
+      lpszClassName: PCWSTR(class_name.as_ptr()),
+      ..Default::default()
+    };
+    let atom = unsafe { RegisterClassW(&raw const class) };
+    assert_ne!(atom, 0, "register app-topmost promotion class");
+
+    // Hidden fixtures participate in native z-order without being adopted
+    // or focused by a GlazeWM instance already running on this desktop.
+    let tile_a = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Promote Tile A",
+      false,
+      None,
+    );
+    let tile_b = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Promote Tile B",
+      false,
+      None,
+    );
+    let studio_like = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Promote App Floater",
+      false,
+      None,
+    );
+    let peer = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Promote Peer",
+      false,
+      None,
+    );
+    let explicit_topmost = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Promote Explicit Topmost",
+      true,
+      None,
+    );
+    let unrelated_topmost = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Promote Unrelated Topmost",
+      true,
+      None,
+    );
+
+    let tiles = [WindowId(tile_a.0), WindowId(tile_b.0)];
+    let initial_order = [
+      WindowId(studio_like.0),
+      WindowId(tile_a.0),
+      WindowId(tile_b.0),
+      WindowId(peer.0),
+    ];
+    let all_windows = [
+      WindowId(tile_a.0),
+      WindowId(tile_b.0),
+      WindowId(studio_like.0),
+      WindowId(peer.0),
+    ];
+
+    reconcile_z_order(
+      &initial_order,
+      &tiles,
+      ZOrderIntent::Preserve,
+      &[],
+      &[],
+    )
+    .expect("seed the chain with the floater above the tiles");
+    wait_for_relative_order(
+      &[studio_like, tile_a, tile_b, peer],
+      &[studio_like.0, tile_a.0, tile_b.0, peer.0],
+    );
+
+    super::NativeWindow::new(studio_like.0)
+      .set_z_order(&WindowZOrder::TopMost)
+      .expect("app sets managed floater topmost");
+    assert!(super::native_window_is_topmost(WindowId(studio_like.0)));
+
+    let demote = [WindowId(studio_like.0)];
+    let promoted_tiles = [WindowId(tile_a.0), WindowId(tile_b.0)];
+    let outcome = reconcile_z_order(
+      &all_windows,
+      &tiles,
+      ZOrderIntent::Promote,
+      &promoted_tiles,
+      &demote,
+    )
+    .expect(
+      "demote the app topmost floater while promoting the tile group",
+    );
+
+    assert_eq!(outcome.skipped_windows, 0);
+    assert!(!outcome.retry_scheduled);
+    wait_for_relative_order(
+      &[tile_a, tile_b, studio_like, peer],
+      &[tile_a.0, tile_b.0, studio_like.0, peer.0],
+    );
+    assert!(
+      !super::native_window_is_topmost(WindowId(studio_like.0)),
+      "managed normal-band floater must be demoted during promotion",
+    );
+    assert!(
+      super::native_window_is_topmost(WindowId(explicit_topmost.0)),
+      "explicit topmost HWND must remain topmost",
+    );
+    assert!(
+      super::native_window_is_topmost(WindowId(unrelated_topmost.0)),
+      "unrelated topmost HWND must remain topmost",
+    );
+
+    unsafe {
+      for hwnd in [
+        tile_a,
+        tile_b,
+        studio_like,
+        peer,
+        explicit_topmost,
+        unrelated_topmost,
+      ] {
+        let _ = DestroyWindow(hwnd);
+      }
+      let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);
+    }
+  }
+
   #[test]
   #[allow(clippy::too_many_lines)] // Exercise several real HWND lifecycle
                                    // transitions in order.

@@ -2,7 +2,8 @@
 
 Date: 2026-11-06
 
-Status: R1–R7 review fixes are implemented; local and remote Windows validation pass.
+Status: R1–R7 and F1–F3 review follow-ups are implemented; local and remote
+Windows validation pass.
 
 ## Symptoms
 
@@ -56,35 +57,45 @@ occurs.
 ## Coverage and validation
 
 Platform tests cover a managed normal-band HWND that has set
-`WS_EX_TOPMOST`, its owned dialog, an explicit topmost HWND, an unrelated
-topmost HWND, and recovery of a suspended HWND after it resumes. The synthetic
-fixtures are hidden so a running GlazeWM instance cannot adopt or focus them.
+`WS_EX_TOPMOST`, its owned dialog, tile promotion while a different floater is
+demoted, an explicit topmost HWND, an unrelated topmost HWND, and recovery of a
+suspended HWND after it resumes. The synthetic fixtures are hidden so a
+running GlazeWM instance cannot adopt or focus them.
 The selector test covers tiled and regular floating windows and excludes
 `shown_on_top`, ignored, stale, show-desktop-minimized, and nonvisible windows.
 The real Roblox Studio scenario was not evaluated: Roblox Studio was not
 running on the VM. The display test also handles sessions with no visible
 windows without leaving its event loop running.
 
-Validation completed:
+## Second-review follow-up validation
+
+The previous response recorded pre-follow-up VM runs
+`20261107T032104Z-1b8788a5` and `20261107T032218Z-4c3a851c`. Those validate
+the earlier R1–R7 tree, not the F1–F3 follow-up. The runs below include the
+added Promote regression and are the current follow-up evidence:
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo clippy --all-targets --all-features -- -D warnings` — passed.
-  Log: `Temp/pr18-final-clippy.log`.
-- `python -m unittest scripts.test_remote_tests` — 9 passed, including
-  continuous-output and descendant-process timeout probes plus remote-marker
-  disagreement cases. Log:
-  `Temp/pr18-final-runner-tests.log`.
-- `cargo test --workspace -- --test-threads=1` — passed locally (267 passed,
-  15 ignored). Log: `Temp/pr18-final-local-workspace-tests.log`.
-- Filtered remote run `hung_hwnd_rejoins_after_suspend_past_early_recovery_window`
-  — 1 executable and 1 test case passed. Log: `Temp/remote-tests/20261107T032104Z-1b8788a5`.
-- Full remote workspace run — 16 executable passes, 0 failures, 0 no-match
-  skips; 255 test cases passed, 0 failed, and 13 ignored. The active console
-  session matched the worker session and reported one monitor for every run.
-  Log: `Temp/remote-tests/20261107T032218Z-4c3a851c`.
-- A deliberately unmatched filter recorded `zero_match_failure: true`, skipped
-  its sole executable, and made no remote run. Log:
-  `Temp/remote-tests/20261107T032045Z-3ba196e0`.
+- `cargo clippy --all-targets --all-features -- -D warnings` — passed with no
+  Clippy errors; existing manifest/dependency warnings remain. Log:
+  `Temp/pr18-second-review-clippy.log`.
+- `python -m unittest scripts.test_remote_tests -v` — 9 passed, including
+  continuous-output and descendant-process timeout probes. Log:
+  `Temp/pr18-second-review-python-tests.log`.
+- Focused local Promote regression — 1 passed:
+  `cargo test -p wm-platform --test test demote_set_preserves_tile_promotion_when_floater_sets_topmost -- --exact --nocapture --test-threads=1`.
+- `cargo test --workspace -- --test-threads=1` — 268 passed, 0 failed,
+  15 ignored. Log: `Temp/pr18-second-review-local-workspace.log`.
+- Focused VM run with `--package wm-platform --filter demote_set_` — 1
+  executable passed, 2 test cases passed, 0 failed. Log:
+  `Temp/remote-tests/20261107T040254Z-8eaf0094`.
+- Full VM workspace run — 16/16 executables passed, 256 test cases passed,
+  0 failed, 13 ignored. All 16 session checks matched the active console
+  session and reported one visible monitor; all 38 transfers completed. Binaries
+  were built locally and uploaded. Log:
+  `Temp/remote-tests/20261107T040315Z-6a88121c`.
+- The Windows test-matrix workflow now runs
+  `python -m unittest scripts.test_remote_tests -v` under Python 3.12. GitHub
+  CI for the follow-up commit is recorded in the response handoff.
 
 Runnable Rustdoc examples ran remotely. `compile_fail` and `no_run` examples
 were checked during the runner's local Rustdoc build and were not launched as
