@@ -8,10 +8,12 @@ The machine-specific connection settings live in the ignored root
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -19,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -497,6 +500,122 @@ def compile_test_binaries(
     return artifacts
 
 
+def compile_doctest_binaries(
+    package: str | None,
+    logger: RunLog,
+    run_dir: Path,
+    *,
+    timeout: int,
+) -> list[TestArtifact]:
+    """Persist locally built doctest executables so they can run on the host."""
+    persist_dir = run_dir / "doctest-binaries"
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    encoded_flags = env.get("CARGO_ENCODED_RUSTDOCFLAGS")
+    if encoded_flags:
+        rustdoc_flags = encoded_flags.split("\x1f")
+    else:
+        rustdoc_flags = shlex.split(
+            env.get("RUSTDOCFLAGS", ""), posix=os.name != "nt"
+        )
+    rustdoc_flags.extend(
+        [
+            "-Z",
+            "unstable-options",
+            "--persist-doctests",
+            str(persist_dir.resolve()),
+            "--no-run",
+        ]
+    )
+    env["CARGO_ENCODED_RUSTDOCFLAGS"] = "\x1f".join(rustdoc_flags)
+
+    command = ["cargo", "test"]
+    if package:
+        command.extend(["--package", package])
+    else:
+        command.append("--workspace")
+    command.append("--doc")
+    logger.write("[doctest-build] " + " ".join(command))
+    code = stream_local_process(
+        command,
+        env=env,
+        timeout=timeout,
+        label="doctest-build",
+        logger=logger,
+        mirror=run_dir / "doctest-build.log",
+        cwd=PROJECT_ROOT,
+    )
+    if code != 0:
+        raise RunnerError(f"Cargo doctest build failed with exit code {code}.")
+
+    executables = sorted(
+        persist_dir.rglob("*.exe"), key=lambda path: path.as_posix().casefold()
+    )
+    artifacts: list[TestArtifact] = []
+    for executable in executables:
+        if is_compile_only_doctest(executable):
+            logger.write(
+                f"[doctest-build] skipping compile-only example: "
+                f"{executable.parent.name}"
+            )
+            continue
+        artifacts.append(
+            TestArtifact(
+                package="doctest",
+                target=executable.parent.relative_to(persist_dir).as_posix(),
+                executable=executable,
+            )
+        )
+    logger.write(
+        f"[doctest-build] Cargo exited 0; persisted "
+        f"{len(artifacts)} doctest executables"
+    )
+    return artifacts
+
+
+def is_compile_only_doctest(executable: Path) -> bool:
+    """Identify `no_run` doctests whose persisted snippet must not be executed."""
+    match = re.fullmatch(r"(.+)_([0-9]+)_([0-9]+)", executable.parent.name)
+    if not match:
+        return False
+
+    source_id, line_number = match.group(1), int(match.group(2))
+    packages_dir = PROJECT_ROOT / "packages"
+    if not packages_dir.is_dir():
+        return False
+
+    for source in packages_dir.rglob("*.rs"):
+        normalized = re.sub(
+            r"[^A-Za-z0-9]+", "_", source.relative_to(PROJECT_ROOT).as_posix()
+        ).strip("_")
+        if normalized != source_id:
+            continue
+        lines = source.read_text(encoding="utf-8").splitlines()
+        if 0 < line_number <= len(lines):
+            return "no_run" in lines[line_number - 1]
+    return False
+
+
+def clean_remote_output_line(line: str) -> str | None:
+    """Drop PowerShell's serialized progress chatter while preserving errors."""
+    if line.strip() == "#< CLIXML":
+        return None
+    if not line.lstrip().startswith("<Objs "):
+        return line
+    try:
+        root = ET.fromstring(line)
+    except ET.ParseError:
+        return line
+    records = [
+        element
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "Obj"
+    ]
+    if records and all(record.get("S") == "progress" for record in records):
+        return None
+    return line
+
+
 def pe_imports(path: Path) -> list[str]:
     """Read imported DLL names from a PE32/PE32+ image using the stdlib only."""
 
@@ -755,30 +874,207 @@ def copy_file(
     )
 
 
-def remote_test_command(executable: str, args: list[str], remote_log: str) -> str:
-    command = " ".join(powershell_quote(arg) for arg in args)
-    invoke = f"& {powershell_quote(executable)}"
-    if command:
-        invoke += " " + command
-    script = (
-        f"{invoke} 2>&1 | Tee-Object -LiteralPath {powershell_quote(remote_log)}; "
-        "$testExitCode = $LASTEXITCODE; "
-        f"Write-Output ('{EXIT_MARKER}' + $testExitCode); "
-        "exit $testExitCode"
+def remote_test_task_script(
+    executable: str,
+    args: list[str],
+    remote_log: str,
+    task_name: str,
+    timeout: int,
+    *,
+    rustdoc_harness: bool = False,
+) -> str:
+    """Create a PowerShell controller/worker pair for the active console."""
+    exit_path = remote_log + ".exit"
+    args_literal = ", ".join(powershell_quote(arg) for arg in args)
+    rustdoc_harness_literal = "$true" if rustdoc_harness else "$false"
+    return f'''param([switch]$Worker)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$testExecutable = {powershell_quote(executable)}
+$testArguments = @({args_literal})
+$testLogPath = {powershell_quote(remote_log)}
+$testExitPath = {powershell_quote(exit_path)}
+$taskName = {powershell_quote(task_name)}
+$testTimeoutSeconds = {timeout}
+$rustdocHarness = {rustdoc_harness_literal}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class GlazeRemoteTestSession {{
+  [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+  [DllImport("wtsapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  public static extern bool WTSQuerySessionInformation(IntPtr server, uint sessionId, int infoClass, out IntPtr buffer, out int bytes);
+  [DllImport("wtsapi32.dll")] public static extern void WTSFreeMemory(IntPtr buffer);
+  public static string QueryString(uint id, int infoClass) {{
+    IntPtr p; int n;
+    if (!WTSQuerySessionInformation(IntPtr.Zero, id, infoClass, out p, out n)) throw new System.ComponentModel.Win32Exception();
+    try {{ return Marshal.PtrToStringUni(p); }} finally {{ WTSFreeMemory(p); }}
+  }}
+  public static int QueryInt(uint id, int infoClass) {{
+    IntPtr p; int n;
+    if (!WTSQuerySessionInformation(IntPtr.Zero, id, infoClass, out p, out n)) throw new System.ComponentModel.Win32Exception();
+    try {{ return Marshal.ReadInt32(p); }} finally {{ WTSFreeMemory(p); }}
+  }}
+}}
+"@
+
+function Read-RemoteTestLogLines([string]$path) {{
+  $stream = [System.IO.FileStream]::new(
+    $path,
+    [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Read,
+    [System.IO.FileShare]::ReadWrite
+  )
+  try {{
+    $reader = [System.IO.StreamReader]::new(
+      $stream, [System.Text.UTF8Encoding]::new($false), $true
     )
-    return (
-        "powershell.exe -NoProfile -NonInteractive -Command "
-        f"\"{script}\""
+    try {{
+      $lines = [System.Collections.Generic.List[string]]::new()
+      while ($null -ne ($line = $reader.ReadLine())) {{ $lines.Add($line) }}
+      return $lines.ToArray()
+    }} finally {{ $reader.Dispose() }}
+  }} finally {{ $stream.Dispose() }}
+}}
+
+if ($Worker) {{
+  $writer = $null
+  $testExitCode = 125
+  try {{
+    $writer = [System.IO.StreamWriter]::new(
+      $testLogPath, $false, [System.Text.UTF8Encoding]::new($false)
     )
+    $sessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    $consoleSessionId = [GlazeRemoteTestSession]::WTSGetActiveConsoleSessionId()
+    $monitorCount = [GlazeRemoteTestSession]::GetSystemMetrics(80)
+    $writer.AutoFlush = $true
+    $writer.WriteLine("[session] process=$sessionId active_console=$consoleSessionId monitors=$monitorCount")
+    if ($consoleSessionId -eq [uint32]::MaxValue -or $sessionId -ne $consoleSessionId) {{
+      throw "Test task did not start in the active console session (process=$sessionId, console=$consoleSessionId)."
+    }}
+    if ($monitorCount -lt 1) {{
+      throw "The active console session has no visible monitors (session=$sessionId)."
+    }}
+    if ($rustdocHarness) {{
+      $env:RUSTDOC_DOCTEST_BIN_PATH = $testExecutable
+    }}
+    & $testExecutable @testArguments 2>&1 | ForEach-Object {{ $writer.WriteLine($_.ToString()) }}
+    $testExitCode = $LASTEXITCODE
+  }} catch {{
+    if ($null -ne $writer) {{ $writer.WriteLine("ERROR: $_") }}
+    $testExitCode = 125
+  }} finally {{
+    if ($null -ne $writer) {{ $writer.Dispose() }}
+    [System.IO.File]::WriteAllText($testExitPath, [string]$testExitCode)
+  }}
+  exit $testExitCode
+}}
+
+$finalExitCode = 125
+$taskRegistered = $false
+try {{
+  $sessionId = [GlazeRemoteTestSession]::WTSGetActiveConsoleSessionId()
+  if ($sessionId -eq [uint32]::MaxValue) {{
+    throw 'No active Windows console session was found for GUI tests.'
+  }}
+  $sessionState = [GlazeRemoteTestSession]::QueryInt($sessionId, 8)
+  if ($sessionState -ne 0) {{
+    throw "The active Windows console session is disconnected (session=$sessionId, state=$sessionState)."
+  }}
+  $domain = [GlazeRemoteTestSession]::QueryString($sessionId, 7)
+  $user = [GlazeRemoteTestSession]::QueryString($sessionId, 5)
+  if ([string]::IsNullOrWhiteSpace($user)) {{
+    throw "No logged-on user was found in the active console session (session=$sessionId)."
+  }}
+  $userSid = (New-Object System.Security.Principal.NTAccount($domain, $user)).Translate(
+    [System.Security.Principal.SecurityIdentifier]
+  ).Value
+  Write-Output "[session] using active console session $sessionId for the test desktop"
+  foreach ($path in @($testLogPath, $testExitPath)) {{
+    if (Test-Path -LiteralPath $path) {{ Remove-Item -LiteralPath $path -Force }}
+  }}
+  $powerShell = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+  $workerArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Worker"
+  $action = New-ScheduledTaskAction -Execute $powerShell -Argument $workerArguments
+  $principal = New-ScheduledTaskPrincipal -UserId $userSid -LogonType Interactive -RunLevel Limited
+  $settings = New-ScheduledTaskSettingsSet `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds $testTimeoutSeconds) `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+  Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+  $taskRegistered = $true
+  Start-ScheduledTask -TaskName $taskName
+
+  $sentLineCount = 0
+  $deadline = (Get-Date).AddSeconds($testTimeoutSeconds)
+  while (-not (Test-Path -LiteralPath $testExitPath)) {{
+    if (Test-Path -LiteralPath $testLogPath) {{
+      $lines = @(Read-RemoteTestLogLines $testLogPath)
+      while ($sentLineCount -lt $lines.Length) {{
+        Write-Output $lines[$sentLineCount]
+        $sentLineCount++
+      }}
+    }}
+    if ((Get-Date) -ge $deadline) {{
+      throw "Interactive test exceeded its $testTimeoutSeconds second timeout."
+    }}
+    Start-Sleep -Milliseconds 250
+  }}
+  if (Test-Path -LiteralPath $testLogPath) {{
+    $lines = @(Read-RemoteTestLogLines $testLogPath)
+    while ($sentLineCount -lt $lines.Length) {{
+      Write-Output $lines[$sentLineCount]
+      $sentLineCount++
+    }}
+  }}
+  $exitText = [System.IO.File]::ReadAllText($testExitPath).Trim()
+  if (-not [int]::TryParse($exitText, [ref]$finalExitCode)) {{
+    throw "The interactive test returned an invalid exit code: $exitText"
+  }}
+}} catch {{
+  Write-Output "ERROR: $_"
+  $finalExitCode = 125
+}} finally {{
+  if ($taskRegistered) {{
+    try {{
+      $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+      if ($null -ne $task -and $task.State -eq 'Running') {{
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+      }}
+      Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }} catch {{ Write-Output "[cleanup] could not remove interactive task: $_" }}
+  }}
+}}
+Write-Output ('{EXIT_MARKER}' + $finalExitCode)
+exit $finalExitCode
+'''
+
+
+def remote_test_command(remote_script: str) -> str:
+    invocation = f"& {powershell_quote(remote_script)}"
+    encoded = base64.b64encode(invocation.encode("utf-16le")).decode("ascii")
+    return f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
 
 
 def kill_remote_tree(
-    connection: RemoteConnection, image_name: str, *, timeout: int, logger: RunLog
+    connection: RemoteConnection,
+    image_name: str,
+    task_name: str,
+    *,
+    timeout: int,
+    logger: RunLog,
 ) -> None:
     command = (
         "powershell.exe -NoProfile -NonInteractive -Command "
         f"\"taskkill.exe /IM {powershell_quote(image_name)} /T /F "
-        "2>$null | Out-Null; exit 0\""
+        "2>$null | Out-Null; "
+        f"$task = Get-ScheduledTask -TaskName {powershell_quote(task_name)} "
+        "-ErrorAction SilentlyContinue; "
+        "if ($task) { Stop-ScheduledTask -TaskName $task.TaskName "
+        "-ErrorAction SilentlyContinue; Unregister-ScheduledTask "
+        "-TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue }; "
+        "exit 0\""
     )
     try:
         result = connection.run_capture(command, timeout=timeout)
@@ -794,7 +1090,8 @@ def run_remote_test(
     executable: str,
     image_name: str,
     args: list[str],
-    remote_log: str,
+    remote_script: str,
+    task_name: str,
     *,
     timeout: int,
     index: int,
@@ -803,7 +1100,7 @@ def run_remote_test(
     logger: RunLog,
 ) -> int:
     label = f"test {index}/{total} {Path(executable).name}"
-    command = remote_test_command(executable, args, remote_log)
+    command = remote_test_command(remote_script)
     test_filter = next(
         (argument for argument in args if not argument.startswith("--")),
         "all tests",
@@ -847,7 +1144,9 @@ def run_remote_test(
                     remote_exit = 125
                 logger.write(f"[{label}] remote exit code {remote_exit}")
             else:
-                logger.write(f"[{label}] {line}", mirror=local_log)
+                readable_line = clean_remote_output_line(line)
+                if readable_line is not None:
+                    logger.write(f"[{label}] {readable_line}", mirror=local_log)
             last_output = time.monotonic()
         except queue.Empty:
             if process.poll() is not None:
@@ -856,7 +1155,13 @@ def run_remote_test(
             if elapsed >= timeout:
                 timed_out = True
                 logger.write(f"[{label}] timed out after {timeout}s; killing remote tree")
-                kill_remote_tree(connection, image_name, timeout=30, logger=logger)
+                kill_remote_tree(
+                    connection,
+                    image_name,
+                    task_name,
+                    timeout=30,
+                    logger=logger,
+                )
                 process.kill()
                 break
             if time.monotonic() - last_output >= 5:
@@ -962,9 +1267,20 @@ def main() -> int:
             artifacts = compile_test_binaries(
                 args.package, logger, run_dir, timeout=build_timeout
             )
+            if args.test_filter:
+                logger.write(
+                    "[doctest-build] skipped because --filter selects named "
+                    "unit/integration tests"
+                )
+            else:
+                artifacts.extend(
+                    compile_doctest_binaries(
+                        args.package, logger, run_dir, timeout=build_timeout
+                    )
+                )
             dependencies = runtime_dlls(artifacts)
             logger.write(
-                f"[run] built {len(artifacts)} test executables and found "
+                f"[run] built {len(artifacts)} test and doctest executables and found "
                 f"{len(dependencies)} non-system runtime DLLs; no remote connection used"
             )
             for dependency in dependencies:
@@ -975,6 +1291,17 @@ def main() -> int:
         artifacts = compile_test_binaries(
             args.package, logger, run_dir, timeout=build_timeout
         )
+        if args.test_filter:
+            logger.write(
+                "[doctest-build] skipped because --filter selects named "
+                "unit/integration tests"
+            )
+        else:
+            artifacts.extend(
+                compile_doctest_binaries(
+                    args.package, logger, run_dir, timeout=build_timeout
+                )
+            )
         dependencies = runtime_dlls(artifacts)
         logger.write(f"[build] found {len(dependencies)} non-system runtime DLL dependencies")
 
@@ -1001,17 +1328,58 @@ def main() -> int:
                 + (prepared.stderr or prepared.stdout or f"exit {prepared.returncode}")
             )
 
+        test_threads = args.test_threads
+        if test_threads is None:
+            test_threads = int(config.get("test_threads", 1))
+        if test_threads < 1:
+            raise RunnerError("test-threads must be at least 1.")
+        test_args = []
+        if args.test_filter:
+            test_args.append(args.test_filter)
+        test_args.append(f"--test-threads={test_threads}")
+
         uploads: list[tuple[Path, str]] = []
-        remote_executables: list[tuple[TestArtifact, str, str]] = []
+        remote_executables: list[tuple[TestArtifact, str, str, str, str, str]] = []
         for index, artifact in enumerate(artifacts, start=1):
             remote_name = f"{run_id}-test-{index:02d}.exe"
             remote_executable = remote_path_join(remote_run_dir, remote_name)
             uploads.append((artifact.executable, remote_executable))
             image_name = remote_name
             remote_log = remote_path_join(remote_run_dir, f"test-{index:02d}.log")
-            remote_executables.append((artifact, remote_executable, image_name))
+            remote_script = remote_path_join(
+                remote_run_dir, f"test-{index:02d}-interactive.ps1"
+            )
+            task_name = f"GlazeWMRemoteTest-{run_id}-{index:02d}"
+            local_script = run_dir / "remote-scripts" / f"test-{index:02d}.ps1"
+            local_script.parent.mkdir(parents=True, exist_ok=True)
+            local_script.write_text(
+                remote_test_task_script(
+                    remote_executable,
+                    test_args,
+                    remote_log,
+                    task_name,
+                    test_timeout,
+                    rustdoc_harness=(
+                        artifact.package == "doctest"
+                        and artifact.target.startswith("merged_doctest_")
+                    ),
+                ),
+                encoding="utf-8",
+            )
+            uploads.append((local_script, remote_script))
+            remote_executables.append(
+                (
+                    artifact,
+                    remote_executable,
+                    image_name,
+                    remote_log,
+                    remote_script,
+                    task_name,
+                )
+            )
             logger.write(
-                f"[plan] {artifact.package}/{artifact.target} -> {remote_name}"
+                f"[plan] {artifact.package}/{artifact.target} -> {remote_name} "
+                "in active Windows desktop session"
             )
 
         for dependency in dependencies:
@@ -1032,28 +1400,28 @@ def main() -> int:
                 logger=logger,
             )
 
-        test_threads = args.test_threads
-        if test_threads is None:
-            test_threads = int(config.get("test_threads", 1))
-        if test_threads < 1:
-            raise RunnerError("test-threads must be at least 1.")
-        test_args = []
-        if args.test_filter:
-            test_args.append(args.test_filter)
-        test_args.append(f"--test-threads={test_threads}")
-
-        logger.write(f"[test] running {len(remote_executables)} test executables on the remote host")
-        for index, (artifact, remote_executable, image_name) in enumerate(
+        logger.write(
+            f"[test] running {len(remote_executables)} test executables in the "
+            "auto-detected active Windows desktop session"
+        )
+        for index, (
+            artifact,
+            remote_executable,
+            image_name,
+            remote_log,
+            remote_script,
+            task_name,
+        ) in enumerate(
             remote_executables, start=1
         ):
-            remote_log = remote_path_join(remote_run_dir, f"test-{index:02d}.log")
             local_log = run_dir / "tests" / f"{index:02d}-{artifact.package}-{artifact.target}.log"
             code = run_remote_test(
                 connection,
                 remote_executable,
                 image_name,
                 test_args,
-                remote_log,
+                remote_script,
+                task_name,
                 timeout=test_timeout,
                 index=index,
                 total=len(remote_executables),
