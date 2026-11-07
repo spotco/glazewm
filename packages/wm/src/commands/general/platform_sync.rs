@@ -536,6 +536,26 @@ pub fn promote_ignored_window(
   reconcile_workspace_stack(&workspace, state, Some(native_window.id()));
 }
 
+/// Returns whether a managed HWND belongs in the visible normal band.
+#[cfg(target_os = "windows")]
+fn is_managed_normal_band_candidate(
+  display_state: &DisplayState,
+  show_desktop_minimized: bool,
+  identity_is_current: bool,
+  window_state: Option<&WindowState>,
+) -> bool {
+  matches!(display_state, DisplayState::Showing | DisplayState::Shown)
+    && !show_desktop_minimized
+    && identity_is_current
+    && match window_state {
+      Some(WindowState::Tiling) => true,
+      Some(WindowState::Floating(config)) => !config.shown_on_top,
+      // Shown-on-top, fullscreen, minimized, ignored, and unrelated
+      // windows do not belong to the managed normal band.
+      _ => false,
+    }
+}
+
 /// Reconciles one displayed workspace from its logical atom stack.
 ///
 /// `forced_activation` is used only for an observed ignored-window
@@ -560,11 +580,12 @@ fn reconcile_workspace_stack(
     .descendant_focus_order()
     .filter_map(|container| container.as_window_container().ok())
     .filter(|window| {
-      matches!(
-        window.display_state(),
-        DisplayState::Showing | DisplayState::Shown
-      ) && !state.is_show_desktop_minimized(window.id())
-        && window.native().identity_is_current()
+      is_managed_normal_band_candidate(
+        &window.display_state(),
+        state.is_show_desktop_minimized(window.id()),
+        window.native().identity_is_current(),
+        Some(&window.state()),
+      )
     })
   {
     match window.state() {
@@ -580,6 +601,16 @@ fn reconcile_workspace_stack(
     }
   }
 
+  // The platform layer checks each live HWND's current WS_EX_TOPMOST bit.
+  // Do not make this candidate set from a diagnostic snapshot: app-owned
+  // style changes can race that snapshot and otherwise miss
+  // reconciliation.
+  let demote_topmost_ids = tiled_ids
+    .iter()
+    .chain(detached_ids.iter())
+    .copied()
+    .collect::<Vec<_>>();
+
   let workspace_monitor_id =
     workspace.monitor().map(|monitor| monitor.id());
   let ignored = state
@@ -589,6 +620,9 @@ fn reconcile_workspace_stack(
       window.is_valid()
         && window.identity_is_current()
         && window.is_visible().unwrap_or(false)
+        // Topmost ignored HWNDs stay outside the managed normal band. The
+        // managed-window demote set above deliberately does not use this
+        // cached diagnostic bit; the platform checks live styles instead.
         && window.debug_info().is_topmost != Some(true)
         && state.nearest_monitor(window).is_some_and(|monitor| {
           workspace_monitor_id == Some(monitor.id())
@@ -754,6 +788,7 @@ fn reconcile_workspace_stack(
     &tiled_ids,
     request,
     &promoted_atom_ids,
+    &demote_topmost_ids,
   ) {
     Ok(outcome) => (
       None,
@@ -885,6 +920,59 @@ impl NormalZOrderLayer {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
   use super::*;
+
+  #[test]
+  fn managed_normal_band_selection_excludes_nonvisible_stale_and_topmost_intent(
+  ) {
+    use wm_common::FloatingStateConfig;
+
+    let tiled = WindowState::Tiling;
+    let regular_floater =
+      WindowState::Floating(FloatingStateConfig::default());
+    let shown_on_top = WindowState::Floating(FloatingStateConfig {
+      shown_on_top: true,
+      ..FloatingStateConfig::default()
+    });
+    let shown = DisplayState::Shown;
+
+    assert!(is_managed_normal_band_candidate(
+      &shown,
+      false,
+      true,
+      Some(&tiled),
+    ));
+    assert!(is_managed_normal_band_candidate(
+      &shown,
+      false,
+      true,
+      Some(&regular_floater),
+    ));
+    assert!(!is_managed_normal_band_candidate(
+      &shown,
+      false,
+      true,
+      Some(&shown_on_top),
+    ));
+    assert!(!is_managed_normal_band_candidate(&shown, false, true, None,));
+    assert!(!is_managed_normal_band_candidate(
+      &DisplayState::Hidden,
+      false,
+      true,
+      Some(&tiled),
+    ));
+    assert!(!is_managed_normal_band_candidate(
+      &DisplayState::Showing,
+      false,
+      false,
+      Some(&tiled),
+    ));
+    assert!(!is_managed_normal_band_candidate(
+      &shown,
+      true,
+      true,
+      Some(&tiled),
+    ));
+  }
 
   #[test]
   #[allow(clippy::too_many_lines)]

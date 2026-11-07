@@ -34,9 +34,17 @@ cargo build && cargo run
 
 After making your changes, push to your fork and [submit a pull request](https://github.com/glzr-io/zebar/pulls) against the `main` branch. Please try to address only a single feature or fix in the PR so that it's easy to review.
 
-### Validation before pushing or distributing builds
+### Validation before committing, pushing, or distributing builds
+
+Before each commit, run `cargo clippy --all-targets --all-features -- -D warnings`. Fix every Clippy error and rerun the command until it passes; do not commit while Clippy fails.
 
 Run all required tests and CI checks for the exact commit before pushing it or distributing a build archive. Do not push or deploy an archive while any required check is failing or has not run; fix the failure and rerun the checks first.
+
+### Remote Windows tests
+
+The remote test runner builds Rust test executables on the local checkout,
+transfers them to a configured Windows host, and runs them there. See
+[`docs/remote-testing.md`](docs/remote-testing.md) for setup and commands.
 
 ### Tips
 

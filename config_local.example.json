@@ -1,0 +1,22 @@
+{
+  "connection": {
+    "provider": "openssh",
+    "host": "",
+    "user": "",
+    "port": 22,
+    "identity_file": "",
+    "nickname": "",
+    "network_computers_root": "",
+    "password_file": ""
+  },
+  "remote": {
+    "directory": ""
+  },
+  "timeouts": {
+    "connect_seconds": 30,
+    "build_seconds": 1800,
+    "transfer_seconds": 600,
+    "test_seconds": 300
+  },
+  "test_threads": 1
+}
