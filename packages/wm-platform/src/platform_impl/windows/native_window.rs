@@ -2361,11 +2361,13 @@ fn reconcile_z_order_with_generation(
     });
 
     if outcome.skipped_windows > 0 {
-      // Early absolute checkpoints, then low-frequency 1s backoff until
-      // the full chain applies or generation/focus cancels. TID-cached
-      // WM_NULL probes keep each attempt cheap. Recovery requires the
-      // original chain head to remain foreground so an old skipped target
-      // cannot rejoin after focus moves elsewhere.
+      // Early absolute checkpoints, then frequency-bounded 1s retries
+      // until the full chain applies or generation, identity, or
+      // focus invalidates the request. This has no fixed lifetime
+      // limit. TID-cached WM_NULL probes keep each attempt cheap.
+      // Recovery requires the original chain head to remain
+      // foreground so an old skipped target cannot rejoin
+      // after focus moves elsewhere.
       const SKIPPED_WINDOW_RECOVERY_EARLY_AT_MS: &[u64] = &[100, 250, 500];
       let recovery_ids = window_ids;
       let recovery_tiled_ids = tiled_window_ids;
@@ -3263,7 +3265,7 @@ mod reorder_z_order_tests {
         SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
         SWP_NOOWNERZORDER, SWP_NOSIZE, WINDOW_EX_STYLE, WM_NULL,
         WM_WINDOWPOSCHANGING, WNDCLASSW, WS_DLGFRAME, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
       },
     },
   };
@@ -3329,22 +3331,11 @@ mod reorder_z_order_tests {
   /// native z-order. `topmost` reproduces a Snipping Tool window left
   /// `WS_EX_TOPMOST` by a previous GlazeWM session.
   fn create_test_window(class: &[u16], topmost: bool) -> HWND {
-    create_test_window_with_owner_and_visibility(
+    create_test_window_with_owner(
       class,
       "glazewm-z-order-test",
       topmost,
       None,
-      false,
-    )
-  }
-
-  fn create_visible_test_window(class: &[u16], topmost: bool) -> HWND {
-    create_test_window_with_owner_and_visibility(
-      class,
-      "glazewm-z-order-test",
-      topmost,
-      None,
-      true,
     )
   }
 
@@ -3354,35 +3345,18 @@ mod reorder_z_order_tests {
     topmost: bool,
     owner: Option<HWND>,
   ) -> HWND {
-    create_test_window_with_owner_and_visibility(
-      class, title, topmost, owner, false,
-    )
-  }
-
-  fn create_test_window_with_owner_and_visibility(
-    class: &[u16],
-    title: &str,
-    topmost: bool,
-    owner: Option<HWND>,
-    visible: bool,
-  ) -> HWND {
     let title = wide(title);
     let ex_style = if topmost {
       WS_EX_TOPMOST
     } else {
       WINDOW_EX_STYLE::default()
     };
-    let style = if visible {
-      WS_OVERLAPPEDWINDOW | WS_VISIBLE
-    } else {
-      WS_OVERLAPPEDWINDOW
-    };
     let hwnd = unsafe {
       CreateWindowExW(
         ex_style,
         PCWSTR(class.as_ptr()),
         PCWSTR(title.as_ptr()),
-        style,
+        WS_OVERLAPPEDWINDOW,
         40,
         40,
         160,
@@ -3982,11 +3956,11 @@ mod reorder_z_order_tests {
     assert!(snipping_is_topmost, "topmost state belongs to Windows");
   }
 
-  /// App-set `WS_EX_TOPMOST` on a managed floater (Roblox Studio) must not
-  /// remove that window from the reconciliation chain. Demoting it into
-  /// the normal band matches `reconcile_workspace_stack`'s demote set.
+  /// An app-set topmost managed floater and its owned popup must rejoin
+  /// the normal chain. Explicit and unrelated topmost windows remain
+  /// untouched.
   #[test]
-  fn demote_set_moves_app_topmost_managed_floater_below_promoted_tiles() {
+  fn demote_set_restores_managed_floater_and_owned_dialog_only() {
     let class_name =
       wide(&format!("GlazeWmAppTopmostFloater{}", std::process::id()));
     let class = WNDCLASSW {
@@ -3997,34 +3971,121 @@ mod reorder_z_order_tests {
     let atom = unsafe { RegisterClassW(&raw const class) };
     assert_ne!(atom, 0, "register app-topmost floater class");
 
-    let tile_a = create_visible_test_window(&class_name, false);
-    let tile_b = create_visible_test_window(&class_name, false);
-    let studio_like = create_visible_test_window(&class_name, true);
-    let peer = create_visible_test_window(&class_name, false);
+    // Hidden HWNDs still participate in native z-order and cannot be
+    // adopted or focused by a GlazeWM instance running on this desktop.
+    let tile_a = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Tile A",
+      false,
+      None,
+    );
+    let tile_b = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Tile B",
+      false,
+      None,
+    );
+    let studio_like = create_test_window_with_owner(
+      &class_name,
+      "Synthetic App Topmost Floater",
+      false,
+      None,
+    );
+    let owned_dialog = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Owned Dialog",
+      false,
+      Some(studio_like),
+    );
+    let peer = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Floating Peer",
+      false,
+      None,
+    );
+    let explicit_topmost = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Explicit Shown On Top",
+      true,
+      None,
+    );
+    let unrelated_topmost = create_test_window_with_owner(
+      &class_name,
+      "Synthetic Unrelated Topmost",
+      true,
+      None,
+    );
 
-    let chain = [tile_a, tile_b, studio_like, peer];
-    let demote = [WindowId(studio_like.0)];
+    let chain = [tile_a, tile_b, owned_dialog, studio_like, peer];
+    let desired = chain.map(|hwnd| WindowId(hwnd.0));
 
     reconcile_z_order(
-      &chain.map(|hwnd| WindowId(hwnd.0)),
+      &desired,
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
-      ZOrderIntent::Promote,
+      ZOrderIntent::Preserve,
+      &[],
+      &[],
+    )
+    .expect("seed the normal chain before app-set topmost state");
+    wait_for_relative_order(
+      &chain,
+      &[tile_a.0, tile_b.0, owned_dialog.0, studio_like.0, peer.0],
+    );
+
+    super::NativeWindow::new(studio_like.0)
+      .set_z_order(&WindowZOrder::TopMost)
+      .expect("app sets managed floater topmost");
+    super::NativeWindow::new(owned_dialog.0)
+      .set_z_order(&WindowZOrder::TopMost)
+      .expect("app sets owned dialog topmost");
+    assert!(super::native_window_is_topmost(WindowId(studio_like.0)));
+    assert!(super::native_window_is_topmost(WindowId(owned_dialog.0)));
+
+    let demote = [WindowId(studio_like.0), WindowId(owned_dialog.0)];
+
+    let outcome = reconcile_z_order(
+      &desired,
       &[WindowId(tile_a.0), WindowId(tile_b.0)],
+      ZOrderIntent::Preserve,
+      &[],
       &demote,
     )
-    .expect("demote app topmost then promote tiled group");
+    .expect("demote the app topmost owner and restore the normal chain");
+
+    assert_eq!(outcome.skipped_windows, 0);
+    assert!(!outcome.retry_scheduled);
 
     wait_for_relative_order(
       &chain,
-      &[tile_a.0, tile_b.0, studio_like.0, peer.0],
+      &[tile_a.0, tile_b.0, owned_dialog.0, studio_like.0, peer.0],
     );
     assert!(
       !super::native_window_is_topmost(WindowId(studio_like.0)),
       "managed normal-band HWND must leave the topmost band after demote",
     );
+    assert!(
+      !super::native_window_is_topmost(WindowId(owned_dialog.0)),
+      "managed owned dialog must leave the topmost band with its owner",
+    );
+    assert!(
+      super::native_window_is_topmost(WindowId(explicit_topmost.0)),
+      "explicit shown-on-top HWND must remain topmost",
+    );
+    assert!(
+      super::native_window_is_topmost(WindowId(unrelated_topmost.0)),
+      "unrelated topmost HWND must remain topmost",
+    );
 
     unsafe {
-      for hwnd in chain {
+      for hwnd in [
+        tile_a,
+        tile_b,
+        owned_dialog,
+        studio_like,
+        peer,
+        explicit_topmost,
+        unrelated_topmost,
+      ] {
         let _ = DestroyWindow(hwnd);
       }
       let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), None);

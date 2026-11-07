@@ -67,10 +67,15 @@ Run a specific test by name substring:
 python scripts/remote_tests.py --package wm-platform --filter hung_hwnd_rejoins_after_suspend_past_early_recovery_window
 ```
 
-`--filter` accepts the same name substring used by Rust's test harness. Combine
-it with `--package` to avoid starting unrelated test executables. Use
-`--test-threads 1` to override the local config for a run.
-Filtered runs select named unit or integration tests and omit doctest binaries;
+`--filter` accepts the same case-sensitive name substring used by Rust's test
+harness. Before connecting, the runner lists tests in every built unit or
+integration executable, excludes ignored tests, and uploads only executables
+with at least one runnable match. A misspelled or ignored-only filter fails
+with exit code 2 before transfer; an executable with no match is reported as
+`skipped (no match)`. The summary reports executable passes/failures/skips
+separately from test case passes/failures/ignored counts. Combine the filter
+with `--package` to avoid building unrelated targets. Use `--test-threads 1`
+to override the local config for a run. Filtered runs omit doctest binaries;
 run a package without `--filter` to include its documentation examples.
 
 The script normally builds the checkout that contains it. To reuse the runner
@@ -89,20 +94,35 @@ python scripts/remote_tests.py --package wm-platform --build-only
 `--build-only` compiles the selected test binaries and retains the build log
 without contacting the Windows host.
 
+The runner's focused accounting and timeout regression checks can be run with:
+
+```powershell
+python -m unittest scripts.test_remote_tests
+```
+
 ## Progress and retained logs
 
 Progress is printed as each build message, upload, remote test line, and
 completion status arrives. The runner also prints a heartbeat while a build,
-transfer, or test is quiet. Each run is preserved under
-`Temp/remote-tests/<run-id>/`:
+transfer, or test is quiet. Each run is written under the Git-ignored local
+directory `Temp/remote-tests/<run-id>/`. These logs are local artifacts and
+are not committed or automatically backed up; copy them elsewhere if they
+need to be retained beyond local cleanup. The remote run directory is also
+retained for inspection. Each local run contains:
 
 - `run.log` — readable combined progress and results;
 - `build.jsonl` — Cargo's raw machine-readable build stream;
 - `doctest-build.log` — doctest compilation and persistence progress;
+- `preflight.log` — listed test names for filtered runs;
 - `transfer.log` — per-file upload starts, heartbeats, sizes, rates, and errors;
 - `tests/*.log` — streamed output for each remote test executable;
-- `summary.json` — scope, run times, remote directory, and pass/fail totals.
+- `summary.json` — scope, run times, executable pass/fail/skip counts, parsed
+  test case counts, and remote directory.
 
 The remote run directory also contains the uploaded executables, runtime DLLs,
-and PowerShell tee logs. The test timeout is bounded; on timeout the runner
-terminates the uniquely named remote test process and its helper-process tree.
+and PowerShell tee logs. Local build, transfer, and remote execution deadlines
+are checked while output is arriving as well as while the process is quiet.
+On timeout the runner terminates and reaps the local process tree, asks the
+remote controller to terminate the uniquely named test process and helper
+tree, and returns a failing status. A remote test pass requires both a
+successful SSH/controller exit and exactly one valid worker exit marker.

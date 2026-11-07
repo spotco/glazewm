@@ -45,6 +45,176 @@ class TestArtifact:
     executable: Path
 
 
+@dataclass(frozen=True)
+class RemoteTestOutcome:
+    exit_code: int
+    test_summary: dict[str, int] | None
+
+
+TEST_RESULT_RE = re.compile(
+    r"^test result: (?:ok|FAILED)\.\s+(\d+) passed; (\d+) failed; "
+    r"(\d+) ignored;"
+)
+
+
+def terminate_process_tree(
+    process: subprocess.Popen[Any], *, wait_timeout: float = 10
+) -> None:
+    """Terminate and reap a timed-out command and its descendants."""
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=wait_timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    elif process.poll() is None:
+        process.terminate()
+
+    try:
+        process.wait(timeout=wait_timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=wait_timeout)
+
+
+def close_process_output(process: subprocess.Popen[Any]) -> None:
+    if process.stdout is not None:
+        process.stdout.close()
+
+
+def parse_test_summary(line: str) -> dict[str, int] | None:
+    match = TEST_RESULT_RE.match(line.strip())
+    if match is None:
+        return None
+    return {
+        "passed": int(match.group(1)),
+        "failed": int(match.group(2)),
+        "ignored": int(match.group(3)),
+    }
+
+
+def parse_listed_test_names(output: str) -> list[str]:
+    """Parse names emitted by Rust's test harness `--list` option."""
+    names = []
+    for line in output.splitlines():
+        name, separator, kind = line.rpartition(": ")
+        if separator and kind == "test" and name:
+            names.append(name)
+    return names
+
+
+def matching_test_names(
+    names: list[str], ignored_names: set[str], test_filter: str
+) -> list[str]:
+    return [
+        name
+        for name in names
+        if test_filter in name and name not in ignored_names
+    ]
+
+
+def select_filtered_artifacts(
+    artifacts: list[TestArtifact],
+    test_filter: str,
+    *,
+    timeout: int,
+    logger: RunLog,
+    run_dir: Path,
+) -> tuple[list[TestArtifact], int, int]:
+    """Preflight Rust test names and select only executables with a match."""
+    selected: list[TestArtifact] = []
+    skipped = 0
+    matching_tests = 0
+    preflight_log = run_dir / "preflight.log"
+    with preflight_log.open("w", encoding="utf-8", newline="") as log:
+        for artifact in artifacts:
+            result = run_local_capture(
+                [str(artifact.executable), "--list"], timeout=timeout
+            )
+            ignored_result = run_local_capture(
+                [str(artifact.executable), "--ignored", "--list"],
+                timeout=timeout,
+            )
+            log.write(
+                f"## {artifact.package}/{artifact.target} "
+                f"list_exit={result.returncode} ignored_list_exit="
+                f"{ignored_result.returncode}\n{result.stdout}\n"
+                f"--ignored --list\n{ignored_result.stdout}\n"
+            )
+            if result.returncode != 0 or ignored_result.returncode != 0:
+                raise RunnerError(
+                    f"Could not list tests in {artifact.package}/{artifact.target}; "
+                    f"exit(s) {result.returncode}/{ignored_result.returncode}. "
+                    f"See {preflight_log}."
+                )
+            names = parse_listed_test_names(result.stdout)
+            ignored_names = set(
+                parse_listed_test_names(ignored_result.stdout)
+            )
+            matches = matching_test_names(names, ignored_names, test_filter)
+            matching_tests += len(matches)
+            if matches:
+                selected.append(artifact)
+                logger.write(
+                    f"[preflight] {artifact.package}/{artifact.target}: "
+                    f"{len(names)} named tests, {len(ignored_names)} ignored, "
+                    f"{len(matches)} runnable filter match(es); will execute"
+                )
+            else:
+                skipped += 1
+                logger.write(
+                    f"[preflight] {artifact.package}/{artifact.target}: "
+                    f"{len(names)} named tests, {len(ignored_names)} ignored, "
+                    "zero runnable match; skipped"
+                )
+    logger.write(
+        f"[preflight] filter matched {matching_tests} runnable test names across "
+        f"{len(selected)} executable(s); {skipped} executable(s) skipped"
+    )
+    return selected, skipped, matching_tests
+
+
+def resolve_remote_exit_code(ssh_exit: int, markers: list[str]) -> int:
+    """Require a successful controller and exactly one valid worker marker."""
+    if ssh_exit != 0:
+        return ssh_exit
+    if len(markers) != 1:
+        return 125
+    marker = markers[0].strip()
+    if not marker.isdecimal():
+        return 125
+    code = int(marker)
+    return code if code <= 255 else 125
+
+
+def run_local_capture(
+    command: list[str], *, timeout: int, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Capture a bounded local command, killing and reaping it on timeout."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        terminate_process_tree(process)
+        stdout, _ = process.communicate()
+        raise RunnerError(
+            f"Command timed out after {timeout}s: {' '.join(command)}\n{stdout}"
+        ) from error
+    return subprocess.CompletedProcess(command, process.returncode, stdout, "")
+
+
 class RunLog:
     """Writes progress to the console and retained UTF-8 run logs."""
 
@@ -339,11 +509,18 @@ class RemoteConnection:
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
         started = time.monotonic()
+        deadline = started + timeout
         last_progress = started
         ended = False
         while process.poll() is None or not ended:
+            now = time.monotonic()
+            if now >= deadline:
+                terminate_process_tree(process)
+                reader.join(timeout=5)
+                close_process_output(process)
+                raise RunnerError(f"SCP timed out after {timeout}s for {remote}.")
             try:
-                line = lines.get(timeout=1)
+                line = lines.get(timeout=min(1, deadline - now))
                 if line is None:
                     ended = True
                 else:
@@ -352,27 +529,35 @@ class RemoteConnection:
             except queue.Empty:
                 if process.poll() is not None:
                     ended = True
-                if time.monotonic() - started > timeout:
-                    process.kill()
-                    reader.join(timeout=5)
-                    raise RunnerError(f"SCP timed out after {timeout}s for {remote}.")
                 if time.monotonic() - last_progress >= 5:
                     progress(f"still transferring ({time.monotonic() - started:.0f}s)")
                     last_progress = time.monotonic()
         reader.join(timeout=5)
+        close_process_output(process)
         if process.returncode != 0:
             raise RunnerError(f"SCP exited with code {process.returncode} for {remote}.")
 
     def run_capture(self, command: str, *, timeout: int) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        process = subprocess.Popen(
             self.ssh_argv(command),
             env=self.env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
-            check=False,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            terminate_process_tree(process)
+            stdout, stderr = process.communicate()
+            raise RunnerError(
+                f"SSH command timed out after {timeout}s: {command}\n"
+                f"{stdout}\n{stderr}"
+            ) from error
+        return subprocess.CompletedProcess(
+            process.args, process.returncode, stdout, stderr
         )
 
 
@@ -428,19 +613,22 @@ def compile_test_binaries(
     artifacts: list[TestArtifact] = []
     seen: set[str] = set()
     started = time.monotonic()
+    deadline = started + timeout
     last_output = started
     reader_done = False
     with raw_log.open("w", encoding="utf-8", newline="") as handle:
         while process.poll() is None or not reader_done:
+            now = time.monotonic()
+            if now >= deadline:
+                terminate_process_tree(process)
+                reader.join(timeout=5)
+                close_process_output(process)
+                raise RunnerError(f"Local Cargo build timed out after {timeout}s.")
             try:
-                raw_line = lines.get(timeout=1)
+                raw_line = lines.get(timeout=min(1, deadline - now))
             except queue.Empty:
                 if process.poll() is not None:
                     reader_done = True
-                if time.monotonic() - started > timeout:
-                    process.kill()
-                    reader.join(timeout=5)
-                    raise RunnerError(f"Local Cargo build timed out after {timeout}s.")
                 if time.monotonic() - last_output >= 5:
                     logger.write(
                         f"[build] still compiling ({time.monotonic() - started:.0f}s)"
@@ -491,6 +679,7 @@ def compile_test_binaries(
                 )
 
     reader.join(timeout=5)
+    close_process_output(process)
     code = process.wait()
     logger.write(f"[build] Cargo exited {code} after {time.monotonic() - started:.1f}s")
     if code != 0:
@@ -820,11 +1009,18 @@ def stream_local_process(
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
     started = time.monotonic()
+    deadline = started + timeout
     last_output = started
     finished_reading = False
     while process.poll() is None or not finished_reading:
+        now = time.monotonic()
+        if now >= deadline:
+            terminate_process_tree(process)
+            reader.join(timeout=5)
+            close_process_output(process)
+            raise RunnerError(f"{label} timed out after {timeout}s.")
         try:
-            line = lines.get(timeout=1)
+            line = lines.get(timeout=min(1, deadline - now))
             if line is None:
                 finished_reading = True
             else:
@@ -834,14 +1030,11 @@ def stream_local_process(
             if process.poll() is not None:
                 finished_reading = True
             elapsed = time.monotonic() - started
-            if elapsed >= timeout:
-                process.kill()
-                reader.join(timeout=5)
-                raise RunnerError(f"{label} timed out after {timeout}s.")
             if time.monotonic() - last_output >= 5:
                 logger.write(f"[{label}] still running ({elapsed:.0f}s)", mirror=mirror)
                 last_output = time.monotonic()
     reader.join(timeout=5)
+    close_process_output(process)
     return process.wait()
 
 
@@ -1098,7 +1291,7 @@ def run_remote_test(
     total: int,
     local_log: Path,
     logger: RunLog,
-) -> int:
+) -> RemoteTestOutcome:
     label = f"test {index}/{total} {Path(executable).name}"
     command = remote_test_command(remote_script)
     test_filter = next(
@@ -1127,63 +1320,80 @@ def run_remote_test(
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
     started = time.monotonic()
+    deadline = started + timeout
     last_output = started
-    remote_exit: int | None = None
+    remote_exit_markers: list[str] = []
+    test_summary: dict[str, int] | None = None
     finished_reading = False
     timed_out = False
     while process.poll() is None or not finished_reading:
+        now = time.monotonic()
+        if now >= deadline:
+            timed_out = True
+            logger.write(f"[{label}] timed out after {timeout}s; killing remote tree")
+            kill_remote_tree(
+                connection,
+                image_name,
+                task_name,
+                timeout=30,
+                logger=logger,
+            )
+            terminate_process_tree(process)
+            break
         try:
-            line = lines.get(timeout=1)
+            line = lines.get(timeout=min(1, deadline - now))
             if line is None:
                 finished_reading = True
                 continue
             if line.startswith(EXIT_MARKER):
-                try:
-                    remote_exit = int(line[len(EXIT_MARKER) :].strip())
-                except ValueError:
-                    remote_exit = 125
-                logger.write(f"[{label}] remote exit code {remote_exit}")
+                remote_exit_markers.append(line[len(EXIT_MARKER) :].strip())
+                logger.write(f"[{label}] received remote exit marker")
             else:
                 readable_line = clean_remote_output_line(line)
                 if readable_line is not None:
                     logger.write(f"[{label}] {readable_line}", mirror=local_log)
+                    parsed_summary = parse_test_summary(readable_line)
+                    if parsed_summary is not None:
+                        test_summary = parsed_summary
             last_output = time.monotonic()
         except queue.Empty:
             if process.poll() is not None:
                 finished_reading = True
             elapsed = time.monotonic() - started
-            if elapsed >= timeout:
-                timed_out = True
-                logger.write(f"[{label}] timed out after {timeout}s; killing remote tree")
-                kill_remote_tree(
-                    connection,
-                    image_name,
-                    task_name,
-                    timeout=30,
-                    logger=logger,
-                )
-                process.kill()
-                break
             if time.monotonic() - last_output >= 5:
                 logger.write(f"[{label}] still running ({elapsed:.0f}s)")
                 last_output = time.monotonic()
 
     if timed_out:
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
         reader.join(timeout=5)
-        return 124
+        close_process_output(process)
+        return RemoteTestOutcome(exit_code=124, test_summary=test_summary)
 
     reader.join(timeout=5)
+    close_process_output(process)
     ssh_exit = process.wait()
-    exit_code = remote_exit if remote_exit is not None else ssh_exit
-    if remote_exit is None and ssh_exit == 0:
+    exit_code = resolve_remote_exit_code(ssh_exit, remote_exit_markers)
+    if ssh_exit != 0:
+        logger.write(
+            f"[{label}] SSH/controller exited {ssh_exit}; remote marker(s)="
+            f"{remote_exit_markers!r}"
+        )
+    elif not remote_exit_markers:
         logger.write(f"[{label}] remote exit marker was missing; treating run as failed")
-        return 125
+    elif len(remote_exit_markers) != 1:
+        logger.write(
+            f"[{label}] expected one remote exit marker, received "
+            f"{len(remote_exit_markers)}; treating run as failed"
+        )
+    elif exit_code == 125:
+        logger.write(
+            f"[{label}] invalid remote exit marker {remote_exit_markers[0]!r}; "
+            "treating run as failed"
+        )
+    else:
+        logger.write(f"[{label}] remote worker exit code {remote_exit_markers[0]}")
     logger.write(f"[{label}] finished with exit {exit_code} in {time.monotonic() - started:.1f}s")
-    return exit_code
+    return RemoteTestOutcome(exit_code=exit_code, test_summary=test_summary)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1249,6 +1459,8 @@ def main() -> int:
     logger = RunLog(run_dir)
     started = datetime.now(timezone.utc)
     failures = 0
+    filter_executables_skipped = 0
+    filter_matching_tests = 0
     try:
         logger.write(f"[run] id={run_id}")
         logger.write(f"[run] scope={'workspace' if not args.package else args.package}")
@@ -1263,35 +1475,47 @@ def main() -> int:
         build_timeout = int(timeouts.get("build_seconds", 1800))
         transfer_timeout = int(timeouts.get("transfer_seconds", 600))
         test_timeout = int(timeouts.get("test_seconds", 300))
-        if args.build_only:
-            artifacts = compile_test_binaries(
-                args.package, logger, run_dir, timeout=build_timeout
-            )
-            if args.test_filter:
-                logger.write(
-                    "[doctest-build] skipped because --filter selects named "
-                    "unit/integration tests"
-                )
-            else:
-                artifacts.extend(
-                    compile_doctest_binaries(
-                        args.package, logger, run_dir, timeout=build_timeout
-                    )
-                )
-            dependencies = runtime_dlls(artifacts)
-            logger.write(
-                f"[run] built {len(artifacts)} test and doctest executables and found "
-                f"{len(dependencies)} non-system runtime DLLs; no remote connection used"
-            )
-            for dependency in dependencies:
-                logger.write(f"[build] runtime DLL: {dependency.name}")
-            return 0
-
-        connection = RemoteConnection(config)
         artifacts = compile_test_binaries(
             args.package, logger, run_dir, timeout=build_timeout
         )
+        artifacts_considered = len(artifacts)
         if args.test_filter:
+            artifacts, filter_executables_skipped, filter_matching_tests = (
+                select_filtered_artifacts(
+                    artifacts,
+                    args.test_filter,
+                    timeout=build_timeout,
+                    logger=logger,
+                    run_dir=run_dir,
+                )
+            )
+            artifacts_considered = (
+                len(artifacts) + filter_executables_skipped
+            )
+            if not artifacts:
+                summary = {
+                    "run_id": run_id,
+                    "started_utc": started.isoformat(),
+                    "finished_utc": datetime.now(timezone.utc).isoformat(),
+                    "scope": args.package or "workspace",
+                    "filter": args.test_filter,
+                    "artifacts_considered": artifacts_considered,
+                    "executable_passes": 0,
+                    "executable_failures": 0,
+                    "executables_skipped_no_match": filter_executables_skipped,
+                    "filter_matching_tests": filter_matching_tests,
+                    "zero_match_failure": True,
+                    "test_cases": {"passed": 0, "failed": 0, "ignored": 0},
+                    "remote_run_directory": None,
+                }
+                (run_dir / "summary.json").write_text(
+                    json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+                )
+                logger.write(
+                    "[summary] ZERO-MATCH FAILURE: no runnable test name matched "
+                    f"{args.test_filter!r}; logs: {run_dir}"
+                )
+                return 2
             logger.write(
                 "[doctest-build] skipped because --filter selects named "
                 "unit/integration tests"
@@ -1302,8 +1526,22 @@ def main() -> int:
                     args.package, logger, run_dir, timeout=build_timeout
                 )
             )
+            artifacts_considered = len(artifacts)
         dependencies = runtime_dlls(artifacts)
-        logger.write(f"[build] found {len(dependencies)} non-system runtime DLL dependencies")
+        logger.write(
+            f"[build] found {len(dependencies)} non-system runtime DLL dependencies"
+        )
+
+        if args.build_only:
+            logger.write(
+                f"[run] built {len(artifacts)} test and doctest executables and found "
+                f"{len(dependencies)} non-system runtime DLLs; no remote connection used"
+            )
+            for dependency in dependencies:
+                logger.write(f"[build] runtime DLL: {dependency.name}")
+            return 0
+
+        connection = RemoteConnection(config)
 
         remote_root = str(config["remote"]["directory"]).rstrip("/\\")
         if not remote_root:
@@ -1404,6 +1642,9 @@ def main() -> int:
             f"[test] running {len(remote_executables)} test executables in the "
             "auto-detected active Windows desktop session"
         )
+        executable_passes = 0
+        test_executables_with_summary = 0
+        test_case_totals = {"passed": 0, "failed": 0, "ignored": 0}
         for index, (
             artifact,
             remote_executable,
@@ -1415,7 +1656,7 @@ def main() -> int:
             remote_executables, start=1
         ):
             local_log = run_dir / "tests" / f"{index:02d}-{artifact.package}-{artifact.target}.log"
-            code = run_remote_test(
+            outcome = run_remote_test(
                 connection,
                 remote_executable,
                 image_name,
@@ -1428,10 +1669,33 @@ def main() -> int:
                 local_log=local_log,
                 logger=logger,
             )
+            code = outcome.exit_code
+            if outcome.test_summary is not None:
+                for key in ("passed", "failed", "ignored"):
+                    test_case_totals[key] += outcome.test_summary[key]
+                test_executables_with_summary += 1
+            elif args.test_filter and code == 0:
+                logger.write(
+                    f"[test] FAILED {artifact.package}/{artifact.target}: "
+                    "filtered run returned success without a libtest summary"
+                )
+                code = 125
+            if (
+                args.test_filter
+                and code == 0
+                and outcome.test_summary is not None
+                and outcome.test_summary["passed"] + outcome.test_summary["failed"] == 0
+            ):
+                logger.write(
+                    f"[test] FAILED {artifact.package}/{artifact.target}: "
+                    "filtered run executed zero test cases"
+                )
+                code = 125
             if code != 0:
                 failures += 1
                 logger.write(f"[test] FAILED {artifact.package}/{artifact.target}: exit {code}")
             else:
+                executable_passes += 1
                 logger.write(f"[test] PASSED {artifact.package}/{artifact.target}")
 
         summary = {
@@ -1440,16 +1704,27 @@ def main() -> int:
             "finished_utc": datetime.now(timezone.utc).isoformat(),
             "scope": args.package or "workspace",
             "filter": args.test_filter,
-            "executables": len(remote_executables),
-            "passed": len(remote_executables) - failures,
-            "failed": failures,
+            "artifacts_considered": artifacts_considered,
+            "executable_count": len(remote_executables),
+            "executable_passes": executable_passes,
+            "executable_failures": failures,
+            "executables_skipped_no_match": filter_executables_skipped,
+            "filter_matching_tests": filter_matching_tests,
+            "test_executables_with_summary": test_executables_with_summary,
+            "test_cases": test_case_totals,
+            "zero_match_failure": False,
             "remote_run_directory": remote_run_dir,
         }
         (run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2) + "\n", encoding="utf-8"
         )
         logger.write(
-            f"[summary] {summary['passed']} passed, {summary['failed']} failed; "
+            f"[summary] executables: {summary['executable_passes']} passed, "
+            f"{summary['executable_failures']} failed, "
+            f"{summary['executables_skipped_no_match']} skipped (no match); "
+            f"test cases: {test_case_totals['passed']} passed, "
+            f"{test_case_totals['failed']} failed, "
+            f"{test_case_totals['ignored']} ignored; "
             f"logs: {run_dir}"
         )
         return 1 if failures else 0
